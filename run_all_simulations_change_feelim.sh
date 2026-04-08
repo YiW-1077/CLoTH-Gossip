@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/opt/homebrew/bin/bash
 
 if [[ "$#" -lt 1 ]]; then
   echo "./run_all_simulations.sh <seed> <output_dir>"
@@ -8,9 +8,9 @@ fi
 seed="$1"
 
 output_dir="$2/$(date "+%Y%m%d%H%M%S")"
-mkdir "$output_dir"
+mkdir -p "$output_dir"
 
-max_processes=32
+max_processes=12
 
 queue=()
 running_processes=0
@@ -45,7 +45,7 @@ function display_progress() {
         total_progress=0
 
         # read each simulation progresses
-        IFS=$'\n' read -r -d '' -a simulation_progress_files <<< $(find "$output_dir" -type f -name "progress.tmp")
+        IFS=$'\n' read -r -d '' -a simulation_progress_files <<< $(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*")
         done_simulations=0
         for file in "${simulation_progress_files[@]}"; do
             progress=$(cat "$file")
@@ -95,6 +95,10 @@ wait
 echo -e "\nAll simulations have completed. \nOutputs saved at $output_dir"
 python3 scripts/analyze_output.py "$output_dir"
 end_time=$(date +%s)
-echo "START : $(date --date @"$start_time")"
-echo "  END : $(date --date @"$end_time")"
-echo " TIME : $((end_time - start_time))"
+echo "START : $(date -r "$start_time" "+%Y-%m-%d %H:%M:%S")"
+echo "  END : $(date -r "$end_time" "+%Y-%m-%d %H:%M:%S")"
+elapsed=$((end_time - start_time))
+hours=$((elapsed / 3600))
+minutes=$(( (elapsed % 3600) / 60 ))
+seconds=$((elapsed % 60))
+echo " TIME : $(printf "%02d:%02d:%02d" $hours $minutes $seconds)"
