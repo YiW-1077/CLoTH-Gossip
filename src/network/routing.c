@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <math.h>
+#include <limits.h>
 #include "core/payments.h"
 #include "simulation/htlc.h"
 #include "data_structures/heap.h"
@@ -34,6 +35,9 @@ pthread_mutex_t data_mutex;
 pthread_mutex_t jobs_mutex;
 struct array** paths;
 struct element* jobs=NULL;
+
+/* === Stage ④: Global RBR Parameters === */
+struct network_params* global_net_params = NULL;
 
 
 /* intialize the data structures of dijkstra and the jobs to be executed by the dijkstra threads
@@ -583,8 +587,25 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
           tmp_timelock = to_node_dist.timelock + edge_timelock;
           if(tmp_timelock > TIMELOCKLIMIT) continue;
 
+          // === Stage ④: Apply RBR (Reputation-Based Routing) ===
+          // Adjust edge cost based on next node's reputation score
+          uint64_t rbr_adjusted_cost = edge_fee;
+          
+          if (global_net_params && global_net_params->enable_rbr && from_node_id >= 0 && from_node_id < array_len(network->nodes)) {
+            struct node* next_node = array_get(network->nodes, from_node_id);
+            if (next_node != NULL && next_node->reputation_score < 0.3) {
+              // Strong penalty for low-reputation nodes: avoid completely
+              rbr_adjusted_cost = LLONG_MAX;
+            } else if (next_node != NULL) {
+              // Apply reputation-based cost multiplier: cost *= (1 + (1 - reputation) * weight)
+              double rbr_weight = 10.0;  // Tunable: how much reputation affects cost
+              double reputation_multiplier = 1.0 + (1.0 - next_node->reputation_score) * rbr_weight;
+              rbr_adjusted_cost = (uint64_t)(edge_fee * reputation_multiplier);
+            }
+          }
+
           // dijkstra link weight update
-          tmp_dist = to_node_dist.distance + edge_fee + PAYMENTATTEMPTPENALTY;
+          tmp_dist = to_node_dist.distance + rbr_adjusted_cost + PAYMENTATTEMPTPENALTY;
           current_dist = distance[p][from_node_id].distance;
           if(tmp_dist > current_dist) continue;
           if(tmp_dist == current_dist) continue;

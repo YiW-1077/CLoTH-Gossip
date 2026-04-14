@@ -993,6 +993,11 @@ int main(int argc, char *argv[]) {
   simulation->events = initialize_events(payments);
   initialize_dijkstra(n_nodes, n_edges, payments);
 
+  // === Stage ④: Initialize Global RBR Parameters ===
+  extern struct network_params* global_net_params;
+  global_net_params = malloc(sizeof(struct network_params));
+  *global_net_params = net_params;
+
   printf("INITIAL DIJKSTRA THREADS EXECUTION\n");
   clock_gettime(CLOCK_MONOTONIC, &start);
   run_dijkstra_threads(network, payments, 0, net_params.routing_method);

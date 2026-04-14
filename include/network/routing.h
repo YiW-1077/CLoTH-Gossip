@@ -17,6 +17,9 @@ extern pthread_mutex_t jobs_mutex;
 extern struct array** paths;
 extern struct element* jobs;
 
+/* === Stage ④: Global RBR Parameters === */
+extern struct network_params* global_net_params;
+
 struct thread_args{
   struct network* network;
   struct array* payments;
