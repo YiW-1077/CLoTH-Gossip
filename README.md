@@ -63,7 +63,10 @@ Run batch experiments:
 ./batch-tools/run_all_simulations_change_pmtamt.sh
 ./batch-tools/run_all_simulations_change_feelim.sh
 ./batch-tools/run_all_simulations_change_groupparams.sh
+./batch-tools/run_all_simulations_detection_defense.sh <seed_start> <output_dir> [n_seeds]
 ```
+
+`run_all_simulations_detection_defense.sh` uses `Python/network_analysis/network_analysis.py` output to set `top_hub_count` for method2, and copies analysis files under `<output_root>/python_network_analysis/`.
 
 where `seed` is the seed used for random variables of the simulator and
 `output-directory` is the path of the directory where to store the output files

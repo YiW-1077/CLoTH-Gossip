@@ -220,7 +220,11 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
   // find path
   if(routing_method == CLOTH_ORIGINAL) {
       if (payment->attempts == 1) {
-          path = paths[payment->id];
+          if (net_params.enable_rbr) {
+              path = dijkstra(payment->sender, payment->receiver, payment->amount, network, simulation->current_time, 0, &error, net_params.routing_method, NULL, payment->max_fee_limit);
+          } else {
+              path = paths[payment->id];
+          }
       }else {
           path = dijkstra(payment->sender, payment->receiver, payment->amount, network, simulation->current_time, 0, &error, net_params.routing_method, NULL, payment->max_fee_limit);
       }
@@ -346,6 +350,9 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   first_route_hop = array_get(route->route_hops, 0);
   next_edge = array_get(network->edges, first_route_hop->edge_id);
 
+  /* Stage ②: record incoming observation at the current node if it is a monitor. */
+  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0);
+
   if(!is_present(next_edge->id, node->open_edges)) {
     printf("ERROR (send_payment): edge %ld is not an edge of node %ld \n", next_edge->id, node->id);
     exit(-1);
@@ -411,6 +418,9 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
   is_last_hop = next_route_hop->to_node_id == payment->receiver;
     next_route_hop->edges_lock_start_time = simulation->current_time;
 
+  /* Stage ②: record incoming observation at this hop if it is a monitor. */
+  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0);
+
   if(!is_present(next_route_hop->edge_id, node->open_edges)) {
     printf("ERROR (forward_payment): edge %ld is not an edge of node %ld \n", next_route_hop->edge_id, node->id);
     exit(-1);
@@ -434,22 +444,47 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
    * If the next node is malicious, inject HTLC failure with attack_probability */
   struct node* next_node = array_get(network->nodes, next_route_hop->to_node_id);
   if (next_node->is_malicious && !is_last_hop) {
+    /* Proactive exposure-based detection:
+     * once a malicious node is observed on a forwarding path, apply a light
+     * reputation penalty even if it does not drop this specific HTLC. */
+    if (net_params.enable_reputation_system) {
+      const double exposure_penalty_multiplier = 0.15;
+      update_node_reputation_on_detection(
+        next_node,
+        net_params.reputation_penalty_on_detection * exposure_penalty_multiplier,
+        0
+      );
+    }
+
     double attack_roll = gsl_rng_uniform(simulation->random_generator);
     if (attack_roll < next_node->attack_probability) {
+      uint64_t forward_delay = net_params.average_payment_forward_interval
+                             + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));
+      uint64_t attack_event_time = simulation->current_time + forward_delay;
+
+      if (next_node->first_attack_time == 0) {
+        next_node->first_attack_time = attack_event_time;
+      }
+
       // HTLC fails due to malicious node attack
       payment->error.type = OFFLINENODE;  // Simulate as node failure
       payment->error.hop = next_route_hop;
       payment->offline_node_count += 1;
       
-      /* === Stage ③ Reputation Update: Monitor Detection ===
-       * If the current node is a monitor, it detects malicious activity */
-      if (net_params.enable_reputation_system && node->is_monitor) {
-        update_node_reputation_on_detection(next_node, net_params.reputation_penalty_on_detection);
+      /* === Stage ③ Reputation Update ===
+       * A forwarding failure gives the upstream hop evidence of malicious behavior.
+       * Reflect this in reputation when the reputation system is enabled. */
+      if (net_params.enable_reputation_system) {
+        update_node_reputation_on_detection(
+          next_node,
+          net_params.reputation_penalty_on_detection,
+          attack_event_time + OFFLINELATENCY
+        );
       }
       
       prev_node_id = previous_route_hop->from_node_id;
       event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
-      next_event_time = simulation->current_time + net_params.average_payment_forward_interval + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));
+      next_event_time = attack_event_time + OFFLINELATENCY;
       next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
       simulation->events = heap_insert(simulation->events, next_event, compare_event);
       return;

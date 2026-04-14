@@ -512,7 +512,6 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
           if(amt_to_send < edge->policy.min_htlc)
             continue;
 
-
           // calc probability by past channel_update msg(node_result)
           edge_probability = get_probability(from_node_id, to_node_dist.node, amt_to_send, source, current_time, network);
 
@@ -538,6 +537,19 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
           edge_weight = get_edge_weight(amt_to_receive, edge_fee, edge_timelock);   // calc weight based on LND
           tmp_weight = to_node_dist.weight + edge_weight;   // calc weight based on LND
           tmp_dist = get_probability_based_dist(tmp_weight, tmp_probability);   // calc dist based on LND
+
+          if (global_net_params && global_net_params->enable_rbr &&
+              from_node_id >= 0 && from_node_id < array_len(network->nodes)) {
+            struct node* candidate_node = array_get(network->nodes, from_node_id);
+            if (candidate_node != NULL) {
+              double rbr_weight = global_net_params->rbr_reputation_weight;
+              double reputation_multiplier = 1.0 + (1.0 - candidate_node->reputation_score) * rbr_weight;
+              if (candidate_node->reputation_score < 0.3) {
+                reputation_multiplier *= 25.0;
+              }
+              tmp_dist = (uint64_t)((double)tmp_dist * reputation_multiplier);
+            }
+          }
 
           current_dist = distance[p][from_node_id].distance;
           current_prob = distance[p][from_node_id].probability;
@@ -593,13 +605,13 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
           
           if (global_net_params && global_net_params->enable_rbr && from_node_id >= 0 && from_node_id < array_len(network->nodes)) {
             struct node* next_node = array_get(network->nodes, from_node_id);
-            if (next_node != NULL && next_node->reputation_score < 0.3) {
-              // Strong penalty for low-reputation nodes: avoid completely
-              rbr_adjusted_cost = LLONG_MAX;
-            } else if (next_node != NULL) {
+            if (next_node != NULL) {
               // Apply reputation-based cost multiplier: cost *= (1 + (1 - reputation) * weight)
-              double rbr_weight = 10.0;  // Tunable: how much reputation affects cost
+              double rbr_weight = global_net_params->rbr_reputation_weight;
               double reputation_multiplier = 1.0 + (1.0 - next_node->reputation_score) * rbr_weight;
+              if (next_node->reputation_score < 0.3) {
+                reputation_multiplier *= 25.0;
+              }
               rbr_adjusted_cost = (uint64_t)(edge_fee * reputation_multiplier);
             }
           }

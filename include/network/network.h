@@ -43,6 +43,8 @@ struct node {
   double reputation_score;          // [0.0, 1.0] - 1.0=trusted, 0.0=malicious
   int malicious_reports;            // count of detection incidents
   long last_movement_time;          // last time this monitor relocated (for movement tracking)
+  uint64_t first_attack_time;       // first simulation time this malicious node triggered attack
+  uint64_t first_detection_time;    // first simulation time this node was detected
 };
 
 /* a bidirectional payment channel of the payment-channel network open between two nodes */
@@ -167,6 +169,9 @@ typedef struct {
     int receiver_proximity;
 } PaymentObservability;
 
+#define MONITOR_NODE_LIMIT 10
+#define MONITOR_SWITCH_INTERVAL_PAYMENTS 100
+
 
 struct network {
   struct array* nodes;
@@ -178,6 +183,9 @@ struct network {
   /* === Stage ② Monitor Tracking === */
   MonitorAgent* monitors;              // Array of deployed monitors
   int num_monitors;
+  long cumulative_monitor_assignments; // sum of active monitor slots over all placements
+  long cumulative_monitor_relocations; // number of monitor moves that changed node
+  int monitor_rotation_epoch;          // incremented each relocation cycle
   HubInfo* hubs;                       // Array of hub information
   int num_hubs;
 };
@@ -208,9 +216,9 @@ void detect_and_record_htlc_observation(struct network* network, long payment_id
 
 /* === Stage ③ Reputation System Functions === */
 void initialize_reputation_scores(struct network* network);
-void update_node_reputation_on_detection(struct node* node, double penalty);
+void update_node_reputation_on_detection(struct node* node, double penalty, uint64_t detection_time);
 void apply_reputation_decay_all_nodes(struct network* network, double decay_rate);
-int suggest_monitor_movement(struct network* network, struct array* monitors, struct network_params params);
+int suggest_monitor_movement(struct network* network, struct network_params params, uint64_t current_time);
 
 int update_group(struct group* group, struct network_params net_params, uint64_t current_time, gsl_rng* random_generator, int enable_fake_balance_update, struct edge* triggered_edge);
 

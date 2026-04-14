@@ -35,6 +35,8 @@ struct node* new_node(long id) {
   node->reputation_score = 1.0;     // Start with full reputation
   node->malicious_reports = 0;      // No incidents yet
   node->last_movement_time = 0;     // Not yet moved
+  node->first_attack_time = 0;
+  node->first_detection_time = 0;
   return node;
 }
 
@@ -556,6 +558,9 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
         HubInfo* hub = &network->hubs[h];
         
         for (int l = 0; l < hub->num_leaf_neighbors; l++) {
+            if (total_monitors >= MONITOR_NODE_LIMIT) {
+                break;
+            }
             int leaf_node_id = hub->leaf_neighbor_ids[l];
             
             // Allocate monitor
@@ -582,9 +587,15 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
             
             total_monitors++;
         }
+
+        if (total_monitors >= MONITOR_NODE_LIMIT) {
+            break;
+        }
     }
     
     network->num_monitors = total_monitors;
+    network->cumulative_monitor_assignments = total_monitors;
+    network->cumulative_monitor_relocations = 0;
     printf("[Method1 Deployment] Placed %d monitors on leaf nodes\n", total_monitors);
     
     return total_monitors;
@@ -597,6 +608,17 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
  */
 static int compare_hub_by_degree(const void* a, const void* b) {
     return ((HubInfo*)b)->degree - ((HubInfo*)a)->degree;
+}
+
+typedef struct {
+    int node_id;
+    int degree;
+} NodeDegree;
+
+static int compare_node_degree_desc(const void* a, const void* b) {
+    const NodeDegree* na = (const NodeDegree*)a;
+    const NodeDegree* nb = (const NodeDegree*)b;
+    return nb->degree - na->degree;
 }
 
 static int* get_top_hubs_by_degree(struct network* network, int top_k) {
@@ -719,6 +741,8 @@ void initialize_reputation_scores(struct network* network) {
             node->reputation_score = 1.0;
             node->malicious_reports = 0;
             node->last_movement_time = 0;
+            node->first_attack_time = 0;
+            node->first_detection_time = 0;
         }
     }
 }
@@ -728,11 +752,15 @@ void initialize_reputation_scores(struct network* network) {
  * Called when a monitor detects malicious activity from a node
  * Reduces reputation by penalty amount
  */
-void update_node_reputation_on_detection(struct node* node, double penalty) {
+void update_node_reputation_on_detection(struct node* node, double penalty, uint64_t detection_time) {
     if (node == NULL) {
         return;
     }
-    
+
+    if (node->first_detection_time == 0 && detection_time > 0) {
+        node->first_detection_time = detection_time;
+    }
+
     node->malicious_reports++;
     node->reputation_score -= penalty;
     
@@ -774,16 +802,73 @@ void apply_reputation_decay_all_nodes(struct network* network, double decay_rate
  * Monitors move to higher-degree hubs if current hub is poorly balanced
  * Returns number of monitors that relocated
  */
-int suggest_monitor_movement(struct network* network, struct array* monitors, struct network_params params) {
-    if (network == NULL || network->monitors == NULL || !params.enable_monitor_movement) {
+int suggest_monitor_movement(struct network* network, struct network_params params, uint64_t current_time) {
+    if (network == NULL || network->monitors == NULL || !params.enable_monitor_movement || network->num_monitors <= 0) {
         return 0;
     }
-    
+
+    int n_nodes = array_len(network->nodes);
+    if (n_nodes <= 0) {
+        return 0;
+    }
+
+    int monitor_count = network->num_monitors;
+    if (monitor_count > MONITOR_NODE_LIMIT) {
+        monitor_count = MONITOR_NODE_LIMIT;
+    }
+
+    NodeDegree* candidates = (NodeDegree*)malloc(n_nodes * sizeof(NodeDegree));
+    int candidate_count = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        struct node* node = (struct node*)array_get(network->nodes, i);
+        if (node == NULL) {
+            continue;
+        }
+        candidates[candidate_count].node_id = (int)node->id;
+        candidates[candidate_count].degree = (int)array_len(node->open_edges);
+        candidate_count++;
+    }
+
+    if (candidate_count == 0) {
+        free(candidates);
+        return 0;
+    }
+
+    qsort(candidates, candidate_count, sizeof(NodeDegree), compare_node_degree_desc);
+
+    int shift_base = (network->monitor_rotation_epoch * monitor_count) % candidate_count;
     int relocations = 0;
-    
-    // For now, this is a placeholder - full implementation in Stage ③ advanced
-    // In production: analyze hub balance, identify better hubs, update monitor locations
-    
+
+    for (int m = 0; m < monitor_count; m++) {
+        MonitorAgent* monitor = &network->monitors[m];
+        int old_node_id = monitor->node_id;
+        int new_node_id = candidates[(shift_base + m) % candidate_count].node_id;
+
+        if (old_node_id == new_node_id) {
+            continue;
+        }
+
+        struct node* old_node = (struct node*)array_get(network->nodes, old_node_id);
+        if (old_node != NULL && old_node->monitor_id == monitor->monitor_id) {
+            old_node->is_monitor = 0;
+            old_node->monitor_id = -1;
+        }
+
+        struct node* new_node = (struct node*)array_get(network->nodes, new_node_id);
+        if (new_node != NULL) {
+            new_node->is_monitor = 1;
+            new_node->monitor_id = monitor->monitor_id;
+            new_node->last_movement_time = (long)current_time;
+        }
+
+        monitor->node_id = new_node_id;
+        relocations++;
+    }
+
+    network->cumulative_monitor_assignments += monitor_count;
+    network->cumulative_monitor_relocations += relocations;
+    network->monitor_rotation_epoch++;
+    free(candidates);
     return relocations;
 }
 
@@ -829,6 +914,9 @@ struct network* initialize_network(struct network_params net_params, gsl_rng* ra
   }
 
   network->groups = array_initialize(1000);
+  network->cumulative_monitor_assignments = 0;
+  network->cumulative_monitor_relocations = 0;
+  network->monitor_rotation_epoch = 0;
 
   return  network;
 }

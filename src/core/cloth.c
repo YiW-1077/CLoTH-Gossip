@@ -173,10 +173,12 @@ void write_monitoring_metrics_csv(struct network* network, long n_payments, int 
   double avg_htlcs_observed = (network->num_monitors > 0) ? 
     ((double)total_htlcs_observed / (double)network->num_monitors) : 0.0;
   
-  fprintf(csv_metrics, "routing_method,num_monitors,total_payments,coverage_rate,observability_per_monitor,avg_htlcs_observed\n");
-  fprintf(csv_metrics, "%d,%d,%ld,%.4f,%.2f,%.2f\n",
+  fprintf(csv_metrics, "routing_method,num_monitors,cumulative_monitor_assignments,cumulative_monitor_relocations,total_payments,coverage_rate,observability_per_monitor,avg_htlcs_observed\n");
+  fprintf(csv_metrics, "%d,%d,%ld,%ld,%ld,%.4f,%.2f,%.2f\n",
           routing_method,
           network->num_monitors,
+          network->cumulative_monitor_assignments,
+          network->cumulative_monitor_relocations,
           n_payments,
           coverage_rate,
           observability_per_monitor,
@@ -206,20 +208,28 @@ void write_reputation_dynamics_csv(struct network* network, char output_dir_name
   }
   
   // Header
-  fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree\n");
+  fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency\n");
   
   // Write reputation data for each node
   for (int i = 0; i < array_len(network->nodes); i++) {
     struct node* node = (struct node*)array_get(network->nodes, i);
     if (node != NULL) {
       int degree = array_len(node->open_edges);
-      fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d\n",
+      long detection_latency = -1;
+      if (node->first_attack_time > 0 &&
+          node->first_detection_time >= node->first_attack_time) {
+        detection_latency = (long)(node->first_detection_time - node->first_attack_time);
+      }
+      fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%llu,%llu,%ld\n",
               node->id,
               node->is_malicious,
               node->is_monitor,
               node->reputation_score,
               node->malicious_reports,
-              degree);
+              degree,
+              (unsigned long long)node->first_attack_time,
+              (unsigned long long)node->first_detection_time,
+              detection_latency);
     }
   }
   
@@ -308,12 +318,18 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
     }
   }
   
-  // Count malicious nodes that were detected
+  // Count malicious nodes that were detected (reported at least once)
   int detected_malicious = 0;
+  int low_reputation_malicious = 0;
   for (int i = 0; i < array_len(network->nodes); i++) {
     struct node* node = (struct node*)array_get(network->nodes, i);
-    if (node != NULL && node->is_malicious && node->reputation_score < 0.5) {
-      detected_malicious++;
+    if (node != NULL && node->is_malicious) {
+      if (node->malicious_reports > 0) {
+        detected_malicious++;
+      }
+      if (node->reputation_score < 0.5) {
+        low_reputation_malicious++;
+      }
     }
   }
   
@@ -329,6 +345,7 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   fprintf(csv_stage4, "avg_attempts_per_payment,%.2f\n", 
           (double)total_attempts / total_payments);
   fprintf(csv_stage4, "malicious_nodes_detected,%d\n", detected_malicious);
+  fprintf(csv_stage4, "malicious_nodes_low_reputation,%d\n", low_reputation_malicious);
   fprintf(csv_stage4, "enable_prt,%d\n", net_params.enable_prt);
   fprintf(csv_stage4, "enable_rbr,%d\n", net_params.enable_rbr);
   fprintf(csv_stage4, "prt_threshold,%d\n", net_params.prt_threshold);
@@ -1061,6 +1078,13 @@ int main(int argc, char *argv[]) {
     struct payment* p = array_get(payments, event->payment->id);
     if(p->end_time != 0 && event->type != UPDATEGROUP && event->type != CONSTRUCTGROUPS && event->type != CHANNELUPDATEFAIL && event->type != CHANNELUPDATESUCCESS){
         completed_payments++;
+
+        if (net_params.enable_monitor_movement &&
+            network->num_monitors > 0 &&
+            completed_payments % MONITOR_SWITCH_INTERVAL_PAYMENTS == 0) {
+            suggest_monitor_movement(network, net_params, simulation->current_time);
+        }
+
         char progress_filename[512];
         strcpy(progress_filename, output_dir_name);
         strcat(progress_filename, "progress.tmp");

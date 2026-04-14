@@ -41,37 +41,39 @@ function display_progress() {
     done_simulations=0
 
     while [ "$done_simulations" -lt "$total_simulations" ]; do
-        progress_summary=""
-        total_progress=0
+        # collect all progress.tmp files (one per simulation)
+        mapfile -t simulation_progress_files < <(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*")
 
-        # read each simulation progresses
-        IFS=$'\n' read -r -d '' -a simulation_progress_files <<< $(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*")
         done_simulations=0
         for file in "${simulation_progress_files[@]}"; do
-            progress=$(cat "$file")
+            progress=$(cat "$file" 2>/dev/null || echo "0")
             if [ "$progress" = "1" ]; then
-              done_simulations=$((done_simulations + 1))
-            elif [ "$progress" = "" ]; then
-              progress="0"
+                done_simulations=$((done_simulations + 1))
             fi
-            total_progress=$(printf "%.5f" "$(echo "scale=4; $total_progress + $progress / $total_simulations" | bc)")
-            progress_summary="$progress_summary$(printf "%3d%% %s" "$(printf "%.0f" "$(echo "$progress*100" | bc)")" "$file")\n"
         done
 
-        # build progress bar
-        progress_bar_len=$(printf "%0.s#" $(seq 1 $(printf "%.0f" "$(echo "$total_progress * 100 / 2" | bc)")))
-        progress_bar=""
-        if [ $(python3 -c "print($total_progress==0)") = "True" ]; then
-            progress_bar=$(printf "Progress: [%-50s] 0%%\t%d/%d\t Time remaining --:--" "" "$done_simulations" "$total_simulations")
+        if [ "$total_simulations" -eq 0 ]; then
+            fraction=0
         else
-            elapsed_time=$(( $(date +%s) - start_time ))
-            estimated_completion_time=$(python3 -c "print(int($elapsed_time / $total_progress - $elapsed_time))")
-            remaining_minutes=$(( estimated_completion_time / 60 ))
-            remaining_seconds=$(( estimated_completion_time % 60 ))
-            progress_bar=$(printf "Progress: [%-50s] %0.1f%%\t%d/%d\t Time remaining %02d:%02d" "$progress_bar_len" "$(echo "scale=1; $total_progress * 100" | bc)" "$done_simulations" "$total_simulations" "$remaining_minutes" "$remaining_seconds")
+            fraction=$(echo "scale=4; $done_simulations / $total_simulations" | bc)
         fi
 
-        echo -e "$progress_summary$progress_bar"
+        # build progress bar from 0..50 characters
+        filled=$(printf "%.0f" "$(echo "$fraction * 50" | bc)")
+        progress_bar=$(printf "%0.s#" $(seq 1 "$filled"))
+
+        if [ "$(python3 -c "print(float('$fraction')==0.0)")" = "True" ]; then
+            progress_line=$(printf "Progress: [%-50s] 0%%\t%d/%d\t Time remaining --:--" "" "$done_simulations" "$total_simulations")
+        else
+            elapsed_time=$(( $(date +%s) - start_time ))
+            estimated_completion_time=$(python3 -c "f=float('$fraction'); elapsed=$elapsed_time; print(int(elapsed / f - elapsed))")
+            remaining_minutes=$(( estimated_completion_time / 60 ))
+            remaining_seconds=$(( estimated_completion_time % 60 ))
+            percent=$(echo "scale=1; $fraction * 100" | bc)
+            progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Time remaining %02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$remaining_minutes" "$remaining_seconds")
+        fi
+
+        echo "$progress_line"
         sleep 1
     done
 }

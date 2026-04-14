@@ -38,6 +38,7 @@ set(DATA_STRUCTURES_SOURCES
     src/data_structures/heap.c
     src/data_structures/list.c
     src/data_structures/utils.c
+        omnetpp_sim/src/AttackGenerator.cc
 )
 
 add_executable(${PROJECT_NAME}
