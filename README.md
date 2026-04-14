@@ -45,10 +45,24 @@ make
 
 ## Run
 
-Run CLoTH:
+Run CLoTH (single simulation):
 
 ```shell
-./run-simulation.sh <seed> <output-directory> <dijkstra_cache_filename> [setting_key=setting_value]
+./run-simulation.sh <seed> <output-directory> [setting_key=setting_value]
+```
+
+Run with Network Attack Simulation (CLoTH + OMNeT++):
+
+```shell
+./run_with_attack_simulation.sh <seed> <output-directory> [setting_key=setting_value]
+```
+
+Run batch experiments:
+
+```shell
+./batch-tools/run_all_simulations_change_pmtamt.sh
+./batch-tools/run_all_simulations_change_feelim.sh
+./batch-tools/run_all_simulations_change_groupparams.sh
 ```
 
 where `seed` is the seed used for random variables of the simulator and

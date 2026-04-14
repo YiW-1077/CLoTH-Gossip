@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<projectDescription>
+    <name>PaymentNetworkAttackSim</name>
+    <comment>OMNeT++ Simulation for Payment Delay Under Network Attack</comment>
+    <projects>
+    </projects>
+    <buildSpec>
+        <buildCommand>
+            <name>org.omnetpp.cdt.core.OMNeTPPBuilder</name>
+            <arguments>
+            </arguments>
+        </buildCommand>
+    </buildSpec>
+    <natures>
+        <nature>org.omnetpp.cdt.core.OMNeTPPNature</nature>
+        <nature>org.eclipse.cdt.core.cnature</nature>
+        <nature>org.eclipse.cdt.core.ccnature</nature>
+    </natures>
+</projectDescription>

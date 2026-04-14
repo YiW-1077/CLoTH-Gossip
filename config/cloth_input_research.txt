@@ -1,0 +1,78 @@
+# CLoTH-Gossip Configuration with DoS Defense Research Parameters
+
+# ============================================
+# Network Generation
+# ============================================
+generate_network_from_file=true
+nodes_filename=nodes_ln.csv
+channels_filename=channels_ln.csv
+edges_filename=edges_ln.csv
+n_additional_nodes=
+n_channels_per_node=
+capacity_per_channel=
+
+# ============================================
+# Payment Configuration
+# ============================================
+generate_payments_from_file=false
+payment_timeout=60000
+average_payment_forward_interval=100
+variance_payment_forward_interval=1
+payment_rate=1
+n_payments=100
+average_payment_amount=100
+variance_payment_amount=10
+average_max_fee_limit=-1
+variance_max_fee_limit=-1
+mpp=1
+
+# ============================================
+# Routing Configuration
+# ============================================
+routing_method=cloth_original
+group_size=5
+group_limit_rate=0.1
+group_cap_update=true
+group_broadcast_delay=0
+cul_threshold_dist_alpha=2
+cul_threshold_dist_beta=10
+enable_fake_balance_update=false
+
+# ============================================
+# RESEARCH EXTENSION: DoS Defense Parameters
+# ============================================
+
+# --- Step ①: Baseline (Malicious Nodes) ---
+malicious_node_ratio=0.15
+malicious_failure_probability=0.8
+
+# --- Step ②: Monitor Placement (Hub Detection) ---
+hub_degree_threshold=50
+enable_monitoring=false
+
+# --- Step ③: Reputation & Movement System ---
+enable_reputation_system=false
+reputation_initial_score=1.0
+reputation_decay_rate=0.1
+reputation_recovery_rate=0.05
+monitor_movement_credit_max=10.0
+monitor_movement_cost=1.0
+monitor_movement_recovery_per_event=0.01
+monitor_relocation_interval=200
+
+# --- Step ④: Attack & Defense Simulation ---
+enable_attack_simulation=false
+attack_start_time=1000
+attack_duration=500
+attack_intensity=0.8
+attack_target_node=-1
+enable_reputation_defense=false
+
+# --- Faulty Node (Legacy) ---
+faulty_node_probability=0.0
+
+# ============================================
+# Output Configuration
+# ============================================
+output_directory_prefix=step_
+research_mode=true
