@@ -30,6 +30,8 @@ struct payment* new_payment(long id, long sender, long receiver, uint64_t amount
   p->no_balance_count = 0;
 //  p->edge_occupied_count = 0;
   p->is_timeout = 0;
+  p->attack_delay_added_total = 0;
+  p->attack_delay_event_count = 0;
   p->end_time = 0;
   p->attempts = 0;
   p->error.type = NOERROR;
@@ -70,7 +72,7 @@ void generate_random_payments(struct payments_params pay_params, long n_nodes, g
     /* payment interarrival time is an exponential (Poisson process) whose mean is the inverse of payment rate
        (expressed in payments per second, then multiplied to convert in milliseconds)
      */
-    next_payment_interval = 1000*gsl_ran_exponential(random_generator, pay_params.inverse_payment_rate);
+    next_payment_interval = 1000 * gsl_ran_exponential(random_generator, pay_params.inverse_payment_rate);
     payment_time += next_payment_interval;
     if(pay_params.max_fee_limit_sigma != -1 && pay_params.max_fee_limit_mu != -1) {
         max_fee_limit = fabs(pay_params.max_fee_limit_mu + gsl_ran_ugaussian(random_generator) * pay_params.max_fee_limit_sigma)*1000.0; // convert satoshi to millisatoshi

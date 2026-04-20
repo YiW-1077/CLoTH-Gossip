@@ -5,12 +5,13 @@ set(CMAKE_C_STANDARD 11)
 
 include_directories(include)
 
-file(COPY config/cloth_input.txt DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY config/data/channels_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY config/data/edges_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY config/data/nodes_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY config DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY cloth_input.txt DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/config)
 file(COPY run-simulation.sh DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 file(COPY scripts/analyze_output.py DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts)
+file(COPY scripts/simple_live_view.py DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts)
+file(COPY scripts/measure_payment_time.sh DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts)
+file(COPY nodes_ln.csv channels_ln.csv edges_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/result)
 
@@ -25,6 +26,7 @@ set(CORE_SOURCES
 set(NETWORK_SOURCES
     src/network/network.c
     src/network/routing.c
+    src/network/monitoring.c
 )
 
 # HTLC & Payment Mechanics
@@ -48,6 +50,7 @@ add_executable(${PROJECT_NAME}
     include/core/payments.h
     include/network/network.h
     include/network/routing.h
+    include/network/monitoring.h
     include/simulation/htlc.h
     include/data_structures/array.h
     include/data_structures/heap.h

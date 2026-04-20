@@ -6,6 +6,8 @@
 #include "data_structures/array.h"
 #include "data_structures/utils.h"
 
+// グローバル変数：実行時設定可能な監視ノード数上限
+int MONITOR_NODE_LIMIT = 300;
 
 /* Functions in this file generate a payment-channel network where to simulate the execution of payments */
 /* このファイルは LN 風の支払いチャネルネットワークを構築・管理する。
@@ -597,6 +599,7 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
     network->cumulative_monitor_assignments = total_monitors;
     network->cumulative_monitor_relocations = 0;
     printf("[Method1 Deployment] Placed %d monitors on leaf nodes\n", total_monitors);
+    fflush(stdout);
     
     return total_monitors;
 }

@@ -27,6 +27,8 @@ PAYMENT_TIMEOUT_MS=200000
 EXT_N_PAYMENTS=2000
 EXT_MALICIOUS_RATIO=0.25
 EXT_ATTACK_SUCCESS_RATE=0.95
+ATTACK_DELAY_PARAMS_OFF="enable_network_attack_delay=false attack_delay_start_time=30000 attack_delay_duration=30000 attack_delay_intensity=1.0 attack_delay_jitter=0.0"
+ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true attack_delay_start_time=30000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
 
 TOP_HUB_COUNT=10
 TOP_HUB_IDS=""
@@ -77,13 +79,13 @@ function display_progress() {
         progress_bar=$(printf "%0.s#" $(seq 1 "$filled"))
 
         if [ "$(python3 -c "print(float('$fraction')==0.0)")" = "True" ]; then
-            progress_line=$(printf "Progress: [%-50s] 0%%\t%d/%d\tETA --:--" "" "$done_simulations" "$total_simulations")
+            progress_line=$(printf "Progress: [%-50s] 0.00%%\t%d/%d\tETA --:--" "" "$done_simulations" "$total_simulations")
         else
             elapsed_time=$(( $(date +%s) - start_time ))
             estimated_completion_time=$(python3 -c "f=float('$fraction'); elapsed=$elapsed_time; print(int(elapsed / f - elapsed))")
             remaining_minutes=$(( estimated_completion_time / 60 ))
             remaining_seconds=$(( estimated_completion_time % 60 ))
-            percent=$(echo "scale=1; $fraction * 100" | bc)
+            percent=$(echo "scale=2; $fraction * 100" | bc)
             progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\tETA %02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$remaining_minutes" "$remaining_seconds")
         fi
 
@@ -137,6 +139,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         enable_pra=false \
         enable_prt=false \
         enable_rbr=false \
+        $ATTACK_DELAY_PARAMS_OFF \
         routing_method=cloth_original"
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/b_detection_only/ \
@@ -152,6 +155,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         enable_pra=false \
         enable_prt=false \
         enable_rbr=false \
+        $ATTACK_DELAY_PARAMS_ON \
         routing_method=cloth_original"
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/c_full_defense/ \
@@ -168,6 +172,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         enable_prt=true \
         enable_rbr=true \
         rbr_reputation_weight=10.0 \
+        $ATTACK_DELAY_PARAMS_ON \
         routing_method=cloth_original"
 
     # Extreme attack scenarios (25% malicious, 95% attack success)
@@ -183,6 +188,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         enable_pra=false \
         enable_prt=false \
         enable_rbr=false \
+        $ATTACK_DELAY_PARAMS_ON \
         routing_method=cloth_original"
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/e_extreme_detection_only/ \
@@ -198,6 +204,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         enable_pra=false \
         enable_prt=false \
         enable_rbr=false \
+        $ATTACK_DELAY_PARAMS_ON \
         routing_method=cloth_original"
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/f_extreme_full_defense/ \
@@ -214,6 +221,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         enable_prt=true \
         enable_rbr=true \
         rbr_reputation_weight=10.0 \
+        $ATTACK_DELAY_PARAMS_ON \
         routing_method=cloth_original"
 done
 

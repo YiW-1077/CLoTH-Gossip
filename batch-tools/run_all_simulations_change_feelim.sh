@@ -26,6 +26,8 @@ TOP_HUB_COUNT=10
 EXT_N_PAYMENTS=2000
 EXT_MALICIOUS_RATIO=0.25
 EXT_ATTACK_SUCCESS_RATE=0.95
+ATTACK_DELAY_PARAMS_OFF="enable_network_attack_delay=false attack_delay_start_time=30000 attack_delay_duration=30000 attack_delay_intensity=1.0 attack_delay_jitter=0.0"
+ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true attack_delay_start_time=30000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
 
 function enqueue_simulation() {
     queue+=("$@")
@@ -73,13 +75,13 @@ function display_progress() {
         progress_bar=$(printf "%0.s#" $(seq 1 "$filled"))
 
         if [ "$(python3 -c "print(float('$fraction')==0.0)")" = "True" ]; then
-            progress_line=$(printf "Progress: [%-50s] 0%%\t%d/%d\t Time remaining --:--" "" "$done_simulations" "$total_simulations")
+            progress_line=$(printf "Progress: [%-50s] 0.00%%\t%d/%d\t Time remaining --:--" "" "$done_simulations" "$total_simulations")
         else
             elapsed_time=$(( $(date +%s) - start_time ))
             estimated_completion_time=$(python3 -c "f=float('$fraction'); elapsed=$elapsed_time; print(int(elapsed / f - elapsed))")
             remaining_minutes=$(( estimated_completion_time / 60 ))
             remaining_seconds=$(( estimated_completion_time % 60 ))
-            percent=$(echo "scale=1; $fraction * 100" | bc)
+            percent=$(echo "scale=2; $fraction * 100" | bc)
             progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Time remaining %02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$remaining_minutes" "$remaining_seconds")
         fi
 
@@ -100,11 +102,11 @@ for i in $(seq -6.0 1.0 1.0); do
             method_params="group_cap_update= group_size= group_limit_rate="
         fi
 
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/a_no_attack           payment_timeout=200000 n_payments=5000 mpp=0 routing_method=$routing_method malicious_node_ratio=0.0 malicious_failure_probability=0.0 monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $method_params"
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/b_detection_only      payment_timeout=200000 n_payments=5000 mpp=0 routing_method=$routing_method malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $method_params"
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/c_full_defense        payment_timeout=200000 n_payments=5000 mpp=0 routing_method=$routing_method malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $method_params"
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/d_extreme_no_defense payment_timeout=200000 n_payments=$EXT_N_PAYMENTS mpp=0 routing_method=$routing_method malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $method_params"
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/e_extreme_full_defense payment_timeout=200000 n_payments=$EXT_N_PAYMENTS mpp=0 routing_method=$routing_method malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $method_params"
+        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/a_no_attack           payment_timeout=200000 n_payments=5000 mpp=0 routing_method=$routing_method malicious_node_ratio=0.0 malicious_failure_probability=0.0 monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $ATTACK_DELAY_PARAMS_OFF $method_params"
+        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/b_detection_only      payment_timeout=200000 n_payments=5000 mpp=0 routing_method=$routing_method malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $ATTACK_DELAY_PARAMS_ON $method_params"
+        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/c_full_defense        payment_timeout=200000 n_payments=5000 mpp=0 routing_method=$routing_method malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $ATTACK_DELAY_PARAMS_ON $method_params"
+        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/d_extreme_no_defense payment_timeout=200000 n_payments=$EXT_N_PAYMENTS mpp=0 routing_method=$routing_method malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $ATTACK_DELAY_PARAMS_ON $method_params"
+        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=$routing_method/max_fee_limit=$avg_fee_lim/e_extreme_full_defense payment_timeout=200000 n_payments=$EXT_N_PAYMENTS mpp=0 routing_method=$routing_method malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 average_max_fee_limit=$avg_fee_lim variance_max_fee_limit=$var_fee_lim average_payment_amount=1000 variance_payment_amount=100 $ATTACK_DELAY_PARAMS_ON $method_params"
     done
 done
 
@@ -116,8 +118,15 @@ while [ "${#queue[@]}" -gt 0 ] || [ "$running_processes" -gt 0 ]; do
 done
 wait
 echo -e "\nAll simulations have completed. \nOutputs saved at $output_dir"
-python3 scripts/analyze_output.py "$output_dir"
-python3 scripts/summarize_attack4.py "$output_dir"
+if python3 scripts/analyze_output.py "$output_dir"; then
+    if python3 scripts/summarize_attack4.py "$output_dir"; then
+        python3 scripts/plot_attack_summary.py "$output_dir" || echo "WARN: plot_attack_summary.py failed"
+    else
+        echo "WARN: summarize_attack4.py failed"
+    fi
+else
+    echo "WARN: analyze_output.py failed; summary.csv was not generated"
+fi
 end_time=$(date +%s)
 echo "START : $(date -r "$start_time" "+%Y-%m-%d %H:%M:%S")"
 echo "  END : $(date -r "$end_time" "+%Y-%m-%d %H:%M:%S")"

@@ -169,7 +169,8 @@ typedef struct {
     int receiver_proximity;
 } PaymentObservability;
 
-#define MONITOR_NODE_LIMIT 10
+// MONITOR_NODE_LIMIT は実行時に設定される（デフォルト300）
+extern int MONITOR_NODE_LIMIT;
 #define MONITOR_SWITCH_INTERVAL_PAYMENTS 100
 
 

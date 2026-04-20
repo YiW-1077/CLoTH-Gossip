@@ -104,6 +104,31 @@ struct pra_context* pra_context_new();
 void pra_context_add_failed_node(struct pra_context* ctx, long node_id);
 void pra_context_free(struct pra_context* ctx);
 
+/* === Stage ④ RBR: Reputation-Based Routing with Path Reconstruction === */
+struct array* find_reputation_based_route(
+    long source, 
+    long destination, 
+    uint64_t amount,
+    struct network* network, 
+    uint64_t current_time,
+    long p,
+    enum pathfind_error* error,
+    enum routing_method routing_method,
+    struct element* exclude_edges,
+    uint64_t max_fee_limit,
+    struct network_params net_params
+);
+
+int is_node_in_avoided_list(long* avoided_nodes, int num_avoided, long node_id);
+void add_node_to_avoided_list(long** avoided_nodes, int* num_avoided, int* capacity, long node_id);
+
+/* === Reputation-Weighted Dijkstra: Dynamic routing based on node reputation === */
+struct array* dijkstra_with_reputation(long source, long destination, uint64_t amount,
+                                       struct network* network, uint64_t current_time,
+                                       long p, enum pathfind_error *error,
+                                       enum routing_method routing_method,
+                                       double rbr_weight);
+
 struct route* transform_path_into_route(struct array* path_hops, uint64_t amount_to_send, struct network* network, uint64_t time);
 
 int compare_distance(struct distance* a, struct distance* b);

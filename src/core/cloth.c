@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <dirent.h>
+#include <unistd.h>
 
 #include <gsl/gsl_rng.h>
 #include <gsl/gsl_cdf.h>
@@ -18,7 +19,13 @@
 #include "data_structures/list.h"
 #include "core/cloth.h"
 #include "network/network.h"
+#include "network/monitoring.h"
 #include "core/event.h"
+
+#define ANSI_RED   "\033[31m"
+#define ANSI_BLUE  "\033[34m"
+#define ANSI_BLACK "\033[30m"
+#define ANSI_RESET "\033[0m"
 
 /* 使用ライブラリの役割（このCファイル）
  * - 標準Cライブラリ（stdio/stdlib/string/time/math/stdint/inttypes/dirent）:
@@ -36,6 +43,102 @@
 /* シミュレーション全体のエントリポイント (main) と、
    ネットワーク/支払いの初期化および入出力処理をまとめたファイル。 */
 
+static const char* event_type_to_string(enum event_type type) {
+  switch (type) {
+    case FINDPATH: return "FINDPATH";
+    case SENDPAYMENT: return "SENDPAYMENT";
+    case FORWARDPAYMENT: return "FORWARDPAYMENT";
+    case RECEIVEPAYMENT: return "RECEIVEPAYMENT";
+    case FORWARDSUCCESS: return "FORWARDSUCCESS";
+    case RECEIVESUCCESS: return "RECEIVESUCCESS";
+    case FORWARDFAIL: return "FORWARDFAIL";
+    case RECEIVEFAIL: return "RECEIVEFAIL";
+    case OPENCHANNEL: return "OPENCHANNEL";
+    case CHANNELUPDATEFAIL: return "CHANNELUPDATEFAIL";
+    case CHANNELUPDATESUCCESS: return "CHANNELUPDATESUCCESS";
+    case UPDATEGROUP: return "UPDATEGROUP";
+    case CONSTRUCTGROUPS: return "CONSTRUCTGROUPS";
+    default: return "UNKNOWN";
+  }
+}
+
+void write_simple_view_static_graph(struct network* network, char output_dir_name[]) {
+  if (network == NULL) return;
+
+  char nodes_filename[512];
+  char edges_filename[512];
+  strcpy(nodes_filename, output_dir_name);
+  strcat(nodes_filename, "simple_view_nodes.csv");
+  strcpy(edges_filename, output_dir_name);
+  strcat(edges_filename, "simple_view_edges.csv");
+
+  FILE* nodes_file = fopen(nodes_filename, "w");
+  if (nodes_file == NULL) {
+    fprintf(stderr, "ERROR: cannot open %s\n", nodes_filename);
+    return;
+  }
+  FILE* edges_file = fopen(edges_filename, "w");
+  if (edges_file == NULL) {
+    fclose(nodes_file);
+    fprintf(stderr, "ERROR: cannot open %s\n", edges_filename);
+    return;
+  }
+
+  fprintf(nodes_file, "id,is_malicious,is_monitor\n");
+  for (long i = 0; i < array_len(network->nodes); i++) {
+    struct node* node = array_get(network->nodes, i);
+    fprintf(nodes_file, "%ld,%d,%d\n", node->id, node->is_malicious, node->is_monitor);
+  }
+
+  fprintf(edges_file, "node1,node2\n");
+  for (long i = 0; i < array_len(network->channels); i++) {
+    struct channel* channel = array_get(network->channels, i);
+    fprintf(edges_file, "%ld,%ld\n", channel->node1, channel->node2);
+  }
+
+  fclose(nodes_file);
+  fclose(edges_file);
+}
+
+void write_simple_view_state(char output_dir_name[],
+                             long completed_payments,
+                             long total_payments,
+                             uint64_t current_time,
+                             long payment_id,
+                             enum event_type event_type,
+                             long node_id,
+                             struct payment* payment) {
+  char route_buf[4096];
+  route_buf[0] = '\0';
+  if (payment != NULL && payment->route != NULL && payment->route->route_hops != NULL) {
+    for (long i = 0; i < array_len(payment->route->route_hops); i++) {
+      struct route_hop* hop = array_get(payment->route->route_hops, i);
+      char hop_buf[64];
+      snprintf(hop_buf, sizeof(hop_buf), "%ld-%ld", hop->from_node_id, hop->to_node_id);
+      if (i > 0) {
+        strncat(route_buf, "|", sizeof(route_buf) - strlen(route_buf) - 1);
+      }
+      strncat(route_buf, hop_buf, sizeof(route_buf) - strlen(route_buf) - 1);
+    }
+  }
+
+  char state_filename[512];
+  strcpy(state_filename, output_dir_name);
+  strcat(state_filename, "simple_view_state.tmp");
+  FILE* state_file = fopen(state_filename, "w");
+  if (state_file == NULL) return;
+
+  fprintf(state_file, "%ld,%ld,%llu,%ld,%s,%ld,%s\n",
+          completed_payments,
+          total_payments,
+          (unsigned long long)current_time,
+          payment_id,
+          event_type_to_string(event_type),
+          node_id,
+          route_buf);
+  fclose(state_file);
+}
+
 
 /* === Stage ① Write Baseline Metrics CSV ===
  *
@@ -47,6 +150,9 @@
  *   - success_rate: success percentage
  *   - avg_delay: average payment completion time
  *   - total_attacks_triggered: count of HTLC rejections
+ *   - attack_delay_total: total extra delay injected by attack-delay model
+ *   - attack_delay_avg_per_payment: average extra delay per payment
+ *   - payments_with_attack_delay: number of payments affected by attack-delay model
  */
 void write_baseline_metrics(struct network* network, struct array* payments, struct network_params net_params, char output_dir_name[]) {
   FILE* csv_metrics;
@@ -57,7 +163,29 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
   long n_failed = 0;
   long total_delay = 0;
   long total_attacks = 0;
+  uint64_t total_attack_delay = 0;
+  long payments_with_attack_delay = 0;
+  uint64_t total_attack_delay_events = 0;
   struct payment* payment;
+  long total_malicious_nodes = 0;
+  double detection_rate=0;
+  long rbr_detected_nodes = 0;
+
+  for (int i = 0; i < array_len(network->nodes); i++) {
+    struct node* node = (struct node*)array_get(network->nodes, i);
+    if (node != NULL) {
+      // もともとの集計：悪意あるノードの統計
+      if (node->is_malicious) {
+        total_malicious_nodes++;
+      }
+
+      // 追加：RBRロジック（スコアが0.3を下回った全ノードをカウント）
+      if (node->reputation_score < 0.3) {
+        rbr_detected_nodes++;
+      }
+    }
+  }
+  detection_rate=rbr_detected_nodes/total_malicious_nodes;
 
   // Count successful payments and collect statistics
   for (i = 0; i < n_payments; i++) {
@@ -72,6 +200,11 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
 
     total_delay += (payment->end_time - payment->start_time);
     total_attacks += payment->offline_node_count;  // Malicious nodes are recorded as offline
+    total_attack_delay += payment->attack_delay_added_total;
+    total_attack_delay_events += payment->attack_delay_event_count;
+    if (payment->attack_delay_added_total > 0) {
+      payments_with_attack_delay++;
+    }
   }
 
   double success_rate = (n_payments > 0) ? ((double)n_successful / (double)n_payments) : 0.0;
@@ -86,8 +219,9 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
     return;
   }
 
-  fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered\n");
-  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld\n",
+  fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered,attack_delay_total,attack_delay_avg_per_payment,payments_with_attack_delay,attack_delay_events,total_malicious_nodes,detection_rate,rbr_detected_nodes\n");
+
+  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld,%llu,%.2f,%ld,%llu,%ld,%.2f,%ld\n",
           n_payments,
           n_successful,
           n_failed,
@@ -95,7 +229,14 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
           avg_delay,
           net_params.malicious_node_ratio,
           net_params.malicious_failure_probability,
-          total_attacks);
+          total_attacks,
+          (unsigned long long)total_attack_delay,
+          (n_payments > 0) ? ((double)total_attack_delay / (double)n_payments) : 0.0,
+          payments_with_attack_delay,
+          (unsigned long long)total_attack_delay_events,
+         total_malicious_nodes,
+          detection_rate,
+          rbr_detected_nodes); // ここにカウントした変数を追加
 
   fclose(csv_metrics);
   printf("[Output] Wrote baseline metrics to %s\n", output_filename);
@@ -106,188 +247,267 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
  *
  * Records deployment location and configuration of each monitor
  */
-void write_monitor_placement_csv(struct network* network, char output_dir_name[]) {
-  if (!network || network->num_monitors == 0) {
-    return;
-  }
-  
-  FILE* csv_monitors;
-  char output_filename[512];
-  
-  strcpy(output_filename, output_dir_name);
-  strcat(output_filename, "monitor_placement.csv");
-  csv_monitors = fopen(output_filename, "w");
-  if (csv_monitors == NULL) {
-    printf("ERROR cannot open monitor_placement.csv\n");
-    return;
-  }
-  
-  fprintf(csv_monitors, "monitor_id,node_id,deployment_method,watching_hub_id,direct_hubs_count,direct_hubs_list\n");
-  
-  for (int i = 0; i < network->num_monitors; i++) {
-    MonitorAgent* m = &network->monitors[i];
-    
-    fprintf(csv_monitors, "%d,%d,%d,%d,%d,",
-            m->monitor_id,
-            m->node_id,
-            m->deployed_at_stage,
-            m->watching_hub_id,
-            m->num_direct_hubs);
-    
-    // Direct hubs list (pipe-separated)
-    for (int h = 0; h < m->num_direct_hubs; h++) {
-      if (h > 0) fprintf(csv_monitors, "|");
-      fprintf(csv_monitors, "%d", m->direct_hub_connections[h]);
-    }
-    fprintf(csv_monitors, "\n");
-  }
-  
-  fclose(csv_monitors);
-  printf("[Output] Wrote monitor placement to %s\n", output_filename);
-}
-
-
-/* === Stage ② Write Monitoring Metrics CSV ===
- *
- * Summarizes monitoring effectiveness: coverage rate, observability, etc.
+/* === Consolidated Summary Output Function ===
+ * Writes all summary CSV files at once after simulation completion
  */
-void write_monitoring_metrics_csv(struct network* network, long n_payments, int routing_method, char output_dir_name[]) {
-  if (!network || network->num_monitors == 0) {
+void write_all_summary_outputs(struct network* network, struct array* payments, 
+                               struct network_params net_params, char output_dir_name[]) {
+  if (network == NULL || payments == NULL) {
     return;
   }
-  
-  FILE* csv_metrics;
-  char output_filename[512];
-  
-  strcpy(output_filename, output_dir_name);
-  strcat(output_filename, "monitor_metrics.csv");
-  csv_metrics = fopen(output_filename, "w");
-  if (csv_metrics == NULL) {
-    printf("ERROR cannot open monitor_metrics.csv\n");
-    return;
-  }
-  
-  // Calculate aggregate statistics
-  long total_htlcs_observed = 0;
-  long total_payments_captured = 0;
-  
-  for (int i = 0; i < network->num_monitors; i++) {
-    total_htlcs_observed += network->monitors[i].total_htlcs_observed;
-    total_payments_captured += network->monitors[i].payments_captured;
-  }
-  
-  double coverage_rate = (n_payments > 0) ? ((double)total_payments_captured / (double)n_payments) : 0.0;
-  double observability_per_monitor = (network->num_monitors > 0) ? 
-    ((double)total_payments_captured / (double)network->num_monitors) : 0.0;
-  double avg_htlcs_observed = (network->num_monitors > 0) ? 
-    ((double)total_htlcs_observed / (double)network->num_monitors) : 0.0;
-  
-  fprintf(csv_metrics, "routing_method,num_monitors,cumulative_monitor_assignments,cumulative_monitor_relocations,total_payments,coverage_rate,observability_per_monitor,avg_htlcs_observed\n");
-  fprintf(csv_metrics, "%d,%d,%ld,%ld,%ld,%.4f,%.2f,%.2f\n",
-          routing_method,
-          network->num_monitors,
-          network->cumulative_monitor_assignments,
-          network->cumulative_monitor_relocations,
-          n_payments,
-          coverage_rate,
-          observability_per_monitor,
-          avg_htlcs_observed);
-  
-  fclose(csv_metrics);
-  printf("[Output] Wrote monitoring metrics to %s\n", output_filename);
-}
 
-
-/* === Stage ③ Write Reputation Dynamics CSV ===
- * Outputs reputation scores of all nodes for analysis
- */
-void write_reputation_dynamics_csv(struct network* network, char output_dir_name[]) {
-  if (network == NULL || network->nodes == NULL) {
-    return;
-  }
-  
-  char output_filename[512];
-  strcpy(output_filename, output_dir_name);
-  strcat(output_filename, "reputation_dynamics.csv");
-  
-  FILE* csv_reputation = fopen(output_filename, "w");
-  if (csv_reputation == NULL) {
-    fprintf(stderr, "ERROR: Cannot open %s\n", output_filename);
-    return;
-  }
-  
-  // Header
-  fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency\n");
-  
-  // Write reputation data for each node
-  for (int i = 0; i < array_len(network->nodes); i++) {
-    struct node* node = (struct node*)array_get(network->nodes, i);
-    if (node != NULL) {
-      int degree = array_len(node->open_edges);
-      long detection_latency = -1;
-      if (node->first_attack_time > 0 &&
-          node->first_detection_time >= node->first_attack_time) {
-        detection_latency = (long)(node->first_detection_time - node->first_attack_time);
-      }
-      fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%llu,%llu,%ld\n",
-              node->id,
-              node->is_malicious,
-              node->is_monitor,
-              node->reputation_score,
-              node->malicious_reports,
-              degree,
-              (unsigned long long)node->first_attack_time,
-              (unsigned long long)node->first_detection_time,
-              detection_latency);
-    }
-  }
-  
-  fclose(csv_reputation);
-  printf("[Output] Wrote reputation dynamics to %s\n", output_filename);
-}
-
-void write_prt_statistics_csv(struct array* payments, char output_dir_name[]) {
-  if (payments == NULL) {
-    return;
-  }
-  
-  char output_filename[512];
-  strcpy(output_filename, output_dir_name);
-  strcat(output_filename, "prt_statistics.csv");
-  
-  FILE* csv_prt = fopen(output_filename, "w");
-  if (csv_prt == NULL) {
-    fprintf(stderr, "ERROR: Cannot open %s\n", output_filename);
-    return;
-  }
-  
-  // Header
-  fprintf(csv_prt, "payment_id,reconstruction_count,prt_abort_triggered,prt_abort_time,is_success,attempts\n");
-  
-  int abort_count = 0;
-  int threshold_exceeded_count = 0;
-  
-  // Write PRT data for each payment
-  for (int i = 0; i < array_len(payments); i++) {
-    struct payment* payment = (struct payment*)array_get(payments, i);
-    if (payment != NULL) {
-      fprintf(csv_prt, "%ld,%d,%d,%llu,%d,%d\n",
-              payment->id,
-              payment->reconstruction_count,
-              payment->prt_abort_triggered,
-              payment->prt_abort_time,
-              payment->is_success,
-              payment->attempts);
+  /* === Write Monitor Placement CSV === */
+  if (network->num_monitors > 0) {
+    char output_filename[512];
+    strcpy(output_filename, output_dir_name);
+    strcat(output_filename, "monitor_placement.csv");
+    
+    FILE* csv_monitors = fopen(output_filename, "w");
+    if (csv_monitors != NULL) {
+      fprintf(csv_monitors, "monitor_id,node_id,deployment_method,watching_hub_id,direct_hubs_count,direct_hubs_list\n");
       
-      if (payment->prt_abort_triggered) {
-        abort_count++;
-        threshold_exceeded_count++;
+      for (int i = 0; i < network->num_monitors; i++) {
+        MonitorAgent* m = &network->monitors[i];
+        fprintf(csv_monitors, "%d,%d,%d,%d,%d,",
+                m->monitor_id,
+                m->node_id,
+                m->deployed_at_stage,
+                m->watching_hub_id,
+                m->num_direct_hubs);
+        
+        for (int h = 0; h < m->num_direct_hubs; h++) {
+          if (h > 0) fprintf(csv_monitors, "|");
+          fprintf(csv_monitors, "%d", m->direct_hub_connections[h]);
+        }
+        fprintf(csv_monitors, "\n");
       }
+      fclose(csv_monitors);
+      printf("[Output] Wrote monitor placement to %s\n", output_filename);
     }
   }
-  
-  fclose(csv_prt);
-  printf("[Output] Wrote PRT statistics to %s (aborts=%d)\n", output_filename, abort_count);
+
+  /* === Write Unified Summary Metrics CSV === */
+  {
+    char output_filename[512];
+    strcpy(output_filename, output_dir_name);
+    strcat(output_filename, "summary.csv");
+    
+    FILE* csv_metrics = fopen(output_filename, "w");
+    if (csv_metrics != NULL) {
+      /* Calculate monitoring metrics */
+      long total_htlcs_observed = 0;
+      long total_payments_captured = 0;
+      
+      if (network->num_monitors > 0) {
+        for (int i = 0; i < network->num_monitors; i++) {
+          total_htlcs_observed += network->monitors[i].total_htlcs_observed;
+          total_payments_captured += network->monitors[i].payments_captured;
+        }
+      }
+      
+      /* Count malicious nodes (expected) and detected malicious nodes */
+      int total_malicious_nodes = 0;
+      int detected_malicious_nodes = 0;
+      
+      for (int i = 0; i < array_len(network->nodes); i++) {
+        struct node* node = (struct node*)array_get(network->nodes, i);
+        if (node != NULL && node->is_malicious) {
+          total_malicious_nodes++;
+          if (node->malicious_reports > 0 || node->reputation_score < 0.5) {
+            detected_malicious_nodes++;
+          }
+        }
+      }
+      
+      double detection_rate = (total_malicious_nodes > 0) ?
+        ((double)detected_malicious_nodes / (double)total_malicious_nodes * 100.0) : 0.0;
+      
+      double coverage_rate = (array_len(payments) > 0) ? 
+        ((double)total_payments_captured / (double)array_len(payments) * 100.0) : 0.0;
+      
+      /* Calculate payment statistics */
+      long successful_payments = 0;
+      long total_attempts = 0;
+      long prt_abort_count = 0;
+      
+      for (int i = 0; i < array_len(payments); i++) {
+        struct payment* payment = (struct payment*)array_get(payments, i);
+        if (payment != NULL) {
+          if (payment->is_success) {
+            successful_payments++;
+          }
+          total_attempts += payment->attempts;
+          if (payment->prt_abort_triggered) {
+            prt_abort_count++;
+          }
+        }
+      }
+      
+      long total_payments = array_len(payments);
+      double success_rate = (total_payments > 0) ? 
+        ((double)successful_payments / (double)total_payments * 100.0) : 0.0;
+      double avg_attempts_per_payment = (total_payments > 0) ? 
+        ((double)total_attempts / (double)total_payments) : 0.0;
+      
+      /* Write header and data as key=value pairs */
+      fprintf(csv_metrics, "metric,value\n");
+      
+      /* Monitoring System */
+      fprintf(csv_metrics, "num_monitors,%d\n", network->num_monitors);
+      fprintf(csv_metrics, "monitoring_strategy,%d\n", net_params.monitoring_strategy);
+      fprintf(csv_metrics, "total_payments_captured,%ld\n", total_payments_captured);
+      fprintf(csv_metrics, "monitoring_coverage_rate_percent,%.2f\n", coverage_rate);
+      fprintf(csv_metrics, "avg_htlcs_observed_per_monitor,%.2f\n",
+              (network->num_monitors > 0) ? ((double)total_htlcs_observed / network->num_monitors) : 0.0);
+      
+      /* Attack Detection Results */
+      fprintf(csv_metrics, "total_malicious_nodes,%d\n", total_malicious_nodes);
+      fprintf(csv_metrics, "detected_malicious_nodes,%d\n", detected_malicious_nodes);
+      fprintf(csv_metrics, "malicious_detection_rate_percent,%.2f\n", detection_rate);
+      
+      /* Payment Results */
+      fprintf(csv_metrics, "total_payments,%ld\n", total_payments);
+      fprintf(csv_metrics, "successful_payments,%ld\n", successful_payments);
+      fprintf(csv_metrics, "payment_success_rate_percent,%.2f\n", success_rate);
+      fprintf(csv_metrics, "avg_attempts_per_payment,%.2f\n", avg_attempts_per_payment);
+      fprintf(csv_metrics, "prt_abort_count,%ld\n", prt_abort_count);
+      
+      /* Network Configuration */
+      fprintf(csv_metrics, "routing_method,%d\n", net_params.routing_method);
+      fprintf(csv_metrics, "enable_reputation_system,%d\n", net_params.enable_reputation_system);
+      fprintf(csv_metrics, "enable_prt,%d\n", net_params.enable_prt);
+      fprintf(csv_metrics, "enable_rbr,%d\n", net_params.enable_rbr);
+      
+      fclose(csv_metrics);
+      printf("[Output] Wrote unified summary.csv\n");
+      printf("  - Detection: %d/%d malicious nodes (%.2f%%)\n", 
+             detected_malicious_nodes, total_malicious_nodes, detection_rate);
+      printf("  - Success: %.2f%% (%ld/%ld payments)\n", 
+             success_rate, successful_payments, total_payments);
+      printf("  - Monitoring: %.2f%% coverage\n", coverage_rate);
+    }
+  }
+
+  /* === Write Reputation Dynamics CSV === */
+  if (net_params.enable_reputation_system && network->nodes != NULL) {
+    char output_filename[512];
+    strcpy(output_filename, output_dir_name);
+    strcat(output_filename, "reputation_dynamics.csv");
+    
+    FILE* csv_reputation = fopen(output_filename, "w");
+    if (csv_reputation != NULL) {
+      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency\n");
+      
+      for (int i = 0; i < array_len(network->nodes); i++) {
+        struct node* node = (struct node*)array_get(network->nodes, i);
+        if (node != NULL) {
+          int degree = array_len(node->open_edges);
+          long detection_latency = -1;
+          if (node->first_attack_time > 0 &&
+              node->first_detection_time >= node->first_attack_time) {
+            detection_latency = (long)(node->first_detection_time - node->first_attack_time);
+          }
+          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%llu,%llu,%ld\n",
+                  node->id,
+                  node->is_malicious,
+                  node->is_monitor,
+                  node->reputation_score,
+                  node->malicious_reports,
+                  degree,
+                  (unsigned long long)node->first_attack_time,
+                  (unsigned long long)node->first_detection_time,
+                  detection_latency);
+        }
+      }
+      fclose(csv_reputation);
+      printf("[Output] Wrote reputation dynamics to %s\n", output_filename);
+    }
+  }
+
+  /* === Write PRT Statistics CSV === */
+  if (net_params.enable_prt) {
+    char output_filename[512];
+    strcpy(output_filename, output_dir_name);
+    strcat(output_filename, "prt_statistics.csv");
+    
+    FILE* csv_prt = fopen(output_filename, "w");
+    if (csv_prt != NULL) {
+      fprintf(csv_prt, "payment_id,reconstruction_count,prt_abort_triggered,prt_abort_time,is_success,attempts\n");
+      
+      int abort_count = 0;
+      for (int i = 0; i < array_len(payments); i++) {
+        struct payment* payment = (struct payment*)array_get(payments, i);
+        if (payment != NULL) {
+          fprintf(csv_prt, "%ld,%d,%d,%llu,%d,%d\n",
+                  payment->id,
+                  payment->reconstruction_count,
+                  payment->prt_abort_triggered,
+                  payment->prt_abort_time,
+                  payment->is_success,
+                  payment->attempts);
+          
+          if (payment->prt_abort_triggered) {
+            abort_count++;
+          }
+        }
+      }
+      fclose(csv_prt);
+      printf("[Output] Wrote PRT statistics to %s (aborts=%d)\n", output_filename, abort_count);
+    }
+  }
+
+  /* === Write Payment Estimation CSV (from monitoring) === */
+  if (net_params.monitoring_strategy > 0) {
+    printf("[Monitoring] Starting payment information integration...\n");
+    fflush(stdout);
+    struct array* estimated_payments = integrate_observations_from_monitors(network);
+    printf("[Monitoring] Integration complete: %ld estimated payments\n", array_len(estimated_payments));
+    fflush(stdout);
+    
+    if (estimated_payments != NULL && array_len(estimated_payments) > 0) {
+      char output_filename[512];
+      strcpy(output_filename, output_dir_name);
+      strcat(output_filename, "payment_information_estimation.csv");
+      
+      FILE* f = fopen(output_filename, "w");
+      if (f != NULL) {
+        fprintf(f, "estimated_payment_id,complete_path,amount,num_hops,num_observations,success_status,confidence_level\n");
+        
+        for (int i = 0; i < array_len(estimated_payments); i++) {
+          struct estimated_payment* est = (struct estimated_payment*)array_get(estimated_payments, i);
+          
+          if (est == NULL || est->complete_path == NULL) {
+            continue;
+          }
+          
+          char path_str[1024] = "";
+          for (int j = 0; j < est->path_length; j++) {
+            if (j > 0) strcat(path_str, "-");
+            char node_str[16];
+            snprintf(node_str, sizeof(node_str), "%ld", est->complete_path[j]);
+            strcat(path_str, node_str);
+          }
+          
+          fprintf(f, "%d,\"%s\",%llu,%d,%d,%s,%.2f\n",
+                  i,
+                  path_str,
+                  est->amount,
+                  est->path_length,
+                  est->num_observations,
+                  est->success_status,
+                  est->confidence_level);
+        }
+        fclose(f);
+        printf("[Output] Wrote payment_information_estimation.csv\n");
+      }
+    }
+    
+    for (int i = 0; i < array_len(estimated_payments); i++) {
+      struct estimated_payment* est = (struct estimated_payment*)array_get(estimated_payments, i);
+      free_estimated_payment(est);
+    }
+    array_free(estimated_payments);
+  }
 }
 
 void write_stage4_comparison_csv(struct array* payments, struct network* network, 
@@ -312,6 +532,9 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   int aborted_payments = 0;
   int high_recon_count = 0;
   uint64_t total_delay = 0;
+  uint64_t total_attack_delay = 0;
+  int payments_with_attack_delay = 0;
+  uint64_t total_attack_delay_events = 0;
   int total_attempts = 0;
   
   for (int i = 0; i < total_payments; i++) {
@@ -322,6 +545,11 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
       if (pmt->reconstruction_count > 5) high_recon_count++;
       if (pmt->end_time > pmt->start_time) {
         total_delay += (pmt->end_time - pmt->start_time);
+      }
+      total_attack_delay += pmt->attack_delay_added_total;
+      total_attack_delay_events += pmt->attack_delay_event_count;
+      if (pmt->attack_delay_added_total > 0) {
+        payments_with_attack_delay++;
       }
       total_attempts += pmt->attempts;
     }
@@ -353,6 +581,13 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
           (double)total_delay / total_payments);
   fprintf(csv_stage4, "avg_attempts_per_payment,%.2f\n", 
           (double)total_attempts / total_payments);
+  fprintf(csv_stage4, "attack_delay_total_ms,%llu\n",
+          (unsigned long long)total_attack_delay);
+  fprintf(csv_stage4, "attack_delay_avg_ms_per_payment,%.2f\n",
+          (double)total_attack_delay / total_payments);
+  fprintf(csv_stage4, "payments_with_attack_delay,%d\n", payments_with_attack_delay);
+  fprintf(csv_stage4, "attack_delay_events,%llu\n",
+          (unsigned long long)total_attack_delay_events);
   fprintf(csv_stage4, "malicious_nodes_detected,%d\n", detected_malicious);
   fprintf(csv_stage4, "malicious_nodes_low_reputation,%d\n", low_reputation_malicious);
   fprintf(csv_stage4, "enable_prt,%d\n", net_params.enable_prt);
@@ -407,7 +642,7 @@ void write_output(struct network* network, struct array* payments, char output_d
   fprintf(csv_channel_output, "id,edge1,edge2,node1,node2,capacity,is_closed\n");
   for(i=0; i<array_len(network->channels); i++) {
     channel = array_get(network->channels, i);
-    fprintf(csv_channel_output, "%ld,%ld,%ld,%ld,%ld,%ld,%d\n", channel->id, channel->edge1, channel->edge2, channel->node1, channel->node2, channel->capacity, channel->is_closed);
+    fprintf(csv_channel_output, "%ld,%ld,%ld,%ld,%ld,%llu,%d\n", channel->id, channel->edge1, channel->edge2, channel->node1, channel->node2, channel->capacity, channel->is_closed);
   }
   fclose(csv_channel_output);
 
@@ -432,7 +667,7 @@ void write_output(struct network* network, struct array* payments, char output_d
             fprintf(csv_group_output, ",");
         }
     }
-    fprintf(csv_group_output, "%lu,%lu,%lu,%lu,", group->is_closed, group->constructed_time, group->min_cap_limit, group->max_cap_limit);
+    fprintf(csv_group_output, "%llu,%llu,%llu,%llu,", group->is_closed, group->constructed_time, group->min_cap_limit, group->max_cap_limit);
     fprintf(csv_group_output, "\"[");
     float cul_avg = 0.0f;
     for(struct element* iterator = group->history; iterator != NULL; iterator = iterator->next) {
@@ -444,9 +679,9 @@ void write_output(struct network* network, struct array* payments, char output_d
             float cul = (1.0f - ((float)group_update->group_cap / (float)group_update->edge_balances[j]));
             sum_cul += cul;
             if(group_update->fake_balance_updated_edge_id == e->id){
-                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%ld,\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s,\"\"actual_balance\"\":%ld}", e->id, group_update->edge_balances[j], cul, "true", group_update->fake_balance_updated_edge_actual_balance);
+                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%llu,\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s,\"\"actual_balance\"\":%ld}", e->id, group_update->edge_balances[j], cul, "true", group_update->fake_balance_updated_edge_actual_balance);
             }else{
-                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%ld,\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s}", e->id, group_update->edge_balances[j], cul, "false");
+                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%llu,\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s}", e->id, group_update->edge_balances[j], cul, "false");
             }
             if(j < n_members - 1) {
                 fprintf(csv_group_output, ",");
@@ -454,7 +689,7 @@ void write_output(struct network* network, struct array* payments, char output_d
         }
         float cul = sum_cul / (float)n_members;
         cul_avg += cul / (float) list_len(group->history);
-        fprintf(csv_group_output, "],\"\"time\"\":%lu,\"\"group_cap\"\":%lu,\"\"cul_avg\"\":%f,\"\"triggered_edge_id\"\":%ld}", group_update->time, group_update->group_cap, cul, group_update->fake_balance_updated_edge_id, group_update->fake_balance_updated_edge_actual_balance, group_update->triggered_edge_id);
+        fprintf(csv_group_output, "],\"\"time\"\":%llu,\"\"group_cap\"\":%llu,\"\"cul_avg\"\":%f,\"\"triggered_edge_id\"\":%ld}", group_update->time, group_update->group_cap, cul, group_update->fake_balance_updated_edge_id, group_update->fake_balance_updated_edge_actual_balance, group_update->triggered_edge_id);
         if(iterator->next != NULL) {
             fprintf(csv_group_output, ",");
         }
@@ -473,16 +708,16 @@ void write_output(struct network* network, struct array* payments, char output_d
   fprintf(csv_edge_output, "id,channel_id,counter_edge_id,from_node_id,to_node_id,balance,fee_base,fee_proportional,min_htlc,timelock,is_closed,tot_flows,cul_threshold,channel_updates,group\n");
   for(i=0; i<array_len(network->edges); i++) {
     edge = array_get(network->edges, i);
-    fprintf(csv_edge_output, "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%d,%ld,%lf,", edge->id, edge->channel_id, edge->counter_edge_id, edge->from_node_id, edge->to_node_id, edge->balance, edge->policy.fee_base, edge->policy.fee_proportional, edge->policy.min_htlc, edge->policy.timelock, edge->is_closed, edge->tot_flows, edge->policy.cul_threshold);
+    fprintf(csv_edge_output, "%ld,%ld,%ld,%ld,%ld,%llu,%llu,%llu,%llu,%lu,%d,%llu,%lf,", edge->id, edge->channel_id, edge->counter_edge_id, edge->from_node_id, edge->to_node_id, edge->balance, edge->policy.fee_base, edge->policy.fee_proportional, edge->policy.min_htlc, edge->policy.timelock, edge->is_closed, edge->tot_flows, edge->policy.cul_threshold);
     char channel_updates_text[1000000] = "";
     for (struct element *iterator = edge->channel_updates; iterator != NULL; iterator = iterator->next) {
         struct channel_update *channel_update = iterator->data;
         char temp[1000000];
         int written = 0;
         if(iterator->next != NULL) {
-            written = snprintf(temp, sizeof(temp), "-%ld%s", channel_update->htlc_maximum_msat, channel_updates_text);
+            written = snprintf(temp, sizeof(temp), "-%llu%s", channel_update->htlc_maximum_msat, channel_updates_text);
         }else{
-            written = snprintf(temp, sizeof(temp), "%ld%s", channel_update->htlc_maximum_msat, channel_updates_text);
+            written = snprintf(temp, sizeof(temp), "%llu%s", channel_update->htlc_maximum_msat, channel_updates_text);
         }
         // Check if the output was truncated
         if (written < 0 || (size_t)written >= sizeof(temp)) {
@@ -507,11 +742,11 @@ void write_output(struct network* network, struct array* payments, char output_d
     printf("ERROR cannot open payment_output.csv\n");
     exit(-1);
   }
-  fprintf(csv_payment_output, "id,sender_id,receiver_id,amount,start_time,max_fee_limit,end_time,mpp,is_success,no_balance_count,offline_node_count,timeout_exp,attempts,route,total_fee,attempts_history\n");
+  fprintf(csv_payment_output, "id,sender_id,receiver_id,amount,start_time,max_fee_limit,end_time,mpp,is_success,no_balance_count,offline_node_count,timeout_exp,attack_delay_total,attack_delay_events,attempts,route,total_fee,attempts_history\n");
   for(i=0; i<array_len(payments); i++)  {
     payment = array_get(payments, i);
     if (payment->id == -1) continue;
-    fprintf(csv_payment_output, "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%u,%d,%d,%u,%d,", payment->id, payment->sender, payment->receiver, payment->amount, payment->start_time, payment->max_fee_limit, payment->end_time, payment->is_shard, payment->is_success, payment->no_balance_count, payment->offline_node_count, payment->is_timeout, payment->attempts);
+    fprintf(csv_payment_output, "%ld,%ld,%ld,%llu,%llu,%llu,%llu,%u,%u,%d,%d,%u,%llu,%u,%d,", payment->id, payment->sender, payment->receiver, payment->amount, payment->start_time, payment->max_fee_limit, payment->end_time, payment->is_shard, payment->is_success, payment->no_balance_count, payment->offline_node_count, payment->is_timeout, (unsigned long long)payment->attack_delay_added_total, payment->attack_delay_event_count, payment->attempts);
     route = payment->route;
     if(route==NULL)
       fprintf(csv_payment_output, ",,");
@@ -524,14 +759,14 @@ void write_output(struct network* network, struct array* payments, char output_d
         else
           fprintf(csv_payment_output,"%ld-",hop->edge_id);
       }
-      fprintf(csv_payment_output, "%ld,",route->total_fee);
+      fprintf(csv_payment_output, "%llu,",route->total_fee);
     }
     // build attempts history json
     if(payment->history != NULL) {
         fprintf(csv_payment_output, "\"[");
         for (struct element *iterator = payment->history; iterator != NULL; iterator = iterator->next) {
             struct attempt *attempt = iterator->data;
-            fprintf(csv_payment_output, "{\"\"attempts\"\":%d,\"\"is_succeeded\"\":%d,\"\"end_time\"\":%lu,\"\"error_edge\"\":%lu,\"\"error_type\"\":%d,\"\"route\"\":[", attempt->attempts, attempt->is_succeeded, attempt->end_time, attempt->error_edge_id, attempt->error_type);
+            fprintf(csv_payment_output, "{\"\"attempts\"\":%d,\"\"is_succeeded\"\":%ld,\"\"end_time\"\":%llu,\"\"error_edge\"\":%lu,\"\"error_type\"\":%d,\"\"route\"\":[", attempt->attempts, attempt->is_succeeded, attempt->end_time, attempt->error_edge_id, attempt->error_type);
             for (j = 0; j < array_len(attempt->route); j++) {
                 struct edge_snapshot* edge_snapshot = array_get(attempt->route, j);
                 edge = array_get(network->edges, edge_snapshot->id);
@@ -592,10 +827,17 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
   /* === Stage ① Malicious Node Parameters === */
   net_params->malicious_node_ratio = 0.0;
   net_params->malicious_failure_probability = 0.0;
+  net_params->enable_network_attack_delay = 0;
+  net_params->attack_delay_start_time = 30000;
+  net_params->attack_delay_duration = 30000;
+  net_params->attack_delay_intensity = 1.0;
+  net_params->attack_delay_jitter = 0.0;
   /* === Stage ② Monitor Placement Parameters === */
   net_params->hub_degree_threshold = 50;
   net_params->monitoring_strategy = 0;  // 0=disabled, 1=method1, 2=method2
   net_params->top_hub_count = 30;
+  net_params->enable_simple_progress_mode = 0;
+  net_params->enable_simple_progress_window = 0;
   /* === Stage ③ Reputation System Parameters === */
   net_params->enable_reputation_system = 0;
   net_params->reputation_decay_rate = 0.01;      // 1% decay per event
@@ -622,26 +864,39 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
 }
 
 
-/* parse the input parameters in "cloth_input.txt" */
-/* cloth_input.txt を開き、1 行ずつ key=value 形式でパースして
+/* parse the input parameters in config/cloth_input.txt (fallback: cloth_input.txt) */
+/* config/cloth_input.txt を開き、1 行ずつ key=value 形式でパースして
  * network_params / payments_params 構造体を埋める。
  *
  * - = の前後に空白がある行はエラーとして終了する。
  * - 一部のパラメータは空文字列を特別な値 (-1 や 0) として解釈する。
  * - 不明なキーや不正な値がある場合は stderr に出力して即時 exit(-1)。
  *
- * 実行時カレントディレクトリに cloth_input.txt が存在する必要がある。 */
+ * 実行時カレントディレクトリに config/cloth_input.txt
+ * (互換用に cloth_input.txt でも可) が存在する必要がある。 */
 void read_input(struct network_params* net_params, struct payments_params* pay_params){
   FILE* input_file;
   char *parameter, *value, line[1024];
+  const char* input_candidates[] = {"config/cloth_input.txt", "cloth_input.txt"};
+  int selected = -1;
 
   initialize_input_parameters(net_params, pay_params);
 
-  input_file = fopen("cloth_input.txt","r");
+  for (int i = 0; i < 2; i++) {
+    input_file = fopen(input_candidates[i], "r");
+    if (input_file != NULL) {
+      selected = i;
+      break;
+    }
+  }
 
   if(input_file==NULL){
-    fprintf(stderr, "ERROR: cannot open file <cloth_input.txt> in current directory.\n");
+    fprintf(stderr, "ERROR: cannot open <config/cloth_input.txt> or <cloth_input.txt> in current directory.\n");
     exit(-1);
+  }
+
+  if (selected == 1) {
+    fprintf(stderr, "WARN: using legacy <cloth_input.txt>. Prefer <config/cloth_input.txt>.\n");
   }
 
   while(fgets(line, 1024, input_file)){
@@ -701,6 +956,21 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
     else if(strcmp(parameter, "malicious_failure_probability")==0){
       net_params->malicious_failure_probability = strtod(value, NULL);
     }
+    else if(strcmp(parameter, "enable_network_attack_delay")==0){
+      net_params->enable_network_attack_delay = (strcmp(value, "true")==0) ? 1 : 0;
+    }
+    else if(strcmp(parameter, "attack_delay_start_time")==0){
+      net_params->attack_delay_start_time = (uint64_t)strtoull(value, NULL, 10);
+    }
+    else if(strcmp(parameter, "attack_delay_duration")==0){
+      net_params->attack_delay_duration = (uint64_t)strtoull(value, NULL, 10);
+    }
+    else if(strcmp(parameter, "attack_delay_intensity")==0){
+      net_params->attack_delay_intensity = strtod(value, NULL);
+    }
+    else if(strcmp(parameter, "attack_delay_jitter")==0){
+      net_params->attack_delay_jitter = strtod(value, NULL);
+    }
     /* === Stage ② Monitor Placement Parameters === */
     else if(strcmp(parameter, "hub_degree_threshold")==0){
       net_params->hub_degree_threshold = strtol(value, NULL, 10);
@@ -715,6 +985,23 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
     }
     else if(strcmp(parameter, "top_hub_count")==0){
       net_params->top_hub_count = strtol(value, NULL, 10);
+    }
+    else if(strcmp(parameter, "monitor_node_limit")==0){
+      extern int MONITOR_NODE_LIMIT;
+      int limit = strtol(value, NULL, 10);
+      printf("[Config] Read monitor_node_limit: value='%s' parsed as %d\n", value, limit);
+      fflush(stdout);
+      if (limit > 0) {
+        printf("[Config] Setting MONITOR_NODE_LIMIT: %d → %d\n", MONITOR_NODE_LIMIT, limit);
+        fflush(stdout);
+        MONITOR_NODE_LIMIT = limit;
+      }
+    }
+    else if(strcmp(parameter, "enable_simple_progress_mode")==0){
+      net_params->enable_simple_progress_mode = (strcmp(value, "true")==0) ? 1 : 0;
+    }
+    else if(strcmp(parameter, "enable_simple_progress_window")==0){
+      net_params->enable_simple_progress_window = (strcmp(value, "true")==0) ? 1 : 0;
     }
     /* === Stage ③ Reputation System Parameters === */
     else if(strcmp(parameter, "enable_reputation_system")==0){
@@ -874,6 +1161,16 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
           exit(-1);
       }
   }
+  if(net_params->enable_network_attack_delay){
+      if(net_params->attack_delay_intensity < 1.0){
+          fprintf(stderr, "ERROR: parameter <attack_delay_intensity> must be >= 1.0 when attack delay is enabled.\n");
+          exit(-1);
+      }
+      if(net_params->attack_delay_jitter < 0.0){
+          fprintf(stderr, "ERROR: parameter <attack_delay_jitter> must be >= 0.0.\n");
+          exit(-1);
+      }
+  }
   fclose(input_file);
 }
 
@@ -911,6 +1208,8 @@ void post_process_payment_stats(struct array* payments){
     payment->no_balance_count = shard1->no_balance_count + shard2->no_balance_count;
     payment->offline_node_count = shard1->offline_node_count + shard2->offline_node_count;
     payment->is_timeout = shard1->is_timeout || shard2->is_timeout ? 1 : 0;
+    payment->attack_delay_added_total = shard1->attack_delay_added_total + shard2->attack_delay_added_total;
+    payment->attack_delay_event_count = shard1->attack_delay_event_count + shard2->attack_delay_event_count;
     payment->attempts = shard1->attempts + shard2->attempts;
     if(shard1->route != NULL && shard2->route != NULL){
       payment->route = array_len(shard1->route->route_hops) > array_len(shard2->route->route_hops) ? shard1->route : shard2->route;
@@ -971,10 +1270,114 @@ int main(int argc, char *argv[]) {
 
   read_input(&net_params, &pay_params);
 
+  /* Override parameters from environment variables (takes precedence over cloth_input.txt).
+   * run-simulation.sh が各パラメータを CLOTH_<PARAM_NAME> 形式の環境変数にも
+   * セットするため、cloth_input.txt への sed 置換が失敗した場合でも
+   * ここで正しい値に上書きされる。
+   * 新しいパラメータを追加した場合はこのブロックにも追記すること。 */
+  {
+    extern int MONITOR_NODE_LIMIT;
+    const char* env_val;
+
+    /* --- ネットワーク規模 --- */
+    if ((env_val = getenv("CLOTH_N_ADDITIONAL_NODES")) != NULL) {
+      long v = strtol(env_val, NULL, 10);
+      if (v > 0) {
+        printf("[Config] Override n_additional_nodes from env: %ld → %ld\n", (long)net_params.n_nodes, v);
+        net_params.n_nodes = v;
+      }
+    }
+
+    /* --- 悪意ノード割合・攻撃確率 --- */
+    if ((env_val = getenv("CLOTH_MALICIOUS_NODE_RATIO")) != NULL) {
+      double v = strtod(env_val, NULL);
+      printf("[Config] Override malicious_node_ratio from env: %.4f → %.4f\n",
+             net_params.malicious_node_ratio, v);
+      net_params.malicious_node_ratio = v;
+    }
+    if ((env_val = getenv("CLOTH_MALICIOUS_FAILURE_PROBABILITY")) != NULL) {
+      double v = strtod(env_val, NULL);
+      printf("[Config] Override malicious_failure_probability from env: %.4f → %.4f\n",
+             net_params.malicious_failure_probability, v);
+      net_params.malicious_failure_probability = v;
+    }
+
+    /* --- 監視ノード数上限 --- */
+    if ((env_val = getenv("CLOTH_MONITOR_NODE_LIMIT")) != NULL) {
+      int limit = atoi(env_val);
+      if (limit > 0) {
+        printf("[Config] Override MONITOR_NODE_LIMIT from env: %d → %d\n", MONITOR_NODE_LIMIT, limit);
+        MONITOR_NODE_LIMIT = limit;
+      }
+    }
+
+    /* --- 監視戦略 --- */
+    if ((env_val = getenv("CLOTH_MONITORING_STRATEGY")) != NULL) {
+      if      (strcmp(env_val, "method1") == 0) net_params.monitoring_strategy = 1;
+      else if (strcmp(env_val, "method2") == 0) net_params.monitoring_strategy = 2;
+      else                                       net_params.monitoring_strategy = 0;
+      printf("[Config] Override monitoring_strategy from env: %d\n", net_params.monitoring_strategy);
+    }
+
+    /* --- レピュテーション / 防御フラグ --- */
+    if ((env_val = getenv("CLOTH_ENABLE_REPUTATION_SYSTEM")) != NULL) {
+      net_params.enable_reputation_system = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_reputation_system from env: %d\n", net_params.enable_reputation_system);
+    }
+    if ((env_val = getenv("CLOTH_ENABLE_MONITOR_MOVEMENT")) != NULL) {
+      net_params.enable_monitor_movement = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_monitor_movement from env: %d\n", net_params.enable_monitor_movement);
+    }
+    if ((env_val = getenv("CLOTH_ENABLE_PRA")) != NULL) {
+      net_params.enable_pra = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_pra from env: %d\n", net_params.enable_pra);
+    }
+    if ((env_val = getenv("CLOTH_ENABLE_PRT")) != NULL) {
+      net_params.enable_prt = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_prt from env: %d\n", net_params.enable_prt);
+    }
+    if ((env_val = getenv("CLOTH_ENABLE_RBR")) != NULL) {
+      net_params.enable_rbr = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_rbr from env: %d\n", net_params.enable_rbr);
+    }
+
+    /* --- 攻撃遅延パラメータ --- */
+    if ((env_val = getenv("CLOTH_ENABLE_NETWORK_ATTACK_DELAY")) != NULL) {
+      net_params.enable_network_attack_delay = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_network_attack_delay from env: %d\n", net_params.enable_network_attack_delay);
+    }
+    if ((env_val = getenv("CLOTH_ATTACK_DELAY_INTENSITY")) != NULL) {
+      net_params.attack_delay_intensity = strtod(env_val, NULL);
+      printf("[Config] Override attack_delay_intensity from env: %.2f\n", net_params.attack_delay_intensity);
+    }
+
+    /* --- 支払い数 --- */
+    if ((env_val = getenv("CLOTH_N_PAYMENTS")) != NULL) {
+      long v = strtol(env_val, NULL, 10);
+      if (v > 0) {
+        printf("[Config] Override n_payments from env: %ld\n", v);
+        pay_params.n_payments = v;
+      }
+    }
+
+    /* --- top_hub_count --- */
+    if ((env_val = getenv("CLOTH_TOP_HUB_COUNT")) != NULL) {
+      long v = strtol(env_val, NULL, 10);
+      if (v > 0) {
+        printf("[Config] Override top_hub_count from env: %ld\n", v);
+        net_params.top_hub_count = (int)v;
+      }
+    }
+
+    fflush(stdout);
+  }
+
   simulation = malloc(sizeof(struct simulation));
   simulation->current_time = 0;
 
   simulation->random_generator = initialize_random_generator();
+
+
   printf("NETWORK INITIALIZATION\n");
   network = initialize_network(net_params, simulation->random_generator);
   n_nodes = array_len(network->nodes);
@@ -982,7 +1385,7 @@ int main(int argc, char *argv[]) {
 
   /* === Stage ① Initialize Malicious Nodes === */
   if (net_params.malicious_node_ratio > 0.0) {
-    initialize_malicious_nodes(network, 
+    initialize_malicious_nodes(network,
                                net_params.malicious_node_ratio,
                                net_params.malicious_failure_probability,
                                simulation->random_generator);
@@ -1013,7 +1416,38 @@ int main(int argc, char *argv[]) {
     printf("group_cover_rate on init : %f\n", (float)(array_len(network->edges) - list_len(group_add_queue)) / (float)(array_len(network->edges)));
 
   printf("PAYMENTS INITIALIZATION\n");
-  payments = initialize_payments(pay_params,  n_nodes, simulation->random_generator);
+  payments = initialize_payments(pay_params, n_nodes, simulation->random_generator);
+
+  /* === Stage ② Monitoring: Initialize Trust Scores and Balance Adjustment Payments === */
+  if (net_params.monitoring_strategy > 0) {
+    printf("[Monitoring] Initializing trust scores for %d monitors\n", network->num_monitors);
+    initialize_monitor_trust_scores(network);
+
+    printf("[Monitoring] Generating balance adjustment payments\n");
+    struct array* balance_adjustment_payments = generate_balance_adjustment_payments(
+        network,
+        1000,  // start_time = 1000ms
+        simulation->random_generator
+    );
+
+    if (array_len(balance_adjustment_payments) > 0) {
+      printf("[Monitoring] Generated %d balance adjustment payments\n", array_len(balance_adjustment_payments));
+      // TODO: Integrate balance adjustment payments into main payments array
+      // For now, just keep them for future event scheduling
+    }
+
+    // Free balance adjustment array (will be re-generated if needed)
+    for (int i = 0; i < array_len(balance_adjustment_payments); i++) {
+      struct balance_adjustment_payment* ba = (struct balance_adjustment_payment*)
+          array_get(balance_adjustment_payments, i);
+      free(ba);
+    }
+    array_free(balance_adjustment_payments);
+  }
+
+  if (net_params.enable_simple_progress_mode && net_params.enable_simple_progress_window) {
+    write_simple_view_static_graph(network, output_dir_name);
+  }
 
   printf("EVENTS INITIALIZATION\n");
   simulation->events = initialize_events(payments);
@@ -1037,10 +1471,50 @@ int main(int argc, char *argv[]) {
   begin = clock();
   simulation->current_time = 1;
   long completed_payments = 0;
+  int simple_mode_is_tty = isatty(fileno(stdout));
   while(heap_len(simulation->events) != 0) {
     event = heap_pop(simulation->events, compare_event);
 
     simulation->current_time = event->time;
+    if (net_params.enable_simple_progress_mode) {
+      long total_payments = array_len(payments);
+      long payment_id = -1;
+      if (event->payment != NULL) {
+        payment_id = event->payment->id;
+      }
+      const char* color = simple_mode_is_tty ? ANSI_BLACK : "";
+      const char* reset_color = simple_mode_is_tty ? ANSI_RESET : "";
+      struct node* node = NULL;
+      if (event->node_id >= 0 && event->node_id < array_len(network->nodes)) {
+        node = array_get(network->nodes, event->node_id);
+      }
+      if (node != NULL) {
+        if (node->is_malicious) color = ANSI_RED;
+        else if (node->is_monitor) color = ANSI_BLUE;
+      }
+      double ratio = (total_payments > 0) ? ((double)completed_payments / (double)total_payments) * 100.0 : 0.0;
+      if (net_params.enable_simple_progress_window) {
+        write_simple_view_state(output_dir_name,
+                                completed_payments,
+                                total_payments,
+                                simulation->current_time,
+                                payment_id,
+                                event->type,
+                                event->node_id,
+                                event->payment);
+      }
+      fflush(stdout);
+      usleep(200000);
+    }
+
+    // === Dynamic Reputation Update from Monitoring ===
+    // Periodically integrate monitor observations and update global reputation scores
+    if (net_params.monitoring_strategy > 0 &&
+        completed_payments > 0 &&
+        completed_payments % 500 == 0) {
+      share_monitor_information_and_update_reputation(network, net_params);
+    }
+
     switch(event->type){
     case FINDPATH:
       find_path(event, simulation, network, &payments, pay_params.mpp, net_params.routing_method, net_params);
@@ -1084,8 +1558,16 @@ int main(int argc, char *argv[]) {
       exit(-1);
     }
 
-    struct payment* p = array_get(payments, event->payment->id);
-    if(p->end_time != 0 && event->type != UPDATEGROUP && event->type != CONSTRUCTGROUPS && event->type != CHANNELUPDATEFAIL && event->type != CHANNELUPDATESUCCESS){
+    if (event->payment != NULL &&
+        event->type != UPDATEGROUP &&
+        event->type != CONSTRUCTGROUPS &&
+        event->type != CHANNELUPDATEFAIL &&
+        event->type != CHANNELUPDATESUCCESS) {
+        struct payment* p = array_get(payments, event->payment->id);
+        if (p->end_time == 0) {
+            free(event);
+            continue;
+        }
         completed_payments++;
 
         if (net_params.enable_monitor_movement &&
@@ -1100,13 +1582,25 @@ int main(int argc, char *argv[]) {
         FILE* progress_file = fopen(progress_filename, "w");
         if(progress_file != NULL){
             fprintf(progress_file, "%f", (float)completed_payments / (float)array_len(payments));
+            fclose(progress_file);
         }
-        fclose(progress_file);
+        if (net_params.enable_simple_progress_mode && net_params.enable_simple_progress_window) {
+            write_simple_view_state(output_dir_name,
+                                    completed_payments,
+                                    array_len(payments),
+                                    simulation->current_time,
+                                    event->payment->id,
+                                    event->type,
+                                    event->node_id,
+                                    event->payment);
+        }
     }
 
     free(event);
   }
-  printf("\n");
+  if (net_params.enable_simple_progress_mode) {
+    printf("\n");
+  }
   end = clock();
 
   if(pay_params.mpp)
@@ -1118,21 +1612,8 @@ int main(int argc, char *argv[]) {
   /* === Stage ① Write Baseline Metrics === */
   write_baseline_metrics(network, payments, net_params, output_dir_name);
 
-  /* === Stage ② Write Monitor Placement Metrics === */
-  if (network->num_monitors > 0) {
-    write_monitor_placement_csv(network, output_dir_name);
-    write_monitoring_metrics_csv(network, array_len(payments), net_params.routing_method, output_dir_name);
-  }
-
-  /* === Stage ③ Write Reputation Dynamics === */
-  if (net_params.enable_reputation_system) {
-    write_reputation_dynamics_csv(network, output_dir_name);
-  }
-
-  /* === Stage ④ Write PRT Statistics === */
-  if (net_params.enable_prt) {
-    write_prt_statistics_csv(payments, output_dir_name);
-  }
+  /* === Write All Summary Outputs (Monitoring, Reputation, PRT, Payment Estimation) === */
+  write_all_summary_outputs(network, payments, net_params, output_dir_name);
 
   /* === Stage ④ Write Comparison Metrics === */
   if (net_params.enable_prt || net_params.enable_rbr) {

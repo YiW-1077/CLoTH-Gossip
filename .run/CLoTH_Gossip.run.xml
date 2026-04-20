@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="CLoTH_Gossip" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="result/" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="CLoTH_Gossip" TARGET_NAME="CLoTH_Gossip" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="CLoTH_Gossip" RUN_TARGET_NAME="CLoTH_Gossip">
+  <configuration default="false" name="CLoTH_Gossip" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="result/" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="Project" TARGET_NAME="CLoTH_Gossip" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="Project" RUN_TARGET_NAME="CLoTH_Gossip">
     <envs>
       <env name="GSL_RNG_SEED" value="9" />
     </envs>

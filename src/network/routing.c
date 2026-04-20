@@ -878,3 +878,162 @@ struct array* dijkstra_with_reputation(long source, long destination, uint64_t a
     
     return path;
 }
+
+/* === Stage ④ Helper: Check if node is in avoided list === */
+int is_node_in_avoided_list(long* avoided_nodes, int num_avoided, long node_id) {
+    if (avoided_nodes == NULL || num_avoided == 0) {
+        return 0;
+    }
+    for (int i = 0; i < num_avoided; i++) {
+        if (avoided_nodes[i] == node_id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* === Stage ④ Helper: Add node to avoided list === */
+void add_node_to_avoided_list(long** avoided_nodes, int* num_avoided, int* capacity, long node_id) {
+    if (*avoided_nodes == NULL) {
+        *capacity = 10;
+        *avoided_nodes = (long*)malloc(*capacity * sizeof(long));
+    }
+    
+    if (*num_avoided >= *capacity) {
+        *capacity *= 2;
+        *avoided_nodes = (long*)realloc(*avoided_nodes, *capacity * sizeof(long));
+    }
+    
+    (*avoided_nodes)[(*num_avoided)++] = node_id;
+}
+
+/* === Stage ④ RBR Main Function: Path Finding with Reputation-Based Reconstruction ===
+ * Algorithm from paper:
+ * Input: Graph G, Faulty map Fn, sender, receiver, amount, max_fee
+ * Output: Path P'
+ * 
+ * 1. AN ← ∅ (avoided nodes)
+ * 2. RL ← True (reconstruction loop)
+ * 3. while RL:
+ *    - RL ← False
+ *    - Find path using Dijkstra
+ *    - For each node in path:
+ *      - if node is faulty and not in AN:
+ *        - Decrease reputation (Equation 10)
+ *        - Add to AN (Equation 11)
+ *        - Reconstruct path with new weights (Equation 13)
+ *        - RL ← True
+ *      - else:
+ *        - Increase reputation (good behavior reward)
+ * 4. Return final path
+ */
+struct array* find_reputation_based_route(
+    long source, 
+    long destination, 
+    uint64_t amount,
+    struct network* network, 
+    uint64_t current_time,
+    long p,
+    enum pathfind_error* error,
+    enum routing_method routing_method,
+    struct element* exclude_edges,
+    uint64_t max_fee_limit,
+    struct network_params net_params
+) {
+    if (!net_params.enable_rbr) {
+        // If RBR disabled, use standard dijkstra
+        return dijkstra(source, destination, amount, network, current_time, p, error, 
+                       routing_method, exclude_edges, max_fee_limit);
+    }
+    
+    long* avoided_nodes = NULL;
+    int num_avoided = 0;
+    int capacity = 0;
+    
+    struct array* current_path = NULL;
+    int reconstruction_loop = 1;
+    int max_iterations = 30;  // Maximum path reconstructions
+    int iteration = 0;
+    
+    double reputation_penalty = net_params.reputation_penalty_on_detection;  // 0.3
+    double reputation_reward = reputation_penalty * 0.1;  // 0.03 for good behavior
+    
+    while (reconstruction_loop && iteration < max_iterations) {
+        iteration++;
+        reconstruction_loop = 0;  // RL ← False
+        
+        // Step 1: Find path with Dijkstra (excluding previously faulty nodes)
+        enum pathfind_error dijkstra_error = NOPATH;
+        
+        if (num_avoided > 0) {
+            current_path = dijkstra_exclude_nodes(
+                source, destination, amount, network, current_time,
+                avoided_nodes, num_avoided, p, &dijkstra_error
+            );
+        } else {
+            current_path = dijkstra(
+                source, destination, amount, network, current_time, p,
+                &dijkstra_error, routing_method, exclude_edges, max_fee_limit
+            );
+        }
+        
+        if (current_path == NULL) {
+            *error = dijkstra_error;
+            if (avoided_nodes != NULL) free(avoided_nodes);
+            return NULL;
+        }
+        
+        // Step 2: Verify each node in path (lines 6-31 of algorithm)
+        int path_len = array_len(current_path);
+        
+        for (int i = 1; i < path_len - 1; i++) {
+            struct path_hop* hop = (struct path_hop*)array_get(current_path, i);
+            struct node* N = (struct node*)array_get(network->nodes, hop->receiver);
+            
+            if (N == NULL) continue;
+            
+            // Line 8: If node has low reputation and not yet avoided
+            if (N->reputation_score < 0.3 && !is_node_in_avoided_list(avoided_nodes, num_avoided, N->id)) {
+                // Line 9: Print detection message
+                printf("[RBR] Faulty node %ld detected on path\n", N->id);
+                
+                // Line 10: Decrease reputation (Equation 10)
+                if (net_params.enable_reputation_system) {
+                    update_node_reputation_on_detection(N, reputation_penalty, current_time);
+                }
+                
+                // Line 11: Add to avoided nodes list
+                add_node_to_avoided_list(&avoided_nodes, &num_avoided, &capacity, N->id);
+                
+                // Line 12-17: Reconstruct path with new weights
+                // Will use dijkstra_exclude_nodes in next iteration
+                
+                // Line 18: RL ← True (trigger reconstruction loop)
+                reconstruction_loop = 1;
+                break;  // Break from node loop, restart path search
+            } else if (N->reputation_score >= 0.3) {
+                // Line 28: Increase reputation for good behavior (honest node)
+                if (net_params.enable_reputation_system) {
+                    N->reputation_score += reputation_reward;
+                    if (N->reputation_score > 1.0) {
+                        N->reputation_score = 1.0;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Line 33: Compute reliable nodes (nodes not in avoided list)
+    // Line 34: Return final path
+    
+    if (iteration >= max_iterations) {
+        printf("[RBR] Warning: Max reconstruction iterations (%d) reached\n", max_iterations);
+    }
+    
+    if (avoided_nodes != NULL) {
+        free(avoided_nodes);
+    }
+    
+    *error = (current_path == NULL) ? NOPATH : 0;
+    return current_path;
+}
