@@ -21,6 +21,7 @@ start_time=$(date +%s)
 N_PAYMENTS=5000
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=0.80
+PAYMENT_TIMEOUT_MS=200000
 
 # Extreme attack condition parameters (25% malicious, 95% attack success)
 EXT_N_PAYMENTS=2000
@@ -55,7 +56,7 @@ function display_progress() {
 
     while [ "$done_simulations" -lt "$total_simulations" ]; do
         # collect all progress.tmp files (one per simulation)
-        mapfile -t simulation_progress_files < <(find "$output_root" -type f -name "progress.tmp" ! -path "*/environment/*")
+        mapfile -t simulation_progress_files < <(find "$output_root" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
 
         done_simulations=0
         for file in "${simulation_progress_files[@]}"; do
@@ -86,9 +87,10 @@ function display_progress() {
             progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\tETA %02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$remaining_minutes" "$remaining_seconds")
         fi
 
-        echo "$progress_line"
+        printf "\r\033[2K%s" "$progress_line"
         sleep 1
     done
+    printf "\n"
 }
 
 if [ -f "Python/network_analysis/network_analysis.py" ]; then
@@ -125,6 +127,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/a_no_attack/ \
         n_payments=$N_PAYMENTS \
+        payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=0.0 \
         malicious_failure_probability=0.0 \
         monitoring_strategy=disabled \
@@ -138,6 +141,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/b_detection_only/ \
         n_payments=$N_PAYMENTS \
+        payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$MALICIOUS_RATIO \
         malicious_failure_probability=$ATTACK_SUCCESS_RATE \
         monitoring_strategy=method2 \
@@ -152,6 +156,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/c_full_defense/ \
         n_payments=$N_PAYMENTS \
+        payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$MALICIOUS_RATIO \
         malicious_failure_probability=$ATTACK_SUCCESS_RATE \
         monitoring_strategy=method2 \
@@ -168,6 +173,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
     # Extreme attack scenarios (25% malicious, 95% attack success)
     enqueue_simulation "./run-simulation.sh $s $seed_dir/d_extreme_no_defense/ \
         n_payments=$EXT_N_PAYMENTS \
+        payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$EXT_MALICIOUS_RATIO \
         malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE \
         monitoring_strategy=disabled \
@@ -181,6 +187,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/e_extreme_detection_only/ \
         n_payments=$EXT_N_PAYMENTS \
+        payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$EXT_MALICIOUS_RATIO \
         malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE \
         monitoring_strategy=method2 \
@@ -195,6 +202,7 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
 
     enqueue_simulation "./run-simulation.sh $s $seed_dir/f_extreme_full_defense/ \
         n_payments=$EXT_N_PAYMENTS \
+        payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$EXT_MALICIOUS_RATIO \
         malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE \
         monitoring_strategy=method2 \

@@ -13,6 +13,15 @@
 #include "network/network.h"
 #include "data_structures/utils.h"
 
+/* 使用ライブラリの役割（このCファイル）
+ * - 標準Cライブラリ（stdio/stdlib/string/stdint/math/limits）:
+ *   ルーティング計算で必要なI/O、メモリ、文字列、数値演算、定数境界値を扱う。
+ * - pthread:
+ *   複数スレッドでDijkstraを並列実行するために使用する。
+ * - プロジェクト内ヘッダ（core/network/simulation/data_structures）:
+ *   支払い情報、ネットワーク状態、ヒープ/配列、ユーティリティ関数を参照する。
+ */
+
 /* Functions in this file simulate the path finding implemented in Lightning Network to find a path between the payment sender and the payment receiver.
    They are a (high-level) copy of functions lnd-v0.10.0-beta (see files `routing/pathfind.go`, `routing/payment_session.go` */
 

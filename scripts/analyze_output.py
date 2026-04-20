@@ -1,3 +1,22 @@
+"""
+出力ディレクトリ群を集計して summary.csv を作るスクリプト。
+
+利用ライブラリ（何をしているか / 使い方）:
+- csv:
+  - payments_output.csv / edges_output.csv / groups_output.csv / cloth_input.txt を読み込む
+  - 集計結果を summary.csv として書き出す
+- os:
+  - 指定ルート配下を再帰走査し、cloth_input.txt を含むシミュレーション出力を探索する
+- sys:
+  - 実行引数（出力ルートパス）を受け取る
+- concurrent.futures.ProcessPoolExecutor:
+  - 各シミュレーションディレクトリの分析をプロセス並列で実行する
+- numpy:
+  - 平均/分散/百分位などの統計量を計算する
+- matplotlib.pyplot:
+  - ヒストグラム/散布図の描画に使う（現在は呼び出しをコメントアウト済み）
+"""
+
 import csv
 import os
 import sys

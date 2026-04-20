@@ -17,6 +17,16 @@ running_processes=0
 total_simulations=0
 start_time=$(date +%s)
 
+# Attack / defense parameters
+MALICIOUS_RATIO=0.15
+ATTACK_SUCCESS_RATE=0.80
+TOP_HUB_COUNT=10
+
+# Extreme attack condition parameters
+EXT_N_PAYMENTS=2000
+EXT_MALICIOUS_RATIO=0.25
+EXT_ATTACK_SUCCESS_RATE=0.95
+
 function enqueue_simulation() {
     queue+=("$@")
     ((total_simulations++))
@@ -29,8 +39,10 @@ function process_queue() {
         ((running_processes++))
     done
 
-    wait -n || true
-    ((running_processes--))
+    if [ "$running_processes" -gt 0 ]; then
+        wait -n || true
+        ((running_processes--))
+    fi
 }
 
 function display_progress() {
@@ -39,16 +51,21 @@ function display_progress() {
     fi
 
     done_simulations=0
+    failed_simulations=0
 
     while [ "$done_simulations" -lt "$total_simulations" ]; do
         # collect all progress.tmp files (one per simulation)
-        mapfile -t simulation_progress_files < <(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*")
+        mapfile -t simulation_progress_files < <(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
 
         done_simulations=0
+        failed_simulations=0
         for file in "${simulation_progress_files[@]}"; do
             progress=$(cat "$file" 2>/dev/null || echo "0")
-            if [ "$progress" = "1" ]; then
+            if [ "$progress" = "1" ] || [ "$progress" = "failed" ]; then
                 done_simulations=$((done_simulations + 1))
+            fi
+            if [ "$progress" = "failed" ]; then
+                failed_simulations=$((failed_simulations + 1))
             fi
         done
 
@@ -63,26 +80,35 @@ function display_progress() {
         progress_bar=$(printf "%0.s#" $(seq 1 "$filled"))
 
         if [ "$(python3 -c "print(float('$fraction')==0.0)")" = "True" ]; then
-            progress_line=$(printf "Progress: [%-50s] 0%%\t%d/%d\t Time remaining --:--" "" "$done_simulations" "$total_simulations")
+            progress_line=$(printf "Progress: [%-50s] 0%%\t%d/%d\t Failed %d\t Time remaining --:--:--" "" "$done_simulations" "$total_simulations" "$failed_simulations")
         else
             elapsed_time=$(( $(date +%s) - start_time ))
-            estimated_completion_time=$(python3 -c "f=float('$fraction'); elapsed=$elapsed_time; print(int(elapsed / f - elapsed))")
-            remaining_minutes=$(( estimated_completion_time / 60 ))
-            remaining_seconds=$(( estimated_completion_time % 60 ))
+            remaining_time_sec=$(python3 -c "f=float('$fraction'); elapsed=$elapsed_time; est=int(elapsed / f - elapsed); print(max(0, est))")
+            remaining_hours=$(( remaining_time_sec / 3600 ))
+            remaining_minutes=$(( (remaining_time_sec % 3600) / 60 ))
+            remaining_seconds=$(( remaining_time_sec % 60 ))
             percent=$(echo "scale=1; $fraction * 100" | bc)
-            progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Time remaining %02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$remaining_minutes" "$remaining_seconds")
+            progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Failed %d\t Time remaining %02d:%02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$failed_simulations" "$remaining_hours" "$remaining_minutes" "$remaining_seconds")
         fi
 
-        echo "$progress_line"
+        printf "\r\033[2K%s" "$progress_line"
         sleep 1
     done
+    printf "\n"
 }
 
 for i in $(seq 2 1 3); do
     for j in $(seq 0 0.5 1.0); do
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=group_routing/avg_pmt_amt=1000/group_size=$i/group_limit_rate=$j      n_payments=5000 mpp=0 payment_timeout=-1 routing_method=group_routing group_cap_update=true average_payment_amount=1000    variance_payment_amount=100    group_size=$i  group_limit_rate=$j"
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=group_routing/avg_pmt_amt=10000/group_size=$i/group_limit_rate=$j     n_payments=5000 mpp=0 payment_timeout=-1 routing_method=group_routing group_cap_update=true average_payment_amount=10000   variance_payment_amount=1000   group_size=$i  group_limit_rate=$j"
-        enqueue_simulation "./run-simulation.sh $seed $output_dir/routing_method=group_routing/avg_pmt_amt=100000/group_size=$i/group_limit_rate=$j    n_payments=5000 mpp=0 payment_timeout=-1 routing_method=group_routing group_cap_update=true average_payment_amount=100000  variance_payment_amount=10000  group_size=$i  group_limit_rate=$j"
+        for avg_pmt_amt in 1000 10000 100000; do
+            var_pmt_amt=$(("$avg_pmt_amt"/10))
+            base="$output_dir/routing_method=group_routing/avg_pmt_amt=$avg_pmt_amt/group_size=$i/group_limit_rate=$j"
+
+            enqueue_simulation "./run-simulation.sh $seed $base/a_no_attack           n_payments=5000 mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=0.0 malicious_failure_probability=0.0 monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
+            enqueue_simulation "./run-simulation.sh $seed $base/b_detection_only      n_payments=5000 mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
+            enqueue_simulation "./run-simulation.sh $seed $base/c_full_defense        n_payments=5000 mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
+            enqueue_simulation "./run-simulation.sh $seed $base/d_extreme_no_defense n_payments=$EXT_N_PAYMENTS mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
+            enqueue_simulation "./run-simulation.sh $seed $base/e_extreme_full_defense n_payments=$EXT_N_PAYMENTS mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
+        done
     done
 done
 # Process the queue
@@ -94,6 +120,7 @@ done
 wait
 echo -e "\nAll simulations have completed. \nOutputs saved at $output_dir"
 python3 scripts/analyze_output.py "$output_dir"
+python3 scripts/summarize_attack4.py "$output_dir"
 end_time=$(date +%s)
 echo "START : $(date -r "$start_time" "+%Y-%m-%d %H:%M:%S")"
 echo "  END : $(date -r "$end_time" "+%Y-%m-%d %H:%M:%S")"

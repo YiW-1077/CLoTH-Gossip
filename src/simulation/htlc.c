@@ -18,6 +18,17 @@
 #include "core/event.h"
 #include "data_structures/utils.h"
 
+/* 使用ライブラリの役割（このCファイル）
+ * - 標準Cライブラリ（stdlib/stdio/string/stdint/unistd）:
+ *   基本I/O、メモリ管理、文字列操作、型、ユーティリティ機能に利用する。
+ * - pthread:
+ *   経路事前計算や共有データ更新時の並列処理・同期で利用する。
+ * - GSL（gsl_rng/gsl_randist/gsl_math）:
+ *   乱数生成や分布サンプリングにより、HTLC成功/失敗の確率イベントを表現する。
+ * - プロジェクト内ヘッダ（simulation/network/core/data_structures）:
+ *   HTLCイベント処理、経路探索、支払い情報、内部データ構造を連携させる。
+ */
+
 /* Functions in this file simulate the HTLC mechanism for exchanging payments, as implemented in the Lightning Network.
    They are a (high-level) copy of functions in lnd-v0.9.1-beta (see files `routing/missioncontrol.go`, `htlcswitch/switch.go`, `htlcswitch/link.go`) */
 

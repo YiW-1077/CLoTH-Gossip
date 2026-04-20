@@ -20,6 +20,15 @@
 #include "network/network.h"
 #include "core/event.h"
 
+/* 使用ライブラリの役割（このCファイル）
+ * - 標準Cライブラリ（stdio/stdlib/string/time/math/stdint/inttypes/dirent）:
+ *   CSV入出力、メモリ確保、文字列処理、時刻計測、数値計算、型・ディレクトリ走査を扱う。
+ * - GSL（gsl_rng/gsl_cdf）:
+ *   乱数と確率分布計算を使い、シミュレーションの確率的挙動を再現する。
+ * - プロジェクト内ヘッダ（core/network/simulation/data_structures）:
+ *   支払い、経路探索、HTLC、イベント、各種データ構造の内部モジュールを利用する。
+ */
+
 /* This file contains the main, where the simulation logic is executed;
    additionally, it contains the the initialization functions,
    a function that reads the input and a function that writes the output values in csv files */
