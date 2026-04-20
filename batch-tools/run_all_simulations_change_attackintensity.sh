@@ -2,11 +2,11 @@
 
 if [[ "$#" -lt 2 ]]; then
   echo "usage: $0 <seed> <output_dir> [remote_output_dir_or_smb_uri]"
-  exit 0
+  echo "example: $0 42 /tmp/cloth-out /Volumes/public1/thesis/2026bachelor-af23/AF23027王毅恒"
+  exit 1
 fi
 
 seed="$1"
-
 output_dir="$2/$(date "+%Y%m%d%H%M%S")"
 mkdir -p "$output_dir"
 remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
@@ -28,22 +28,20 @@ if [[ -n "$remote_arg" ]]; then
     fi
 fi
 
-max_processes=32
+max_processes="${MAX_PROCESSES:-32}"
+N_PAYMENTS="${N_PAYMENTS:-5000}"
+PAYMENT_TIMEOUT_MS="${PAYMENT_TIMEOUT_MS:-200000}"
+TOP_HUB_COUNT="${TOP_HUB_COUNT:-10}"
+
+ATTACK_RATIOS=(0.05 0.10 0.15 0.20 0.25 0.30)
+ATTACK_SUCCESS_RATES=(0.20 0.40 0.60 0.80 0.95)
+PAYMENT_AMOUNTS=(1000 10000 100000)
+ROUTING_METHODS=(cloth_original group_routing)
 
 queue=()
 running_processes=0
 total_simulations=0
 start_time=$(date +%s)
-
-# Attack / defense parameters
-MALICIOUS_RATIO=0.15
-ATTACK_SUCCESS_RATE=0.80
-TOP_HUB_COUNT=10
-
-# Extreme attack condition parameters
-EXT_N_PAYMENTS=2000
-EXT_MALICIOUS_RATIO=0.25
-EXT_ATTACK_SUCCESS_RATE=0.95
 
 function enqueue_simulation() {
     queue+=("$@")
@@ -102,7 +100,6 @@ function display_progress() {
 
     while [ "$done_simulations" -lt "$total_simulations" ]; do
         move_completed_to_remote
-        # collect all progress.tmp files (one per simulation)
         mapfile -t simulation_progress_files < <(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
 
         done_simulations=0
@@ -117,13 +114,7 @@ function display_progress() {
             fi
         done
 
-        if [ "$total_simulations" -eq 0 ]; then
-            fraction=0
-        else
-            fraction=$(echo "scale=4; $done_simulations / $total_simulations" | bc)
-        fi
-
-        # build progress bar from 0..50 characters
+        fraction=$(echo "scale=6; $done_simulations / $total_simulations" | bc)
         filled=$(printf "%.0f" "$(echo "$fraction * 50" | bc)")
         progress_bar=$(printf "%0.s#" $(seq 1 "$filled"))
 
@@ -135,7 +126,7 @@ function display_progress() {
             remaining_hours=$(( remaining_time_sec / 3600 ))
             remaining_minutes=$(( (remaining_time_sec % 3600) / 60 ))
             remaining_seconds=$(( remaining_time_sec % 60 ))
-            percent=$(echo "scale=1; $fraction * 100" | bc)
+            percent=$(echo "scale=2; $fraction * 100" | bc)
             progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Failed %d\t Time remaining %02d:%02d:%02d" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$failed_simulations" "$remaining_hours" "$remaining_minutes" "$remaining_seconds")
         fi
 
@@ -145,21 +136,55 @@ function display_progress() {
     printf "\n"
 }
 
-for i in $(seq 2 1 3); do
-    for j in $(seq 0 0.5 1.0); do
-        for avg_pmt_amt in 1000 10000 100000; do
-            var_pmt_amt=$(("$avg_pmt_amt"/10))
-            base="$output_dir/routing_method=group_routing/avg_pmt_amt=$avg_pmt_amt/group_size=$i/group_limit_rate=$j"
+for routing_method in "${ROUTING_METHODS[@]}"; do
+    if [ "$routing_method" = "group_routing" ]; then
+        method_params="group_cap_update=true group_size=10 group_limit_rate=0.1"
+    else
+        method_params="group_cap_update= group_size= group_limit_rate="
+    fi
 
-            enqueue_simulation "./run-simulation.sh $seed $base/a_no_attack           n_payments=5000 mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=0.0 malicious_failure_probability=0.0 monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
-            enqueue_simulation "./run-simulation.sh $seed $base/b_detection_only      n_payments=5000 mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
-            enqueue_simulation "./run-simulation.sh $seed $base/c_full_defense        n_payments=5000 mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
-            enqueue_simulation "./run-simulation.sh $seed $base/d_extreme_no_defense n_payments=$EXT_N_PAYMENTS mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 enable_pra=false enable_prt=false enable_rbr=false group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
-            enqueue_simulation "./run-simulation.sh $seed $base/e_extreme_full_defense n_payments=$EXT_N_PAYMENTS mpp=0 payment_timeout=200000 routing_method=group_routing malicious_node_ratio=$EXT_MALICIOUS_RATIO malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 group_cap_update=true average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt group_size=$i group_limit_rate=$j"
+    for avg_pmt_amt in "${PAYMENT_AMOUNTS[@]}"; do
+        var_pmt_amt=$(("$avg_pmt_amt"/10))
+        base="$output_dir/routing_method=$routing_method/avg_pmt_amt=$avg_pmt_amt"
+
+        enqueue_simulation "./run-simulation.sh $seed $base/baseline_no_attack \
+            n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
+            malicious_node_ratio=0.0 malicious_failure_probability=0.0 monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT \
+            enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 \
+            enable_pra=false enable_prt=false enable_rbr=false \
+            average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt $method_params"
+
+        for ratio in "${ATTACK_RATIOS[@]}"; do
+            for prob in "${ATTACK_SUCCESS_RATES[@]}"; do
+                intensity="$base/malicious_ratio=$ratio/attack_success=$prob"
+
+                enqueue_simulation "./run-simulation.sh $seed $intensity/no_defense \
+                    n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
+                    malicious_node_ratio=$ratio malicious_failure_probability=$prob monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT \
+                    enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 \
+                    enable_pra=false enable_prt=false enable_rbr=false \
+                    average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt $method_params"
+
+                enqueue_simulation "./run-simulation.sh $seed $intensity/detection_only \
+                    n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
+                    malicious_node_ratio=$ratio malicious_failure_probability=$prob monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT \
+                    enable_reputation_system=true enable_monitor_movement=false movement_credit_limit=0 \
+                    enable_pra=false enable_prt=false enable_rbr=false \
+                    average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt $method_params"
+
+                enqueue_simulation "./run-simulation.sh $seed $intensity/full_defense \
+                    n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
+                    malicious_node_ratio=$ratio malicious_failure_probability=$prob monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT \
+                    enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 \
+                    enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 \
+                    average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt $method_params"
+            done
         done
     done
 done
-# Process the queue
+
+echo "Queued simulations: $total_simulations"
+
 display_progress &
 while [ "${#queue[@]}" -gt 0 ] || [ "$running_processes" -gt 0 ]; do
     process_queue
@@ -167,16 +192,23 @@ while [ "${#queue[@]}" -gt 0 ] || [ "$running_processes" -gt 0 ]; do
 done
 wait
 move_completed_to_remote
-echo -e "\nAll simulations have completed. \nOutputs saved at $output_dir"
+
+echo -e "\nAll simulations have completed.\nOutputs saved at $output_dir"
 if [[ -n "$remote_output_dir" ]]; then
     echo "Completed runs were offloaded to $remote_output_dir"
 fi
+
 analysis_input="$output_dir"
 if [[ -n "$remote_output_dir" ]]; then
     analysis_input="$remote_output_dir"
 fi
-python3 scripts/analyze_output.py "$analysis_input"
-python3 scripts/summarize_attack4.py "$analysis_input"
+
+if python3 scripts/analyze_output.py "$analysis_input"; then
+    python3 scripts/summarize_attack4.py "$analysis_input" || echo "WARN: summarize_attack4.py failed"
+else
+    echo "WARN: analyze_output.py failed; summary.csv was not generated"
+fi
+
 end_time=$(date +%s)
 echo "START : $(date -r "$start_time" "+%Y-%m-%d %H:%M:%S")"
 echo "  END : $(date -r "$end_time" "+%Y-%m-%d %H:%M:%S")"
@@ -184,4 +216,4 @@ elapsed=$((end_time - start_time))
 hours=$((elapsed / 3600))
 minutes=$(( (elapsed % 3600) / 60 ))
 seconds=$((elapsed % 60))
-echo " TIME : $(printf "%02d:%02d:%02d" $hours $minutes $seconds)"
+echo " TIME : $(printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds")"

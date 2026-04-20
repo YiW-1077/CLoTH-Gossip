@@ -23,11 +23,18 @@ struct network_params {
     /* === Stage ① Research: Malicious Node Parameters === */
     double malicious_node_ratio;           // fraction of nodes that are malicious (0.0 to 1.0)
     double malicious_failure_probability;  // prob of HTLC failure when on malicious node
+    unsigned int enable_network_attack_delay; // 1 to enable attack-time delay amplification
+    uint64_t attack_delay_start_time;         // attack-delay window start [ms]
+    uint64_t attack_delay_duration;           // attack-delay window duration [ms]
+    double attack_delay_intensity;            // delay multiplier during attack window (>=1.0)
+    double attack_delay_jitter;               // additive gaussian jitter to multiplier
 
     /* === Stage ② Research: Monitor Placement Parameters === */
     int hub_degree_threshold;              // minimum degree to be considered a hub (e.g., 50)
     int monitoring_strategy;               // 1=method1, 2=method2
     int top_hub_count;                     // for method2: number of top hubs to connect
+    unsigned int enable_simple_progress_mode; // 1 to print colorized in-terminal progress
+    unsigned int enable_simple_progress_window; // 1 to show live graph in a separate window
 
     /* === Stage ③ Research: Reputation System Parameters === */
     unsigned int enable_reputation_system;  // 1 to enable reputation scoring

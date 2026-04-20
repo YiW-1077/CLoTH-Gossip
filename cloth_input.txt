@@ -1,7 +1,7 @@
 generate_network_from_file=true
-nodes_filename=config/data/nodes_ln.csv
-channels_filename=config/data/channels_ln.csv
-edges_filename=config/data/edges_ln.csv
+nodes_filename=nodes_ln.csv
+channels_filename=channels_ln.csv
+edges_filename=edges_ln.csv
 n_additional_nodes=
 n_channels_per_node=
 capacity_per_channel=

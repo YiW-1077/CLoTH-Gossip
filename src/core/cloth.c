@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <dirent.h>
+#include <unistd.h>
 
 #include <gsl/gsl_rng.h>
 #include <gsl/gsl_cdf.h>
@@ -19,6 +20,11 @@
 #include "core/cloth.h"
 #include "network/network.h"
 #include "core/event.h"
+
+#define ANSI_RED   "\033[31m"
+#define ANSI_BLUE  "\033[34m"
+#define ANSI_BLACK "\033[30m"
+#define ANSI_RESET "\033[0m"
 
 /* 使用ライブラリの役割（このCファイル）
  * - 標準Cライブラリ（stdio/stdlib/string/time/math/stdint/inttypes/dirent）:
@@ -36,6 +42,102 @@
 /* シミュレーション全体のエントリポイント (main) と、
    ネットワーク/支払いの初期化および入出力処理をまとめたファイル。 */
 
+static const char* event_type_to_string(enum event_type type) {
+  switch (type) {
+    case FINDPATH: return "FINDPATH";
+    case SENDPAYMENT: return "SENDPAYMENT";
+    case FORWARDPAYMENT: return "FORWARDPAYMENT";
+    case RECEIVEPAYMENT: return "RECEIVEPAYMENT";
+    case FORWARDSUCCESS: return "FORWARDSUCCESS";
+    case RECEIVESUCCESS: return "RECEIVESUCCESS";
+    case FORWARDFAIL: return "FORWARDFAIL";
+    case RECEIVEFAIL: return "RECEIVEFAIL";
+    case OPENCHANNEL: return "OPENCHANNEL";
+    case CHANNELUPDATEFAIL: return "CHANNELUPDATEFAIL";
+    case CHANNELUPDATESUCCESS: return "CHANNELUPDATESUCCESS";
+    case UPDATEGROUP: return "UPDATEGROUP";
+    case CONSTRUCTGROUPS: return "CONSTRUCTGROUPS";
+    default: return "UNKNOWN";
+  }
+}
+
+void write_simple_view_static_graph(struct network* network, char output_dir_name[]) {
+  if (network == NULL) return;
+
+  char nodes_filename[512];
+  char edges_filename[512];
+  strcpy(nodes_filename, output_dir_name);
+  strcat(nodes_filename, "simple_view_nodes.csv");
+  strcpy(edges_filename, output_dir_name);
+  strcat(edges_filename, "simple_view_edges.csv");
+
+  FILE* nodes_file = fopen(nodes_filename, "w");
+  if (nodes_file == NULL) {
+    fprintf(stderr, "ERROR: cannot open %s\n", nodes_filename);
+    return;
+  }
+  FILE* edges_file = fopen(edges_filename, "w");
+  if (edges_file == NULL) {
+    fclose(nodes_file);
+    fprintf(stderr, "ERROR: cannot open %s\n", edges_filename);
+    return;
+  }
+
+  fprintf(nodes_file, "id,is_malicious,is_monitor\n");
+  for (long i = 0; i < array_len(network->nodes); i++) {
+    struct node* node = array_get(network->nodes, i);
+    fprintf(nodes_file, "%ld,%d,%d\n", node->id, node->is_malicious, node->is_monitor);
+  }
+
+  fprintf(edges_file, "node1,node2\n");
+  for (long i = 0; i < array_len(network->channels); i++) {
+    struct channel* channel = array_get(network->channels, i);
+    fprintf(edges_file, "%ld,%ld\n", channel->node1, channel->node2);
+  }
+
+  fclose(nodes_file);
+  fclose(edges_file);
+}
+
+void write_simple_view_state(char output_dir_name[],
+                             long completed_payments,
+                             long total_payments,
+                             uint64_t current_time,
+                             long payment_id,
+                             enum event_type event_type,
+                             long node_id,
+                             struct payment* payment) {
+  char route_buf[4096];
+  route_buf[0] = '\0';
+  if (payment != NULL && payment->route != NULL && payment->route->route_hops != NULL) {
+    for (long i = 0; i < array_len(payment->route->route_hops); i++) {
+      struct route_hop* hop = array_get(payment->route->route_hops, i);
+      char hop_buf[64];
+      snprintf(hop_buf, sizeof(hop_buf), "%ld-%ld", hop->from_node_id, hop->to_node_id);
+      if (i > 0) {
+        strncat(route_buf, "|", sizeof(route_buf) - strlen(route_buf) - 1);
+      }
+      strncat(route_buf, hop_buf, sizeof(route_buf) - strlen(route_buf) - 1);
+    }
+  }
+
+  char state_filename[512];
+  strcpy(state_filename, output_dir_name);
+  strcat(state_filename, "simple_view_state.tmp");
+  FILE* state_file = fopen(state_filename, "w");
+  if (state_file == NULL) return;
+
+  fprintf(state_file, "%ld,%ld,%llu,%ld,%s,%ld,%s\n",
+          completed_payments,
+          total_payments,
+          (unsigned long long)current_time,
+          payment_id,
+          event_type_to_string(event_type),
+          node_id,
+          route_buf);
+  fclose(state_file);
+}
+
 
 /* === Stage ① Write Baseline Metrics CSV ===
  *
@@ -47,6 +149,9 @@
  *   - success_rate: success percentage
  *   - avg_delay: average payment completion time
  *   - total_attacks_triggered: count of HTLC rejections
+ *   - attack_delay_total: total extra delay injected by attack-delay model
+ *   - attack_delay_avg_per_payment: average extra delay per payment
+ *   - payments_with_attack_delay: number of payments affected by attack-delay model
  */
 void write_baseline_metrics(struct network* network, struct array* payments, struct network_params net_params, char output_dir_name[]) {
   FILE* csv_metrics;
@@ -57,6 +162,9 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
   long n_failed = 0;
   long total_delay = 0;
   long total_attacks = 0;
+  uint64_t total_attack_delay = 0;
+  long payments_with_attack_delay = 0;
+  uint64_t total_attack_delay_events = 0;
   struct payment* payment;
 
   // Count successful payments and collect statistics
@@ -72,6 +180,11 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
 
     total_delay += (payment->end_time - payment->start_time);
     total_attacks += payment->offline_node_count;  // Malicious nodes are recorded as offline
+    total_attack_delay += payment->attack_delay_added_total;
+    total_attack_delay_events += payment->attack_delay_event_count;
+    if (payment->attack_delay_added_total > 0) {
+      payments_with_attack_delay++;
+    }
   }
 
   double success_rate = (n_payments > 0) ? ((double)n_successful / (double)n_payments) : 0.0;
@@ -86,8 +199,8 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
     return;
   }
 
-  fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered\n");
-  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld\n",
+  fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered,attack_delay_total,attack_delay_avg_per_payment,payments_with_attack_delay,attack_delay_events\n");
+  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld,%llu,%.2f,%ld,%llu\n",
           n_payments,
           n_successful,
           n_failed,
@@ -95,7 +208,11 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
           avg_delay,
           net_params.malicious_node_ratio,
           net_params.malicious_failure_probability,
-          total_attacks);
+          total_attacks,
+          (unsigned long long)total_attack_delay,
+          (n_payments > 0) ? ((double)total_attack_delay / (double)n_payments) : 0.0,
+          payments_with_attack_delay,
+          (unsigned long long)total_attack_delay_events);
 
   fclose(csv_metrics);
   printf("[Output] Wrote baseline metrics to %s\n", output_filename);
@@ -312,6 +429,9 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   int aborted_payments = 0;
   int high_recon_count = 0;
   uint64_t total_delay = 0;
+  uint64_t total_attack_delay = 0;
+  int payments_with_attack_delay = 0;
+  uint64_t total_attack_delay_events = 0;
   int total_attempts = 0;
   
   for (int i = 0; i < total_payments; i++) {
@@ -322,6 +442,11 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
       if (pmt->reconstruction_count > 5) high_recon_count++;
       if (pmt->end_time > pmt->start_time) {
         total_delay += (pmt->end_time - pmt->start_time);
+      }
+      total_attack_delay += pmt->attack_delay_added_total;
+      total_attack_delay_events += pmt->attack_delay_event_count;
+      if (pmt->attack_delay_added_total > 0) {
+        payments_with_attack_delay++;
       }
       total_attempts += pmt->attempts;
     }
@@ -353,6 +478,13 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
           (double)total_delay / total_payments);
   fprintf(csv_stage4, "avg_attempts_per_payment,%.2f\n", 
           (double)total_attempts / total_payments);
+  fprintf(csv_stage4, "attack_delay_total_ms,%llu\n",
+          (unsigned long long)total_attack_delay);
+  fprintf(csv_stage4, "attack_delay_avg_ms_per_payment,%.2f\n",
+          (double)total_attack_delay / total_payments);
+  fprintf(csv_stage4, "payments_with_attack_delay,%d\n", payments_with_attack_delay);
+  fprintf(csv_stage4, "attack_delay_events,%llu\n",
+          (unsigned long long)total_attack_delay_events);
   fprintf(csv_stage4, "malicious_nodes_detected,%d\n", detected_malicious);
   fprintf(csv_stage4, "malicious_nodes_low_reputation,%d\n", low_reputation_malicious);
   fprintf(csv_stage4, "enable_prt,%d\n", net_params.enable_prt);
@@ -507,11 +639,11 @@ void write_output(struct network* network, struct array* payments, char output_d
     printf("ERROR cannot open payment_output.csv\n");
     exit(-1);
   }
-  fprintf(csv_payment_output, "id,sender_id,receiver_id,amount,start_time,max_fee_limit,end_time,mpp,is_success,no_balance_count,offline_node_count,timeout_exp,attempts,route,total_fee,attempts_history\n");
+  fprintf(csv_payment_output, "id,sender_id,receiver_id,amount,start_time,max_fee_limit,end_time,mpp,is_success,no_balance_count,offline_node_count,timeout_exp,attack_delay_total,attack_delay_events,attempts,route,total_fee,attempts_history\n");
   for(i=0; i<array_len(payments); i++)  {
     payment = array_get(payments, i);
     if (payment->id == -1) continue;
-    fprintf(csv_payment_output, "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%u,%d,%d,%u,%d,", payment->id, payment->sender, payment->receiver, payment->amount, payment->start_time, payment->max_fee_limit, payment->end_time, payment->is_shard, payment->is_success, payment->no_balance_count, payment->offline_node_count, payment->is_timeout, payment->attempts);
+    fprintf(csv_payment_output, "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%u,%d,%d,%u,%llu,%u,%d,", payment->id, payment->sender, payment->receiver, payment->amount, payment->start_time, payment->max_fee_limit, payment->end_time, payment->is_shard, payment->is_success, payment->no_balance_count, payment->offline_node_count, payment->is_timeout, (unsigned long long)payment->attack_delay_added_total, payment->attack_delay_event_count, payment->attempts);
     route = payment->route;
     if(route==NULL)
       fprintf(csv_payment_output, ",,");
@@ -592,10 +724,17 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
   /* === Stage ① Malicious Node Parameters === */
   net_params->malicious_node_ratio = 0.0;
   net_params->malicious_failure_probability = 0.0;
+  net_params->enable_network_attack_delay = 0;
+  net_params->attack_delay_start_time = 30000;
+  net_params->attack_delay_duration = 30000;
+  net_params->attack_delay_intensity = 1.0;
+  net_params->attack_delay_jitter = 0.0;
   /* === Stage ② Monitor Placement Parameters === */
   net_params->hub_degree_threshold = 50;
   net_params->monitoring_strategy = 0;  // 0=disabled, 1=method1, 2=method2
   net_params->top_hub_count = 30;
+  net_params->enable_simple_progress_mode = 0;
+  net_params->enable_simple_progress_window = 0;
   /* === Stage ③ Reputation System Parameters === */
   net_params->enable_reputation_system = 0;
   net_params->reputation_decay_rate = 0.01;      // 1% decay per event
@@ -622,26 +761,39 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
 }
 
 
-/* parse the input parameters in "cloth_input.txt" */
-/* cloth_input.txt を開き、1 行ずつ key=value 形式でパースして
+/* parse the input parameters in config/cloth_input.txt (fallback: cloth_input.txt) */
+/* config/cloth_input.txt を開き、1 行ずつ key=value 形式でパースして
  * network_params / payments_params 構造体を埋める。
  *
  * - = の前後に空白がある行はエラーとして終了する。
  * - 一部のパラメータは空文字列を特別な値 (-1 や 0) として解釈する。
  * - 不明なキーや不正な値がある場合は stderr に出力して即時 exit(-1)。
  *
- * 実行時カレントディレクトリに cloth_input.txt が存在する必要がある。 */
+ * 実行時カレントディレクトリに config/cloth_input.txt
+ * (互換用に cloth_input.txt でも可) が存在する必要がある。 */
 void read_input(struct network_params* net_params, struct payments_params* pay_params){
   FILE* input_file;
   char *parameter, *value, line[1024];
+  const char* input_candidates[] = {"config/cloth_input.txt", "cloth_input.txt"};
+  int selected = -1;
 
   initialize_input_parameters(net_params, pay_params);
 
-  input_file = fopen("cloth_input.txt","r");
+  for (int i = 0; i < 2; i++) {
+    input_file = fopen(input_candidates[i], "r");
+    if (input_file != NULL) {
+      selected = i;
+      break;
+    }
+  }
 
   if(input_file==NULL){
-    fprintf(stderr, "ERROR: cannot open file <cloth_input.txt> in current directory.\n");
+    fprintf(stderr, "ERROR: cannot open <config/cloth_input.txt> or <cloth_input.txt> in current directory.\n");
     exit(-1);
+  }
+
+  if (selected == 1) {
+    fprintf(stderr, "WARN: using legacy <cloth_input.txt>. Prefer <config/cloth_input.txt>.\n");
   }
 
   while(fgets(line, 1024, input_file)){
@@ -701,6 +853,21 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
     else if(strcmp(parameter, "malicious_failure_probability")==0){
       net_params->malicious_failure_probability = strtod(value, NULL);
     }
+    else if(strcmp(parameter, "enable_network_attack_delay")==0){
+      net_params->enable_network_attack_delay = (strcmp(value, "true")==0) ? 1 : 0;
+    }
+    else if(strcmp(parameter, "attack_delay_start_time")==0){
+      net_params->attack_delay_start_time = (uint64_t)strtoull(value, NULL, 10);
+    }
+    else if(strcmp(parameter, "attack_delay_duration")==0){
+      net_params->attack_delay_duration = (uint64_t)strtoull(value, NULL, 10);
+    }
+    else if(strcmp(parameter, "attack_delay_intensity")==0){
+      net_params->attack_delay_intensity = strtod(value, NULL);
+    }
+    else if(strcmp(parameter, "attack_delay_jitter")==0){
+      net_params->attack_delay_jitter = strtod(value, NULL);
+    }
     /* === Stage ② Monitor Placement Parameters === */
     else if(strcmp(parameter, "hub_degree_threshold")==0){
       net_params->hub_degree_threshold = strtol(value, NULL, 10);
@@ -715,6 +882,12 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
     }
     else if(strcmp(parameter, "top_hub_count")==0){
       net_params->top_hub_count = strtol(value, NULL, 10);
+    }
+    else if(strcmp(parameter, "enable_simple_progress_mode")==0){
+      net_params->enable_simple_progress_mode = (strcmp(value, "true")==0) ? 1 : 0;
+    }
+    else if(strcmp(parameter, "enable_simple_progress_window")==0){
+      net_params->enable_simple_progress_window = (strcmp(value, "true")==0) ? 1 : 0;
     }
     /* === Stage ③ Reputation System Parameters === */
     else if(strcmp(parameter, "enable_reputation_system")==0){
@@ -874,6 +1047,16 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
           exit(-1);
       }
   }
+  if(net_params->enable_network_attack_delay){
+      if(net_params->attack_delay_intensity < 1.0){
+          fprintf(stderr, "ERROR: parameter <attack_delay_intensity> must be >= 1.0 when attack delay is enabled.\n");
+          exit(-1);
+      }
+      if(net_params->attack_delay_jitter < 0.0){
+          fprintf(stderr, "ERROR: parameter <attack_delay_jitter> must be >= 0.0.\n");
+          exit(-1);
+      }
+  }
   fclose(input_file);
 }
 
@@ -911,6 +1094,8 @@ void post_process_payment_stats(struct array* payments){
     payment->no_balance_count = shard1->no_balance_count + shard2->no_balance_count;
     payment->offline_node_count = shard1->offline_node_count + shard2->offline_node_count;
     payment->is_timeout = shard1->is_timeout || shard2->is_timeout ? 1 : 0;
+    payment->attack_delay_added_total = shard1->attack_delay_added_total + shard2->attack_delay_added_total;
+    payment->attack_delay_event_count = shard1->attack_delay_event_count + shard2->attack_delay_event_count;
     payment->attempts = shard1->attempts + shard2->attempts;
     if(shard1->route != NULL && shard2->route != NULL){
       payment->route = array_len(shard1->route->route_hops) > array_len(shard2->route->route_hops) ? shard1->route : shard2->route;
@@ -1013,7 +1198,11 @@ int main(int argc, char *argv[]) {
     printf("group_cover_rate on init : %f\n", (float)(array_len(network->edges) - list_len(group_add_queue)) / (float)(array_len(network->edges)));
 
   printf("PAYMENTS INITIALIZATION\n");
-  payments = initialize_payments(pay_params,  n_nodes, simulation->random_generator);
+  payments = initialize_payments(pay_params, n_nodes, simulation->random_generator);
+
+  if (net_params.enable_simple_progress_mode && net_params.enable_simple_progress_window) {
+    write_simple_view_static_graph(network, output_dir_name);
+  }
 
   printf("EVENTS INITIALIZATION\n");
   simulation->events = initialize_events(payments);
@@ -1037,10 +1226,41 @@ int main(int argc, char *argv[]) {
   begin = clock();
   simulation->current_time = 1;
   long completed_payments = 0;
+  int simple_mode_is_tty = isatty(fileno(stdout));
   while(heap_len(simulation->events) != 0) {
     event = heap_pop(simulation->events, compare_event);
 
     simulation->current_time = event->time;
+    if (net_params.enable_simple_progress_mode) {
+      long total_payments = array_len(payments);
+      long payment_id = -1;
+      if (event->payment != NULL) {
+        payment_id = event->payment->id;
+      }
+      const char* color = simple_mode_is_tty ? ANSI_BLACK : "";
+      const char* reset_color = simple_mode_is_tty ? ANSI_RESET : "";
+      struct node* node = NULL;
+      if (event->node_id >= 0 && event->node_id < array_len(network->nodes)) {
+        node = array_get(network->nodes, event->node_id);
+      }
+      if (node != NULL) {
+        if (node->is_malicious) color = ANSI_RED;
+        else if (node->is_monitor) color = ANSI_BLUE;
+      }
+      double ratio = (total_payments > 0) ? ((double)completed_payments / (double)total_payments) * 100.0 : 0.0;
+      if (net_params.enable_simple_progress_window) {
+        write_simple_view_state(output_dir_name,
+                                completed_payments,
+                                total_payments,
+                                simulation->current_time,
+                                payment_id,
+                                event->type,
+                                event->node_id,
+                                event->payment);
+      }
+      fflush(stdout);
+      usleep(200000);
+    }
     switch(event->type){
     case FINDPATH:
       find_path(event, simulation, network, &payments, pay_params.mpp, net_params.routing_method, net_params);
@@ -1084,8 +1304,16 @@ int main(int argc, char *argv[]) {
       exit(-1);
     }
 
-    struct payment* p = array_get(payments, event->payment->id);
-    if(p->end_time != 0 && event->type != UPDATEGROUP && event->type != CONSTRUCTGROUPS && event->type != CHANNELUPDATEFAIL && event->type != CHANNELUPDATESUCCESS){
+    if (event->payment != NULL &&
+        event->type != UPDATEGROUP &&
+        event->type != CONSTRUCTGROUPS &&
+        event->type != CHANNELUPDATEFAIL &&
+        event->type != CHANNELUPDATESUCCESS) {
+        struct payment* p = array_get(payments, event->payment->id);
+        if (p->end_time == 0) {
+            free(event);
+            continue;
+        }
         completed_payments++;
 
         if (net_params.enable_monitor_movement &&
@@ -1100,13 +1328,25 @@ int main(int argc, char *argv[]) {
         FILE* progress_file = fopen(progress_filename, "w");
         if(progress_file != NULL){
             fprintf(progress_file, "%f", (float)completed_payments / (float)array_len(payments));
+            fclose(progress_file);
         }
-        fclose(progress_file);
+        if (net_params.enable_simple_progress_mode && net_params.enable_simple_progress_window) {
+            write_simple_view_state(output_dir_name,
+                                    completed_payments,
+                                    array_len(payments),
+                                    simulation->current_time,
+                                    event->payment->id,
+                                    event->type,
+                                    event->node_id,
+                                    event->payment);
+        }
     }
 
     free(event);
   }
-  printf("\n");
+  if (net_params.enable_simple_progress_mode) {
+    printf("\n");
+  }
   end = clock();
 
   if(pay_params.mpp)

@@ -1,7 +1,7 @@
 #!/opt/homebrew/bin/bash
 
-if [[ "$#" -lt 1 ]]; then
-  echo "./run_all_simulations.sh <seed> <output_dir>"
+if [[ "$#" -lt 2 ]]; then
+  echo "usage: $0 <seed> <output_dir> [remote_output_dir_or_smb_uri]"
   exit 0
 fi
 
@@ -9,6 +9,24 @@ seed="$1"
 
 output_dir="$2/$(date "+%Y%m%d%H%M%S")"
 mkdir -p "$output_dir"
+remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
+remote_output_dir=""
+if [[ -n "$remote_arg" ]]; then
+    if [[ "$remote_arg" == smb://172.20.86.110/public1/* ]]; then
+        remote_arg="/Volumes/public1/${remote_arg#smb://172.20.86.110/public1/}"
+    elif [[ "$remote_arg" == smb://* ]]; then
+        echo "WARN: unsupported SMB URI format: $remote_arg"
+        echo "      mount SMB first and pass local mount path (e.g. /Volumes/public1/...)."
+        remote_arg=""
+    fi
+    if [[ -n "$remote_arg" ]]; then
+        remote_output_dir="$remote_arg/$(basename "$output_dir")"
+        if ! mkdir -p "$remote_output_dir"; then
+            echo "WARN: cannot create remote output dir <$remote_output_dir>; offload disabled."
+            remote_output_dir=""
+        fi
+    fi
+fi
 
 max_processes=32
 
@@ -45,6 +63,35 @@ function process_queue() {
     fi
 }
 
+function move_completed_to_remote() {
+    if [[ -z "$remote_output_dir" ]]; then
+        return 0
+    fi
+    mapfile -t simulation_progress_files < <(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
+    for file in "${simulation_progress_files[@]}"; do
+        sim_dir="$(dirname "$file")"
+        if [[ -f "$sim_dir/.moved_to_remote" ]]; then
+            continue
+        fi
+        progress=$(cat "$file" 2>/dev/null || echo "0")
+        if [[ "$progress" != "1" && "$progress" != "failed" ]]; then
+            continue
+        fi
+        rel_path="${sim_dir#$output_dir/}"
+        if [[ "$rel_path" == "$sim_dir" ]]; then
+            continue
+        fi
+        dest_dir="$remote_output_dir/$rel_path"
+        mkdir -p "$dest_dir" || continue
+        if rsync -a "$sim_dir/" "$dest_dir/" > /dev/null 2>&1; then
+            rm -rf "$sim_dir"
+            mkdir -p "$sim_dir"
+            echo "$progress" > "$sim_dir/progress.tmp"
+            echo "$dest_dir" > "$sim_dir/.moved_to_remote"
+        fi
+    done
+}
+
 function display_progress() {
     if [ "$total_simulations" -eq 0 ]; then
         return 0
@@ -54,6 +101,7 @@ function display_progress() {
     failed_simulations=0
 
     while [ "$done_simulations" -lt "$total_simulations" ]; do
+        move_completed_to_remote
         # collect all progress.tmp files (one per simulation)
         mapfile -t simulation_progress_files < <(find "$output_dir" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
 
@@ -136,9 +184,17 @@ while [ "${#queue[@]}" -gt 0 ] || [ "$running_processes" -gt 0 ]; do
     sleep 1
 done
 wait
+move_completed_to_remote
 echo -e "\nAll simulations have completed. \nOutputs saved at $output_dir"
-python3 scripts/analyze_output.py "$output_dir"
-python3 scripts/summarize_attack4.py "$output_dir"
+if [[ -n "$remote_output_dir" ]]; then
+    echo "Completed runs were offloaded to $remote_output_dir"
+fi
+analysis_input="$output_dir"
+if [[ -n "$remote_output_dir" ]]; then
+    analysis_input="$remote_output_dir"
+fi
+python3 scripts/analyze_output.py "$analysis_input"
+python3 scripts/summarize_attack4.py "$analysis_input"
 end_time=$(date +%s)
 echo "START : $(date -r "$start_time" "+%Y-%m-%d %H:%M:%S")"
 echo "  END : $(date -r "$end_time" "+%Y-%m-%d %H:%M:%S")"

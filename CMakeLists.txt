@@ -5,12 +5,11 @@ set(CMAKE_C_STANDARD 11)
 
 include_directories(include)
 
-file(COPY config/cloth_input.txt DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY config/data/channels_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY config/data/edges_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
-file(COPY config/data/nodes_ln.csv DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY config DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 file(COPY run-simulation.sh DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 file(COPY scripts/analyze_output.py DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts)
+file(COPY scripts/simple_live_view.py DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts)
+file(COPY scripts/measure_payment_time.sh DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts)
 
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/result)
 

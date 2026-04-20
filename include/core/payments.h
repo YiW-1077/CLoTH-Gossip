@@ -40,6 +40,8 @@ struct payment {
   int offline_node_count;
   int no_balance_count;
   unsigned int is_timeout;
+  uint64_t attack_delay_added_total; // cumulative delay added by attack-delay model [ms]
+  unsigned int attack_delay_event_count; // number of hops where extra delay was injected
   struct element* history; // list of `struct attempt`
   
   /* === Stage ④ PRT: Path Reconstruction Tracking === */

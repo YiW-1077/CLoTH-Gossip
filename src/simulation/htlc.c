@@ -42,6 +42,46 @@ uint64_t compute_fee(uint64_t amount_to_forward, struct policy policy) {
   return policy.fee_base + fee;
 }
 
+static uint64_t sample_base_forward_delay(struct simulation* simulation, struct network_params net_params) {
+  return net_params.average_payment_forward_interval +
+         (long)(fabs(net_params.variance_payment_forward_interval *
+                     gsl_ran_ugaussian(simulation->random_generator)));
+}
+
+static unsigned int is_attack_delay_active(struct simulation* simulation, struct network_params net_params) {
+  if (!net_params.enable_network_attack_delay) return 0;
+  if (net_params.attack_delay_duration == 0) return 0;
+  if (net_params.attack_delay_intensity <= 1.0 && net_params.attack_delay_jitter <= 0.0) return 0;
+  return simulation->current_time >= net_params.attack_delay_start_time &&
+         simulation->current_time < (net_params.attack_delay_start_time + net_params.attack_delay_duration);
+}
+
+static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
+                                             struct network_params net_params,
+                                             struct payment* payment,
+                                             uint64_t base_delay,
+                                             unsigned int attacked_path) {
+  if (!attacked_path || !is_attack_delay_active(simulation, net_params)) {
+    return base_delay;
+  }
+
+  double multiplier = net_params.attack_delay_intensity;
+  if (net_params.attack_delay_jitter > 0.0) {
+    multiplier += gsl_ran_gaussian(simulation->random_generator, net_params.attack_delay_jitter);
+  }
+  if (multiplier < 1.0) multiplier = 1.0;
+
+  uint64_t adjusted_delay = (uint64_t)llround((double)base_delay * multiplier);
+  if (adjusted_delay < base_delay) adjusted_delay = base_delay;
+
+  if (payment != NULL && adjusted_delay > base_delay) {
+    payment->attack_delay_added_total += (adjusted_delay - base_delay);
+    payment->attack_delay_event_count += 1;
+  }
+
+  return adjusted_delay;
+}
+
 /* check whether there is sufficient balance in an edge for forwarding the payment; check also that the policies in the edge are respected */
 unsigned int check_balance_and_policy(struct edge* edge, struct edge* prev_edge, struct route_hop* prev_hop, struct route_hop* next_hop) {
   uint64_t expected_fee;
@@ -420,6 +460,7 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
   struct node* node;
   unsigned int is_last_hop;
   struct edge *next_edge = NULL, *prev_edge;
+  struct node* next_node;
 
   payment = event->payment;
   node = array_get(network->nodes, event->node_id);
@@ -437,15 +478,21 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
     exit(-1);
   }
 
+  next_node = array_get(network->nodes, next_route_hop->to_node_id);
+
   /* simulate the case that the next node in the route is offline */
   is_next_node_offline = gsl_ran_discrete(simulation->random_generator, network->faulty_node_prob);
   if(is_next_node_offline && !is_last_hop){ //assume that the receiver node is always online
+    uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
+    uint64_t network_delay = apply_attack_delay_if_needed(
+      simulation, net_params, payment, base_delay, next_node->is_malicious && !is_last_hop
+    );
     payment->offline_node_count += 1;
     payment->error.type = OFFLINENODE;
     payment->error.hop = next_route_hop;
     prev_node_id = previous_route_hop->from_node_id;
     event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
-    next_event_time = simulation->current_time + net_params.average_payment_forward_interval + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator))) + OFFLINELATENCY;
+    next_event_time = simulation->current_time + network_delay + OFFLINELATENCY;
     next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
     simulation->events = heap_insert(simulation->events, next_event, compare_event);
     return;
@@ -453,7 +500,6 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
 
   /* === Stage ① Malicious Node Attack Injection ===
    * If the next node is malicious, inject HTLC failure with attack_probability */
-  struct node* next_node = array_get(network->nodes, next_route_hop->to_node_id);
   if (next_node->is_malicious && !is_last_hop) {
     /* Proactive exposure-based detection:
      * once a malicious node is observed on a forwarding path, apply a light
@@ -469,8 +515,10 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
 
     double attack_roll = gsl_rng_uniform(simulation->random_generator);
     if (attack_roll < next_node->attack_probability) {
-      uint64_t forward_delay = net_params.average_payment_forward_interval
-                             + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));
+      uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
+      uint64_t forward_delay = apply_attack_delay_if_needed(
+        simulation, net_params, payment, base_delay, 1
+      );
       uint64_t attack_event_time = simulation->current_time + forward_delay;
 
       if (next_node->first_attack_time == 0) {
@@ -536,12 +584,16 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
 
   // fail no balance
   if(!check_balance_and_policy(next_edge, prev_edge, previous_route_hop, next_route_hop)){
+    uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
+    uint64_t network_delay = apply_attack_delay_if_needed(
+      simulation, net_params, payment, base_delay, next_node->is_malicious && !is_last_hop
+    );
     payment->error.type = NOBALANCE;
     payment->error.hop = next_route_hop;
     payment->no_balance_count += 1;
     prev_node_id = previous_route_hop->from_node_id;
     event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
-    next_event_time = simulation->current_time + net_params.average_payment_forward_interval + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));//prev_channel->latency;
+    next_event_time = simulation->current_time + network_delay;
     next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
     simulation->events = heap_insert(simulation->events, next_event, compare_event);
     return;
@@ -556,7 +608,13 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
   // success forwarding
   event_type = is_last_hop  ? RECEIVEPAYMENT : FORWARDPAYMENT;
   // interval for forwarding payment
-  next_event_time = simulation->current_time + net_params.average_payment_forward_interval + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));//next_channel->latency;
+  {
+    uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
+    uint64_t network_delay = apply_attack_delay_if_needed(
+      simulation, net_params, payment, base_delay, next_node->is_malicious && !is_last_hop
+    );
+    next_event_time = simulation->current_time + network_delay;
+  }
   next_event = new_event(next_event_time, event_type, next_route_hop->to_node_id, event->payment);
   simulation->events = heap_insert(simulation->events, next_event, compare_event);
 }
