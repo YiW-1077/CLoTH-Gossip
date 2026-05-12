@@ -258,6 +258,9 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
   uint64_t shard1_amount, shard2_amount;
   enum pathfind_error error;
   long shard1_id, shard2_id;
+  
+  /* === Stage ④ Hypothesis Testing: Detect warm-up phase === */
+  int is_warmup_phase = (simulation->processed_payments < 500);
 
   payment = event->payment;
 
@@ -278,6 +281,13 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
+          } else if (is_warmup_phase) {
+              // === Stage ④ Warm-up: Avoid malicious nodes during baseline learning ===
+              path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
+                                                   network, simulation->current_time,
+                                                   0, &error,
+                                                   net_params.routing_method,
+                                                   payment->max_fee_limit);
           } else {
               path = paths[payment->id];
           }
@@ -288,6 +298,13 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
+          } else if (is_warmup_phase) {
+              // === Warm-up retry: Still avoid malicious nodes ===
+              path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
+                                                   network, simulation->current_time,
+                                                   0, &error,
+                                                   net_params.routing_method,
+                                                   payment->max_fee_limit);
           } else if (net_params.monitoring_strategy > 0 && net_params.enable_reputation_system) {
               // === Retry: Use reputation-weighted dijkstra when monitoring is active ===
               path = dijkstra_with_reputation(payment->sender, payment->receiver, payment->amount,
@@ -445,7 +462,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   next_edge = array_get(network->edges, first_route_hop->edge_id);
 
   /* Stage ②: record incoming observation at the current node if it is a monitor. */
-  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0);
+  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route);
   
   /* === Stage ② Payment Information Monitoring (Sender) ===
    * If sender is a monitor, record the initial HTLC.
@@ -480,6 +497,14 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
     payment->offline_node_count += 1;
     payment->error.type = OFFLINENODE;
     payment->error.hop = first_route_hop;
+    report_attacked_node_to_monitors(
+      network,
+      node->id,
+      first_route_hop->to_node_id,
+      payment->id,
+      simulation->current_time,
+      net_params
+    );
     next_event_time = simulation->current_time + OFFLINELATENCY;
     next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
     simulation->events = heap_insert(simulation->events, next_event, compare_event);
@@ -491,6 +516,14 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
     payment->error.type = NOBALANCE;
     payment->error.hop = first_route_hop;
     payment->no_balance_count += 1;
+    report_attacked_node_to_monitors(
+      network,
+      node->id,
+      first_route_hop->to_node_id,
+      payment->id,
+      simulation->current_time,
+      net_params
+    );
     next_event_time = simulation->current_time;
     next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
     simulation->events = heap_insert(simulation->events, next_event, compare_event);
@@ -502,6 +535,22 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   next_edge->balance -= first_route_hop->amount_to_forward;
 
   next_edge->tot_flows += 1;
+  
+  /* === Stage ④ Hypothesis Testing: Record first hop HTLC send time === */
+  // Initialize hop_send_times if not yet done (use flag to prevent multiple malloc)
+  if (!payment->hop_send_times_initialized && route->route_hops != NULL) {
+      int num_hops = route->route_hops->size;
+      payment->hop_send_times = (uint64_t*)malloc(num_hops * sizeof(uint64_t));
+      payment->hop_send_times_capacity = num_hops;
+      payment->hop_send_times_initialized = 1;
+      for (int i = 0; i < num_hops; i++) {
+          payment->hop_send_times[i] = 0; // Initialize to 0
+      }
+  }
+  // Record send time for first hop (hop index 0)
+  if (payment->hop_send_times != NULL && payment->hop_send_times_capacity > 0) {
+      payment->hop_send_times[0] = simulation->current_time;
+  }
 
   // success sending
   event_type = first_route_hop->to_node_id == payment->receiver ? RECEIVEPAYMENT : FORWARDPAYMENT;
@@ -534,7 +583,7 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
     next_route_hop->edges_lock_start_time = simulation->current_time;
 
   /* Stage ②: record incoming observation at this hop if it is a monitor. */
-  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0);
+  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route);
   
   /* === Stage ② Payment Information Monitoring ===
    * If current node is a monitor, record detailed HTLC observation
@@ -584,18 +633,6 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
   /* === Stage ① Malicious Node Attack Injection ===
    * If the next node is malicious, inject HTLC failure with attack_probability */
   if (next_node->is_malicious && !is_last_hop) {
-    /* Proactive exposure-based detection:
-     * once a malicious node is observed on a forwarding path, apply a light
-     * reputation penalty even if it does not drop this specific HTLC. */
-    if (net_params.enable_reputation_system) {
-      const double exposure_penalty_multiplier = 0.15;
-      update_node_reputation_on_detection(
-        next_node,
-        net_params.reputation_penalty_on_detection * exposure_penalty_multiplier,
-        0
-      );
-    }
-
     double attack_roll = gsl_rng_uniform(simulation->random_generator);
     if (attack_roll < next_node->attack_probability) {
       uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
@@ -608,21 +645,20 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
         next_node->first_attack_time = attack_event_time;
       }
 
+
+
       // HTLC fails due to malicious node attack
       payment->error.type = OFFLINENODE;  // Simulate as node failure
       payment->error.hop = next_route_hop;
       payment->offline_node_count += 1;
-      
-      /* === Stage ③ Reputation Update ===
-       * A forwarding failure gives the upstream hop evidence of malicious behavior.
-       * Reflect this in reputation when the reputation system is enabled. */
-      if (net_params.enable_reputation_system) {
-        update_node_reputation_on_detection(
-          next_node,
-          net_params.reputation_penalty_on_detection,
-          attack_event_time + OFFLINELATENCY
-        );
-      }
+      report_attacked_node_to_monitors(
+        network,
+        node->id,
+        next_node->id,
+        payment->id,
+        attack_event_time,
+        net_params
+      );
       
       prev_node_id = previous_route_hop->from_node_id;
       event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
@@ -674,6 +710,14 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
     payment->error.type = NOBALANCE;
     payment->error.hop = next_route_hop;
     payment->no_balance_count += 1;
+    report_attacked_node_to_monitors(
+      network,
+      node->id,
+      next_node->id,
+      payment->id,
+      simulation->current_time,
+      net_params
+    );
     prev_node_id = previous_route_hop->from_node_id;
     event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
     next_event_time = simulation->current_time + network_delay;
@@ -687,6 +731,30 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
   next_edge->balance -= next_route_hop->amount_to_forward;
 
   next_edge->tot_flows += 1;
+  
+  /* === Stage ④ Hypothesis Testing: Record hop send time === */
+  // Initialize hop_send_times if not yet done (use flag to prevent multiple malloc)
+  if (!payment->hop_send_times_initialized && route->route_hops != NULL) {
+      int num_hops = route->route_hops->size;
+      payment->hop_send_times = (uint64_t*)malloc(num_hops * sizeof(uint64_t));
+      payment->hop_send_times_capacity = num_hops;
+      payment->hop_send_times_initialized = 1;
+      for (int i = 0; i < num_hops; i++) {
+          payment->hop_send_times[i] = 0; // Initialize to 0
+      }
+  }
+  // Find current hop index and record send time
+  if (payment->hop_send_times != NULL && route->route_hops != NULL) {
+      for (int i = 0; i < route->route_hops->size; i++) {
+          struct route_hop* hop = (struct route_hop*)array_get(route->route_hops, i);
+          if (hop != NULL && hop->from_node_id == node->id) {
+              if (i + 1 < payment->hop_send_times_capacity) {
+                  payment->hop_send_times[i + 1] = simulation->current_time;  // Record next hop's send time
+              }
+              break;
+          }
+      }
+  }
 
   // success forwarding
   event_type = is_last_hop  ? RECEIVEPAYMENT : FORWARDPAYMENT;
@@ -783,6 +851,46 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
   event->payment->end_time = simulation->current_time;
 
   add_attempt_history(payment, network, simulation->current_time, 1);
+  
+  /* === Stage ④ Hypothesis Testing: Increment global payment counter === */
+  simulation->processed_payments++;
+  
+  /* === Stage ④ Hypothesis Testing: Process successful payment latencies === */
+  if (net_params.enable_reputation_system && payment->route != NULL && payment->hop_send_times != NULL) {
+      for (int hop_idx = 0; hop_idx < array_len(payment->route->route_hops); hop_idx++) {
+          struct route_hop* hop = (struct route_hop*)array_get(payment->route->route_hops, hop_idx);
+          if (hop == NULL) continue;
+          
+          struct node* hop_node = (struct node*)array_get(network->nodes, hop->from_node_id);
+          if (hop_node == NULL) continue;
+          
+          // Get HTLC send time for this hop (time at start of routing through this node)
+          uint64_t hop_send_time = (hop_idx < payment->hop_send_times_capacity) ? 
+              payment->hop_send_times[hop_idx] : 0;
+          
+          if (hop_send_time == 0) continue; // No send time recorded
+          
+          // For successful payment, use payment end time as result time
+          int should_report = on_payment_result_hypothesis_test(
+              hop_node,
+              hop_send_time,
+              simulation->current_time,
+              simulation->processed_payments  // Use actual global payment count
+          );
+          
+          // If p-value test indicates attack, report it
+          if (should_report && net_params.enable_reputation_system) {
+              report_attacked_node_to_monitors(
+                  network,
+                  (hop_idx > 0) ? ((struct route_hop*)array_get(payment->route->route_hops, hop_idx - 1))->from_node_id : payment->sender,
+                  hop_node->id,
+                  payment->id,
+                  simulation->current_time,
+                  net_params
+              );
+          }
+      }
+  }
   
   // === Dynamic Reputation Update: Success Path ===
   // When payment succeeds, increase reputation of nodes in successful path
@@ -904,36 +1012,45 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
     error_edge->channel_updates = push(error_edge->channel_updates, channel_update);
 
   add_attempt_history(payment, network, simulation->current_time, 0);
-
-  // === Dynamic Reputation Update: Failure Path ===
-  // When payment fails, decrease reputation of nodes in failed path (especially error node)
-  if (net_params.monitoring_strategy > 0 && net_params.enable_reputation_system && payment->route != NULL) {
-    double base_penalty = 0.1;  // Base reputation penalty for failure
-    
-    // Heavy penalty on the error node
-    if (error_hop != NULL) {
-      struct node* error_node = (struct node*)array_get(network->nodes, error_hop->to_node_id);
-      if (error_node != NULL && error_node->reputation_score > 0.0) {
-        error_node->reputation_score -= base_penalty * 2.0;  // 2x penalty on error node
-        if (error_node->reputation_score < 0.0) {
-          error_node->reputation_score = 0.0;
-        }
-      }
-    }
-    
-    // Light penalty on other nodes in path (they weren't the failure point)
-    for (int i = 0; i < array_len(payment->route->route_hops); i++) {
-      struct route_hop* hop = (struct route_hop*)array_get(payment->route->route_hops, i);
-      if (hop != NULL && hop != error_hop) {
-        struct node* hop_node = (struct node*)array_get(network->nodes, hop->from_node_id);
-        if (hop_node != NULL && hop_node->reputation_score > 0.0) {
-          hop_node->reputation_score -= base_penalty * 0.3;  // Light penalty
-          if (hop_node->reputation_score < 0.0) {
-            hop_node->reputation_score = 0.0;
+  
+  /* === Stage ④ Hypothesis Testing: Increment global payment counter === */
+  simulation->processed_payments++;
+  
+  /* === Stage ④ Hypothesis Testing: Process failed payment latencies === */
+  if (net_params.enable_reputation_system && payment->route != NULL && payment->hop_send_times != NULL) {
+      for (int hop_idx = 0; hop_idx < array_len(payment->route->route_hops); hop_idx++) {
+          struct route_hop* hop = (struct route_hop*)array_get(payment->route->route_hops, hop_idx);
+          if (hop == NULL) continue;
+          
+          struct node* hop_node = (struct node*)array_get(network->nodes, hop->from_node_id);
+          if (hop_node == NULL) continue;
+          
+          // Get HTLC send time for this hop
+          uint64_t hop_send_time = (hop_idx < payment->hop_send_times_capacity) ? 
+              payment->hop_send_times[hop_idx] : 0;
+          
+          if (hop_send_time == 0) continue; // No send time recorded
+          
+          // For failed payment, use failure time as result time
+          int should_report = on_payment_result_hypothesis_test(
+              hop_node,
+              hop_send_time,
+              simulation->current_time,
+              simulation->processed_payments  // Use actual global payment count
+          );
+          
+          // If p-value test indicates attack, report it
+          if (should_report && net_params.enable_reputation_system) {
+              report_attacked_node_to_monitors(
+                  network,
+                  (hop_idx > 0) ? ((struct route_hop*)array_get(payment->route->route_hops, hop_idx - 1))->from_node_id : payment->sender,
+                  hop_node->id,
+                  payment->id,
+                  simulation->current_time,
+                  net_params
+              );
           }
-        }
       }
-    }
   }
 
   /* === Stage ④ PRT: Path Reconstruction Threshold Check ===
@@ -1059,7 +1176,7 @@ int can_join_group(struct group* group, struct edge* edge, enum routing_method r
         return 1;
     }
     else{
-        printf(stderr, "ERROR: can_join_group called with unsupported routing method %d\n", routing_method);
+        fprintf(stderr, "ERROR: can_join_group called with unsupported routing method %d\n", routing_method);
         exit(1);
     }
 }

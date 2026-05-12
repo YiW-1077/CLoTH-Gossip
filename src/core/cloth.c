@@ -460,7 +460,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
   if (net_params.monitoring_strategy > 0) {
     printf("[Monitoring] Starting payment information integration...\n");
     fflush(stdout);
-    struct array* estimated_payments = integrate_observations_from_monitors(network);
+    struct array* estimated_payments = integrate_observations_from_monitors(network, payments);
     printf("[Monitoring] Integration complete: %ld estimated payments\n", array_len(estimated_payments));
     fflush(stdout);
     
@@ -689,7 +689,7 @@ void write_output(struct network* network, struct array* payments, char output_d
         }
         float cul = sum_cul / (float)n_members;
         cul_avg += cul / (float) list_len(group->history);
-        fprintf(csv_group_output, "],\"\"time\"\":%llu,\"\"group_cap\"\":%llu,\"\"cul_avg\"\":%f,\"\"triggered_edge_id\"\":%ld}", group_update->time, group_update->group_cap, cul, group_update->fake_balance_updated_edge_id, group_update->fake_balance_updated_edge_actual_balance, group_update->triggered_edge_id);
+        fprintf(csv_group_output, "],\"\"time\"\":%llu,\"\"group_cap\"\":%llu,\"\"cul_avg\"\":%f,\"\"triggered_edge_id\"\":%ld}", group_update->time, group_update->group_cap, cul, group_update->triggered_edge_id);
         if(iterator->next != NULL) {
             fprintf(csv_group_output, ",");
         }
