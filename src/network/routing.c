@@ -797,7 +797,29 @@ struct array* dijkstra_exclude_nodes(long source, long destination, uint64_t amo
     
     return path;
 }
+/* dijkstra_avoid_malicious_nodes: is_malicious==1 のノードを自動的に除外して経路探索する */
+struct array* dijkstra_avoid_malicious_nodes(long source, long destination, uint64_t amount,
+                                             struct network* network, uint64_t current_time,
+                                             long p, enum pathfind_error *error,
+                                             enum routing_method routing_method,
+                                             uint64_t max_fee_limit) {
+    /* malicious ノードの ID を収集 */
+    size_t node_count = array_len(network->nodes);
+    long* avoided_nodes = malloc(node_count * sizeof(long));
+    int num_avoided = 0;
 
+    for (size_t i = 0; i < node_count; i++) {
+        struct node* n = array_get(network->nodes, i);
+        /* sender/receiver 自身は除外リストに入れない */
+        if (n->is_malicious && n->id != source && n->id != destination) {
+            avoided_nodes[num_avoided++] = n->id;
+        }
+    }
+
+    struct array* path = dijkstra_exclude_nodes(source, destination, amount, network, current_time, avoided_nodes, num_avoided, p, error);
+    free(avoided_nodes);
+    return path;
+}
 
 /* === Stage ④ PRA Context Management === */
 struct pra_context* pra_context_new() {
