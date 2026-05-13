@@ -469,7 +469,9 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   next_edge = array_get(network->edges, first_route_hop->edge_id);
 
   /* Stage ②: record incoming observation at the current node if it is a monitor. */
-  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route);
+  if (detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route)) {
+    payment->is_observed = 1;
+  }
   
   /* === Stage ② Payment Information Monitoring (Sender) ===
    * If sender is a monitor, record the initial HTLC.
@@ -590,7 +592,9 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
     next_route_hop->edges_lock_start_time = simulation->current_time;
 
   /* Stage ②: record incoming observation at this hop if it is a monitor. */
-  detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route);
+  if (detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route)) {
+    payment->is_observed = 1;
+  }
   
   /* === Stage ② Payment Information Monitoring ===
    * If current node is a monitor, record detailed HTLC observation

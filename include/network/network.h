@@ -225,7 +225,7 @@ void initialize_hub_info(struct network* network, int hub_threshold);
 void analyze_leaf_neighbors(struct network* network, int leaf_threshold);
 int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf_threshold);
 int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold, int leaf_threshold, int top_hub_count);
-void detect_and_record_htlc_observation(struct network* network, long payment_id, uint64_t amount, int node_id, int direction, uint64_t timestamp, struct route* route);
+int detect_and_record_htlc_observation(struct network* network, long payment_id, uint64_t amount, int node_id, int direction, uint64_t timestamp, struct route* route);
 
 /* === Stage ③ Reputation System Functions === */
 void initialize_reputation_scores(struct network* network);

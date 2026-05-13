@@ -57,6 +57,9 @@ struct payment {
   
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment was processed during warm-up phase (< 500 payments)
+  
+  /* === Monitoring: Observation tracking === */
+  unsigned int is_observed;         // 1 if at least one monitor observed this payment
 };
 
 struct attempt {

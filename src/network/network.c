@@ -714,20 +714,22 @@ int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
  * Method1: Single hub observation
  * Method2: Multiple hub sources via direct_hub_connections
  */
-void detect_and_record_htlc_observation(struct network* network, long payment_id, 
+int detect_and_record_htlc_observation(struct network* network, long payment_id, 
                                         uint64_t amount, int node_id, int direction, uint64_t timestamp,
                                         struct route* route) {
+    int was_observed = 0;
+    
     if (!network || network->num_monitors == 0) {
-        return;
+        return 0;
     }
     
     if (direction != 0) {  // Only process incoming HTLC
-        return;
+        return 0;
     }
     
     struct node* node = (struct node*)array_get(network->nodes, node_id);
     if (!node) {
-        return;
+        return 0;
     }
     
     // Check each monitor for observation capability
@@ -765,6 +767,7 @@ void detect_and_record_htlc_observation(struct network* network, long payment_id
         
         // Record observation if monitor can observe this payment
         if (can_observe) {
+            was_observed = 1;
             monitor->total_htlcs_observed++;
             monitor->payments_captured++;
             
@@ -836,6 +839,8 @@ void detect_and_record_htlc_observation(struct network* network, long payment_id
             }
         }
     }
+    
+    return was_observed;
 }
 
 

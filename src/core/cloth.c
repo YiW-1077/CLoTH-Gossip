@@ -342,39 +342,14 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         }
       }
       
-      /* Calculate coverage rate: count unique monitored payments */
+      /* Calculate coverage rate: count monitored payments using is_observed flag */
       long unique_monitored_payments = 0;
       
-      if (g_htlc_observations != NULL && array_len(g_htlc_observations) > 0) {
-        // Count unique payment IDs that were observed
-        struct array* observed_payment_ids = array_initialize(100);
-        for (int i = 0; i < array_len(g_htlc_observations); i++) {
-          struct htlc_observation* obs = (struct htlc_observation*)array_get(g_htlc_observations, i);
-          if (obs != NULL && !obs->is_balance_adjustment) {
-            // Check if this payment ID is already in our set
-            int found = 0;
-            for (int j = 0; j < array_len(observed_payment_ids); j++) {
-              uint64_t* pid = (uint64_t*)array_get(observed_payment_ids, j);
-              if (*pid == obs->payment_id) {
-                found = 1;
-                break;
-              }
-            }
-            // Add if not found
-            if (!found) {
-              uint64_t* new_pid = (uint64_t*)malloc(sizeof(uint64_t));
-              *new_pid = obs->payment_id;
-              array_insert(observed_payment_ids, new_pid);
-            }
-          }
+      for (int i = 0; i < array_len(payments); i++) {
+        struct payment* p = (struct payment*)array_get(payments, i);
+        if (p != NULL && !p->is_warmup && p->is_observed) {
+          unique_monitored_payments++;
         }
-        unique_monitored_payments = array_len(observed_payment_ids);
-        
-        // Clean up
-        for (int i = 0; i < array_len(observed_payment_ids); i++) {
-          free(array_get(observed_payment_ids, i));
-        }
-        array_free(observed_payment_ids);
       }
       
       /* Calculate coverage rate based on unique monitored payments */
