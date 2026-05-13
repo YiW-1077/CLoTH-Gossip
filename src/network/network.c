@@ -1,10 +1,12 @@
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include <gsl/gsl_math.h>
 #include <gsl/gsl_rng.h>
 #include "network/network.h"
 #include "data_structures/array.h"
 #include "data_structures/utils.h"
+#include "network/monitoring.h"
 
 // グローバル変数：実行時設定可能な監視ノード数上限
 int MONITOR_NODE_LIMIT = 300;
@@ -39,6 +41,11 @@ struct node* new_node(long id) {
   node->last_movement_time = 0;     // Not yet moved
   node->first_attack_time = 0;
   node->first_detection_time = 0;
+  /* === Stage ④ Initialize Hypothesis Testing Fields === */
+  node->baseline_mean = 0.0;        // Log-normal baseline mean (not yet learned)
+  node->baseline_std = 0.0;         // Log-normal baseline std (0 = not yet learned)
+  node->suspicion_score = 0;        // No suspicion initially
+  node->payment_count = 0;          // No payments processed yet
   return node;
 }
 
@@ -133,12 +140,12 @@ void write_network_files(struct network* network){
 
   for(i=0; i<array_len(network->channels); i++){
     channel = array_get(network->channels, i);
-    fprintf(channels_output_file, "%ld,%ld,%ld,%ld,%ld,%ld\n", channel->id, channel->edge1, channel->edge2, channel->node1, channel->node2, channel->capacity);
+    fprintf(channels_output_file, "%ld,%ld,%ld,%ld,%ld,%" PRIu64 "\n", channel->id, channel->edge1, channel->edge2, channel->node1, channel->node2, channel->capacity);
   }
 
   for(i=0; i<array_len(network->edges); i++){
     edge = array_get(network->edges, i);
-    fprintf(edges_output_file, "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d\n", edge->id, edge->channel_id, edge->counter_edge_id, edge->from_node_id, edge->to_node_id, edge->balance, (edge->policy).fee_base, (edge->policy).fee_proportional, (edge->policy).min_htlc, (edge->policy).timelock);
+    fprintf(edges_output_file, "%ld,%ld,%ld,%ld,%ld,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u\n", edge->id, edge->channel_id, edge->counter_edge_id, edge->from_node_id, edge->to_node_id, edge->balance, (edge->policy).fee_base, (edge->policy).fee_proportional, (edge->policy).min_htlc, (edge->policy).timelock);
   }
 
   fclose(nodes_output_file);
@@ -370,7 +377,7 @@ struct network* generate_network_from_files(char nodes_filename[256], char chann
 
   fgets(row, 2048, channels_file);
   while(fgets(row, 2048, channels_file)!=NULL) {
-    sscanf(row, "%ld,%ld,%ld,%ld,%ld,%ld", &id, &direction1, &direction2, &node_id1, &node_id2, &capacity);
+    sscanf(row, "%ld,%ld,%ld,%ld,%ld,%" SCNu64, &id, &direction1, &direction2, &node_id1, &node_id2, &capacity);
     channel = new_channel(id, direction1, direction2, node_id1, node_id2, capacity);
     network->channels = array_insert(network->channels, channel);
   }
@@ -379,7 +386,7 @@ struct network* generate_network_from_files(char nodes_filename[256], char chann
 
   fgets(row, 2048, edges_file);
   while(fgets(row, 2048, edges_file)!=NULL) {
-    sscanf(row, "%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%lf", &id, &channel_id, &other_direction, &node_id1, &node_id2, &balance, &policy.fee_base, &policy.fee_proportional, &policy.min_htlc, &policy.timelock, &policy.cul_threshold);
+    sscanf(row, "%ld,%ld,%ld,%ld,%ld,%" SCNu64 ",%" SCNu64 ",%" SCNu64 ",%" SCNu64 ",%u,%lf", &id, &channel_id, &other_direction, &node_id1, &node_id2, &balance, &policy.fee_base, &policy.fee_proportional, &policy.min_htlc, &policy.timelock, &policy.cul_threshold);
     channel = array_get(network->channels, channel_id);
     edge = new_edge(id, channel_id, other_direction, node_id1, node_id2, balance, policy, channel->capacity);
     network->edges = array_insert(network->edges, edge);
@@ -687,6 +694,7 @@ int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
             monitor->direct_hub_connections[h] = top_hubs[h];
         }
         monitor->num_direct_hubs = top_hub_count;
+        monitor->deployed_at_stage = 2;  // Mark as Method 2
     }
     
     free(top_hubs);
@@ -698,34 +706,135 @@ int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
 }
 
 
-/* === Stage ② HTLC Observation Logging ===
+/* === Stage ② HTLC Observation and Correlation Detection ===
  *
  * When an HTLC passes through a monitor node, record the observation.
  * Multiple monitors observing the same payment enables information correlation.
+ * 
+ * Method1: Single hub observation
+ * Method2: Multiple hub sources via direct_hub_connections
  */
 void detect_and_record_htlc_observation(struct network* network, long payment_id, 
-                                        uint64_t amount, int node_id, int direction) {
+                                        uint64_t amount, int node_id, int direction, uint64_t timestamp,
+                                        struct route* route) {
     if (!network || network->num_monitors == 0) {
         return;
     }
     
-    // Check if this node is a monitor
+    if (direction != 0) {  // Only process incoming HTLC
+        return;
+    }
+    
     struct node* node = (struct node*)array_get(network->nodes, node_id);
-    if (!node || !node->is_monitor) {
+    if (!node) {
         return;
     }
     
-    int monitor_id = node->monitor_id;
-    if (monitor_id < 0 || monitor_id >= network->num_monitors) {
-        return;
-    }
-    
-    MonitorAgent* monitor = &network->monitors[monitor_id];
-    
-    if (direction == 0) {  // Incoming HTLC
-        monitor->total_htlcs_observed++;
-    } else {               // Outgoing HTLC
-        // Could track outgoing separately if needed
+    // Check each monitor for observation capability
+    for (int m = 0; m < network->num_monitors; m++) {
+        MonitorAgent* monitor = &network->monitors[m];
+        int can_observe = 0;
+        struct route_hop* matched_hop = NULL;
+        
+        // Method 1: Direct observation (payment passes through monitor's node)
+        if (node_id == monitor->node_id) {
+            can_observe = 1;
+        }
+        // Method 2: Hub-based observation (payment route contains a hub from direct_hub_connections)
+        else if (monitor->num_direct_hubs > 0 && route != NULL) {
+            // Check if any node in the payment route is in monitor's direct_hub_connections
+            if (route->route_hops && route->route_hops->size > 0) {
+                for (int h = 0; h < route->route_hops->size; h++) {
+                    struct route_hop* hop = (struct route_hop*)array_get(route->route_hops, h);
+                    if (hop) {
+                        int hop_node_id = hop->to_node_id;
+                        
+                        // Check if this hop node is in monitor's direct_hub_connections
+                        for (int d = 0; d < monitor->num_direct_hubs; d++) {
+                            if (hop_node_id == monitor->direct_hub_connections[d]) {
+                                can_observe = 1;
+                                matched_hop = hop;
+                                break;
+                            }
+                        }
+                        if (can_observe) break;
+                    }
+                }
+            }
+        }
+        
+        // Record observation if monitor can observe this payment
+        if (can_observe) {
+            monitor->total_htlcs_observed++;
+            monitor->payments_captured++;
+            
+            // If this is an indirect observation (monitor not colocated with node), record a detailed HTLC observation
+            if (node_id != monitor->node_id && matched_hop != NULL) {
+                long prev_node = matched_hop->from_node_id;
+                long next_node = matched_hop->to_node_id;
+                uint64_t obs_amount = matched_hop->amount_to_forward;
+                uint32_t timelock = matched_hop->timelock;
+
+                record_htlc_observation(network,
+                                         payment_id,
+                                         prev_node,
+                                         next_node,
+                                         obs_amount,
+                                         timestamp,
+                                         timelock,
+                                         monitor->node_id,
+                                         monitor->monitor_id,
+                                         0.0,
+                                         0.0,
+                                         0);
+            }
+
+            // Record observation for correlation detection
+            PaymentObservability* payment_obs = NULL;
+            
+            // Search for existing payment observation
+            struct element* it = network->observed_payments;
+            while (it != NULL) {
+                PaymentObservability* obs = (PaymentObservability*)it->data;
+                if (obs != NULL && obs->payment_id == payment_id) {
+                    payment_obs = obs;
+                    break;
+                }
+                it = it->next;
+            }
+            
+            // Create new observation if not found
+            if (payment_obs == NULL) {
+                payment_obs = (PaymentObservability*)malloc(sizeof(PaymentObservability));
+                payment_obs->payment_id = payment_id;
+                payment_obs->amount_observed = amount;
+                payment_obs->observers = (int*)malloc(sizeof(int) * network->num_monitors);
+                payment_obs->num_observers = 0;
+                payment_obs->sender_proximity = -1;
+                payment_obs->receiver_proximity = -1;
+                
+                network->observed_payments = push(network->observed_payments, payment_obs);
+            }
+            
+            // Check if this monitor already observed this payment
+            int already_observed = 0;
+            for (int i = 0; i < payment_obs->num_observers; i++) {
+                if (payment_obs->observers[i] == m) {
+                    already_observed = 1;
+                    break;
+                }
+            }
+            
+            // Add observer if not already added
+            if (!already_observed && payment_obs->num_observers < network->num_monitors) {
+                payment_obs->observers[payment_obs->num_observers++] = m;
+            }
+            
+            // Correlation detection: Multiple monitors observing same payment
+            if (payment_obs->num_observers > 1) {
+                monitor->htlcs_with_correlated_pairs++;
+            }
+        }
     }
 }
 
@@ -920,6 +1029,9 @@ struct network* initialize_network(struct network_params net_params, gsl_rng* ra
   network->cumulative_monitor_assignments = 0;
   network->cumulative_monitor_relocations = 0;
   network->monitor_rotation_epoch = 0;
+  
+  /* === Initialize multi-monitor correlation tracking === */
+  network->observed_payments = NULL;
 
   return  network;
 }

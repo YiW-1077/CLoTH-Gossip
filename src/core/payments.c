@@ -45,6 +45,10 @@ struct payment* new_payment(long id, long sender, long receiver, uint64_t amount
   p->last_reconstruction_time = 0;
   p->prt_abort_triggered = 0;
   p->prt_abort_time = 0;
+  /* === Stage ④ Hypothesis Testing Initialization === */
+  p->hop_send_times = NULL;
+  p->hop_send_times_capacity = 0;
+  p->hop_send_times_initialized = 0;
   return p;
 }
 
@@ -77,7 +81,7 @@ void generate_random_payments(struct payments_params pay_params, long n_nodes, g
     if(pay_params.max_fee_limit_sigma != -1 && pay_params.max_fee_limit_mu != -1) {
         max_fee_limit = fabs(pay_params.max_fee_limit_mu + gsl_ran_ugaussian(random_generator) * pay_params.max_fee_limit_sigma)*1000.0; // convert satoshi to millisatoshi
     }
-    fprintf(payments_file, "%ld,%ld,%ld,%ld,%ld,%ld\n", payment_idIndex++, sender_id, receiver_id, payment_amount, payment_time, max_fee_limit);
+    fprintf(payments_file, "%ld,%ld,%ld,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n", payment_idIndex++, sender_id, receiver_id, payment_amount, payment_time, max_fee_limit);
   }
 
   fclose(payments_file);
@@ -107,7 +111,7 @@ struct array* generate_payments(struct payments_params pay_params) {
 
   fgets(row, 256, payments_file);
   while(fgets(row, 256, payments_file) != NULL) {
-    sscanf(row, "%ld,%ld,%ld,%"SCNu64",%"SCNu64",%"SCNu64"", &id, &sender, &receiver, &amount, &time, &max_fee_limit);
+    sscanf(row, "%ld,%ld,%ld,%" SCNu64 ",%" SCNu64 ",%" SCNu64, &id, &sender, &receiver, &amount, &time, &max_fee_limit);
     payment = new_payment(id, sender, receiver, amount, time, max_fee_limit);
     payments = array_insert(payments, payment);
   }

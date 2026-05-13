@@ -128,10 +128,10 @@ void write_simple_view_state(char output_dir_name[],
   FILE* state_file = fopen(state_filename, "w");
   if (state_file == NULL) return;
 
-  fprintf(state_file, "%ld,%ld,%llu,%ld,%s,%ld,%s\n",
+  fprintf(state_file, "%ld,%ld,%" PRIu64 ",%ld,%s,%ld,%s\n",
           completed_payments,
           total_payments,
-          (unsigned long long)current_time,
+          current_time,
           payment_id,
           event_type_to_string(event_type),
           node_id,
@@ -185,7 +185,7 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
       }
     }
   }
-  detection_rate=rbr_detected_nodes/total_malicious_nodes;
+  detection_rate = (total_malicious_nodes > 0) ? ((double)rbr_detected_nodes / (double)total_malicious_nodes) : 0.0;
 
   // Count successful payments and collect statistics
   for (i = 0; i < n_payments; i++) {
@@ -221,7 +221,7 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
 
   fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered,attack_delay_total,attack_delay_avg_per_payment,payments_with_attack_delay,attack_delay_events,total_malicious_nodes,detection_rate,rbr_detected_nodes\n");
 
-  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld,%llu,%.2f,%ld,%llu,%ld,%.2f,%ld\n",
+  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld,%" PRIu64 ",%.2f,%ld,%" PRIu64 ",%ld,%.2f,%ld\n",
           n_payments,
           n_successful,
           n_failed,
@@ -230,11 +230,11 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
           net_params.malicious_node_ratio,
           net_params.malicious_failure_probability,
           total_attacks,
-          (unsigned long long)total_attack_delay,
+          total_attack_delay,
           (n_payments > 0) ? ((double)total_attack_delay / (double)n_payments) : 0.0,
           payments_with_attack_delay,
-          (unsigned long long)total_attack_delay_events,
-         total_malicious_nodes,
+          total_attack_delay_events,
+          total_malicious_nodes,
           detection_rate,
           rbr_detected_nodes); // ここにカウントした変数を追加
 
@@ -407,15 +407,15 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
               node->first_detection_time >= node->first_attack_time) {
             detection_latency = (long)(node->first_detection_time - node->first_attack_time);
           }
-          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%llu,%llu,%ld\n",
+          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld\n",
                   node->id,
                   node->is_malicious,
                   node->is_monitor,
                   node->reputation_score,
                   node->malicious_reports,
                   degree,
-                  (unsigned long long)node->first_attack_time,
-                  (unsigned long long)node->first_detection_time,
+                  node->first_attack_time,
+                  node->first_detection_time,
                   detection_latency);
         }
       }
@@ -438,7 +438,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       for (int i = 0; i < array_len(payments); i++) {
         struct payment* payment = (struct payment*)array_get(payments, i);
         if (payment != NULL) {
-          fprintf(csv_prt, "%ld,%d,%d,%llu,%d,%d\n",
+          fprintf(csv_prt, "%ld,%d,%d,%" PRIu64 ",%d,%d\n",
                   payment->id,
                   payment->reconstruction_count,
                   payment->prt_abort_triggered,
@@ -642,7 +642,7 @@ void write_output(struct network* network, struct array* payments, char output_d
   fprintf(csv_channel_output, "id,edge1,edge2,node1,node2,capacity,is_closed\n");
   for(i=0; i<array_len(network->channels); i++) {
     channel = array_get(network->channels, i);
-    fprintf(csv_channel_output, "%ld,%ld,%ld,%ld,%ld,%llu,%d\n", channel->id, channel->edge1, channel->edge2, channel->node1, channel->node2, channel->capacity, channel->is_closed);
+    fprintf(csv_channel_output, "%ld,%ld,%ld,%ld,%ld,%" PRIu64 ",%u\n", channel->id, channel->edge1, channel->edge2, channel->node1, channel->node2, channel->capacity, channel->is_closed);
   }
   fclose(csv_channel_output);
 
@@ -667,7 +667,7 @@ void write_output(struct network* network, struct array* payments, char output_d
             fprintf(csv_group_output, ",");
         }
     }
-    fprintf(csv_group_output, "%llu,%llu,%llu,%llu,", group->is_closed, group->constructed_time, group->min_cap_limit, group->max_cap_limit);
+    fprintf(csv_group_output, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",", group->is_closed, group->constructed_time, group->min_cap_limit, group->max_cap_limit);
     fprintf(csv_group_output, "\"[");
     float cul_avg = 0.0f;
     for(struct element* iterator = group->history; iterator != NULL; iterator = iterator->next) {
@@ -679,9 +679,9 @@ void write_output(struct network* network, struct array* payments, char output_d
             float cul = (1.0f - ((float)group_update->group_cap / (float)group_update->edge_balances[j]));
             sum_cul += cul;
             if(group_update->fake_balance_updated_edge_id == e->id){
-                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%llu,\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s,\"\"actual_balance\"\":%ld}", e->id, group_update->edge_balances[j], cul, "true", group_update->fake_balance_updated_edge_actual_balance);
+                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%" PRIu64 ",\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s,\"\"actual_balance\"\":%" PRIu64 "}", e->id, group_update->edge_balances[j], cul, "true", group_update->fake_balance_updated_edge_actual_balance);
             }else{
-                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%llu,\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s}", e->id, group_update->edge_balances[j], cul, "false");
+                fprintf(csv_group_output, "{\"\"edge_id\"\":%ld,\"\"balance\"\":%" PRIu64 ",\"\"cul\"\":%f,\"\"fake_balance_update\"\":%s}", e->id, group_update->edge_balances[j], cul, "false");
             }
             if(j < n_members - 1) {
                 fprintf(csv_group_output, ",");
@@ -689,7 +689,7 @@ void write_output(struct network* network, struct array* payments, char output_d
         }
         float cul = sum_cul / (float)n_members;
         cul_avg += cul / (float) list_len(group->history);
-        fprintf(csv_group_output, "],\"\"time\"\":%llu,\"\"group_cap\"\":%llu,\"\"cul_avg\"\":%f,\"\"triggered_edge_id\"\":%ld}", group_update->time, group_update->group_cap, cul, group_update->triggered_edge_id);
+        fprintf(csv_group_output, "],\"\"time\"\":%" PRIu64 ",\"\"group_cap\"\":%" PRIu64 ",\"\"cul_avg\"\":%f,\"\"triggered_edge_id\"\":%ld}", group_update->time, group_update->group_cap, cul, group_update->triggered_edge_id);
         if(iterator->next != NULL) {
             fprintf(csv_group_output, ",");
         }
@@ -708,16 +708,16 @@ void write_output(struct network* network, struct array* payments, char output_d
   fprintf(csv_edge_output, "id,channel_id,counter_edge_id,from_node_id,to_node_id,balance,fee_base,fee_proportional,min_htlc,timelock,is_closed,tot_flows,cul_threshold,channel_updates,group\n");
   for(i=0; i<array_len(network->edges); i++) {
     edge = array_get(network->edges, i);
-    fprintf(csv_edge_output, "%ld,%ld,%ld,%ld,%ld,%llu,%llu,%llu,%llu,%lu,%d,%llu,%lf,", edge->id, edge->channel_id, edge->counter_edge_id, edge->from_node_id, edge->to_node_id, edge->balance, edge->policy.fee_base, edge->policy.fee_proportional, edge->policy.min_htlc, edge->policy.timelock, edge->is_closed, edge->tot_flows, edge->policy.cul_threshold);
+    fprintf(csv_edge_output, "%ld,%ld,%ld,%ld,%ld,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%u,%" PRIu64 ",%lf,", edge->id, edge->channel_id, edge->counter_edge_id, edge->from_node_id, edge->to_node_id, edge->balance, edge->policy.fee_base, edge->policy.fee_proportional, edge->policy.min_htlc, edge->policy.timelock, edge->is_closed, edge->tot_flows, edge->policy.cul_threshold);
     char channel_updates_text[1000000] = "";
     for (struct element *iterator = edge->channel_updates; iterator != NULL; iterator = iterator->next) {
         struct channel_update *channel_update = iterator->data;
         char temp[1000000];
         int written = 0;
         if(iterator->next != NULL) {
-            written = snprintf(temp, sizeof(temp), "-%llu%s", channel_update->htlc_maximum_msat, channel_updates_text);
+            written = snprintf(temp, sizeof(temp), "-%" PRIu64 "%s", channel_update->htlc_maximum_msat, channel_updates_text);
         }else{
-            written = snprintf(temp, sizeof(temp), "%llu%s", channel_update->htlc_maximum_msat, channel_updates_text);
+            written = snprintf(temp, sizeof(temp), "%" PRIu64 "%s", channel_update->htlc_maximum_msat, channel_updates_text);
         }
         // Check if the output was truncated
         if (written < 0 || (size_t)written >= sizeof(temp)) {
@@ -746,7 +746,7 @@ void write_output(struct network* network, struct array* payments, char output_d
   for(i=0; i<array_len(payments); i++)  {
     payment = array_get(payments, i);
     if (payment->id == -1) continue;
-    fprintf(csv_payment_output, "%ld,%ld,%ld,%llu,%llu,%llu,%llu,%u,%u,%d,%d,%u,%llu,%u,%d,", payment->id, payment->sender, payment->receiver, payment->amount, payment->start_time, payment->max_fee_limit, payment->end_time, payment->is_shard, payment->is_success, payment->no_balance_count, payment->offline_node_count, payment->is_timeout, (unsigned long long)payment->attack_delay_added_total, payment->attack_delay_event_count, payment->attempts);
+    fprintf(csv_payment_output, "%ld,%ld,%ld,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%u,%d,%d,%u,%" PRIu64 ",%u,%d,", payment->id, payment->sender, payment->receiver, payment->amount, payment->start_time, payment->max_fee_limit, payment->end_time, payment->is_shard, payment->is_success, payment->no_balance_count, payment->offline_node_count, payment->is_timeout, payment->attack_delay_added_total, payment->attack_delay_event_count, payment->attempts);
     route = payment->route;
     if(route==NULL)
       fprintf(csv_payment_output, ",,");
@@ -766,15 +766,15 @@ void write_output(struct network* network, struct array* payments, char output_d
         fprintf(csv_payment_output, "\"[");
         for (struct element *iterator = payment->history; iterator != NULL; iterator = iterator->next) {
             struct attempt *attempt = iterator->data;
-            fprintf(csv_payment_output, "{\"\"attempts\"\":%d,\"\"is_succeeded\"\":%ld,\"\"end_time\"\":%llu,\"\"error_edge\"\":%lu,\"\"error_type\"\":%d,\"\"route\"\":[", attempt->attempts, attempt->is_succeeded, attempt->end_time, attempt->error_edge_id, attempt->error_type);
+            fprintf(csv_payment_output, "{\"\"attempts\"\":%d,\"\"is_succeeded\"\":%hd,\"\"end_time\"\":%" PRIu64 ",\"\"error_edge\"\":%ld,\"\"error_type\"\":%d,\"\"route\"\":[", attempt->attempts, attempt->is_succeeded, attempt->end_time, attempt->error_edge_id, attempt->error_type);
             for (j = 0; j < array_len(attempt->route); j++) {
                 struct edge_snapshot* edge_snapshot = array_get(attempt->route, j);
                 edge = array_get(network->edges, edge_snapshot->id);
                 channel = array_get(network->channels, edge->channel_id);
-                fprintf(csv_payment_output,"{\"\"edge_id\"\":%lu,\"\"from_node_id\"\":%lu,\"\"to_node_id\"\":%lu,\"\"sent_amt\"\":%lu,\"\"edge_cap\"\":%lu,\"\"channel_cap\"\":%lu,", edge_snapshot->id, edge->from_node_id, edge->to_node_id, edge_snapshot->sent_amt, edge_snapshot->balance, channel->capacity);
-                if(edge_snapshot->is_in_group) fprintf(csv_payment_output, "\"\"group_cap\"\":%lu,", edge_snapshot->group_cap);
+                fprintf(csv_payment_output,"{\"\"edge_id\"\":%ld,\"\"from_node_id\"\":%ld,\"\"to_node_id\"\":%ld,\"\"sent_amt\"\":%" PRIu64 ",\"\"edge_cap\"\":%" PRIu64 ",\"\"channel_cap\"\":%" PRIu64 ",", edge_snapshot->id, edge->from_node_id, edge->to_node_id, edge_snapshot->sent_amt, edge_snapshot->balance, channel->capacity);
+                if(edge_snapshot->is_in_group) fprintf(csv_payment_output, "\"\"group_cap\"\":%" PRIu64 ",", edge_snapshot->group_cap);
                 else fprintf(csv_payment_output,"\"\"group_cap\"\":null,");
-                if(edge_snapshot->does_channel_update_exist) fprintf(csv_payment_output,"\"\"channel_update\"\":%lu}", edge_snapshot->last_channle_update_value);
+                if(edge_snapshot->does_channel_update_exist) fprintf(csv_payment_output,"\"\"channel_update\"\":%" PRIu64 "}", edge_snapshot->last_channle_update_value);
                 else fprintf(csv_payment_output,"\"\"channel_update\"\":}");
                 if (j != array_len(attempt->route) - 1) fprintf(csv_payment_output, ",");
             }
@@ -1431,7 +1431,7 @@ int main(int argc, char *argv[]) {
     );
 
     if (array_len(balance_adjustment_payments) > 0) {
-      printf("[Monitoring] Generated %d balance adjustment payments\n", array_len(balance_adjustment_payments));
+      printf("[Monitoring] Generated %ld balance adjustment payments\n", array_len(balance_adjustment_payments));
       // TODO: Integrate balance adjustment payments into main payments array
       // For now, just keep them for future event scheduling
     }

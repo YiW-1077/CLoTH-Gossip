@@ -2,9 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <math.h>
 #include "network/monitoring.h"
 #include "data_structures/array.h"
 #include "network/network.h"
+#include "core/payments.h"
 
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
@@ -14,17 +17,13 @@ int g_monitoring_enabled = 1;
 static struct monitor_trust_score* g_monitor_trust_scores = NULL;
 static int g_num_monitors_with_scores = 0;
 
-/* === Helper function to compare observations === */
-static int obs_compare_by_amount_time(const void* a, const void* b) {
-    struct htlc_observation* obs_a = (struct htlc_observation*)a;
-    struct htlc_observation* obs_b = (struct htlc_observation*)b;
-    
-    if (obs_a->amount != obs_b->amount) {
-        return obs_a->amount < obs_b->amount ? -1 : 1;
-    }
-    if (obs_a->timestamp != obs_b->timestamp) {
-        return obs_a->timestamp < obs_b->timestamp ? -1 : 1;
-    }
+/* === Helper function to compare observation pointers by timestamp === */
+static int obs_compare_by_timestamp(const void* a, const void* b) {
+    const struct htlc_observation* obs_a = *(const struct htlc_observation* const*)a;
+    const struct htlc_observation* obs_b = *(const struct htlc_observation* const*)b;
+
+    if (obs_a->timestamp < obs_b->timestamp) return -1;
+    if (obs_a->timestamp > obs_b->timestamp) return 1;
     return 0;
 }
 
@@ -88,26 +87,29 @@ int observations_match(
     if (obs1 == NULL || obs2 == NULL) {
         return 0;
     }
-    
-    // Check if amounts match
-    if (obs1->amount != obs2->amount) {
-        return 0;
-    }
-    
-    // Check if timelocks match
+
+    // Timelock must match
     if (obs1->timelock != obs2->timelock) {
         return 0;
     }
-    
-    // Check if timestamps are within window
-    uint64_t time_diff = (obs1->timestamp > obs2->timestamp) ?
-                         (obs1->timestamp - obs2->timestamp) :
-                         (obs2->timestamp - obs1->timestamp);
-    
+
+    // Enforce temporal ordering: obs1 should be earlier (upstream) and obs2 later (downstream)
+    if (obs2->timestamp < obs1->timestamp) {
+        return 0;
+    }
+
+    // Check if timestamps are within window (obs2.timestamp - obs1.timestamp)
+    uint64_t time_diff = obs2->timestamp - obs1->timestamp;
     if (time_diff > time_window_ms) {
         return 0;
     }
-    
+
+    // Amounts along a payment path should be non-increasing due to fees.
+    // Require upstream amount >= downstream amount.
+    if (obs1->amount < obs2->amount) {
+        return 0;
+    }
+
     return 1;
 }
 
@@ -145,7 +147,7 @@ long* reconstruct_payment_path_from_chain(
 }
 
 /* === Integrate observations to estimate payment paths === */
-struct array* integrate_observations_from_monitors(struct network* network) {
+struct array* integrate_observations_from_monitors(struct network* network, struct array* payments) {
     struct array* estimated_payments = array_initialize(100);
     
     if (g_htlc_observations == NULL || array_len(g_htlc_observations) == 0) {
@@ -161,80 +163,123 @@ struct array* integrate_observations_from_monitors(struct network* network) {
     int num_obs = array_len(g_htlc_observations);
     printf("[Monitoring] Processing %d observations\n", num_obs);
     
-    // Group observations by payment_id and amount
+    // Group observations by payment_id
     struct array** observation_groups = (struct array**)malloc(num_obs * sizeof(struct array*));
-    int* group_ids = (int*)malloc(num_obs * sizeof(int));
+    uint64_t* group_ids = (uint64_t*)malloc(num_obs * sizeof(uint64_t));
     int num_groups = 0;
-    
-    // Mark which observations have been grouped
-    int* processed = (int*)calloc(num_obs, sizeof(int));
-    
-    uint64_t time_window = 10000;  // 10 second window for matching observations
-    
+
     for (int i = 0; i < num_obs; i++) {
-        if (processed[i]) continue;
-        
         struct htlc_observation* obs_i = (struct htlc_observation*)array_get(g_htlc_observations, i);
-        
-        // Start new group
-        observation_groups[num_groups] = array_initialize(20);
-        observation_groups[num_groups] = array_insert(observation_groups[num_groups], obs_i);
-        processed[i] = 1;
-        group_ids[num_groups] = (int)obs_i->payment_id;
-        
-        // Find matching observations to form chain
-        for (int j = i + 1; j < num_obs; j++) {
-            if (processed[j]) continue;
-            
-            struct htlc_observation* obs_j = (struct htlc_observation*)array_get(g_htlc_observations, j);
-            
-            // Try to link: current group's last obs.next_node == obs_j.prev_node
-            struct htlc_observation* last_obs = (struct htlc_observation*)
-                array_get(observation_groups[num_groups], 
-                          array_len(observation_groups[num_groups]) - 1);
-            
-            if (last_obs->next_node_id == obs_j->prev_node_id &&
-                observations_match(last_obs, obs_j, time_window)) {
-                
-                observation_groups[num_groups] = array_insert(observation_groups[num_groups], obs_j);
-                processed[j] = 1;
+
+        int target_group = -1;
+        for (int g = 0; g < num_groups; g++) {
+            if (group_ids[g] == obs_i->payment_id) {
+                target_group = g;
+                break;
             }
         }
-        
-        num_groups++;
+
+        if (target_group == -1) {
+            target_group = num_groups;
+            observation_groups[target_group] = array_initialize(20);
+            group_ids[target_group] = obs_i->payment_id;
+            num_groups++;
+        }
+
+        observation_groups[target_group] = array_insert(observation_groups[target_group], obs_i);
     }
     
     printf("[Monitoring] Formed %d observation groups\n", num_groups);
     
     // Convert groups to estimated payments
+    // Use route-consistent chaining within each payment_id group.
+    uint64_t time_window = 10000;  // 10 second window for matching observations
     for (int g = 0; g < num_groups; g++) {
-        struct estimated_payment* est = (struct estimated_payment*)malloc(sizeof(struct estimated_payment));
-        
-        if (est == NULL) {
+        long group_len = array_len(observation_groups[g]);
+        if (group_len <= 0) {
             continue;
         }
-        
-        struct htlc_observation* first_obs = (struct htlc_observation*)
-            array_get(observation_groups[g], 0);
-        struct htlc_observation* last_obs = (struct htlc_observation*)
-            array_get(observation_groups[g], array_len(observation_groups[g]) - 1);
-        
-        // Reconstruct path
-        int path_len = 0;
-        est->complete_path = reconstruct_payment_path_from_chain(observation_groups[g], &path_len);
-        est->path_length = path_len;
-        est->amount = first_obs->amount;
-        est->num_observations = array_len(observation_groups[g]);
-        
-        // Estimate success and confidence
-        strcpy(est->success_status, "estimated");
-        
-        /* === Confidence Calculation Based on Observation Count === */
-        // TODO: Enhance with monitor trust scores after initialization
-        est->confidence_level = (float)est->num_observations / 10.0f;  // Simple heuristic
-        if (est->confidence_level > 1.0f) est->confidence_level = 1.0f;
-        
-        estimated_payments = array_insert(estimated_payments, est);
+
+        // Sort observations by time first.
+        if (group_len > 1) {
+            qsort(observation_groups[g]->element, group_len, sizeof(void*), obs_compare_by_timestamp);
+        }
+
+        // Require route consistency only for payments that changed route (reconstruction/retry).
+        int require_route_consistency = 0;
+        if (payments != NULL) {
+            uint64_t payment_id = group_ids[g];
+            if (payment_id < (uint64_t)array_len(payments)) {
+                struct payment* p = (struct payment*)array_get(payments, (long)payment_id);
+                if (p != NULL && (p->reconstruction_count > 0 || p->attempts > 1)) {
+                    require_route_consistency = 1;
+                }
+            }
+        }
+
+        // Split same-payment observations into chains.
+        struct array** chains = (struct array**)malloc(group_len * sizeof(struct array*));
+        int num_chains = 0;
+        if (chains == NULL) {
+            continue;
+        }
+
+        for (long i = 0; i < group_len; i++) {
+            struct htlc_observation* obs = (struct htlc_observation*)array_get(observation_groups[g], i);
+            int target_chain = -1;
+
+            if (require_route_consistency) {
+                for (int c = 0; c < num_chains; c++) {
+                    struct htlc_observation* last_obs = (struct htlc_observation*)array_get(chains[c], array_len(chains[c]) - 1);
+                    if (last_obs != NULL &&
+                        last_obs->next_node_id == obs->prev_node_id &&
+                        observations_match(last_obs, obs, time_window)) {
+                        target_chain = c;
+                        break;
+                    }
+                }
+            }
+
+            if (target_chain == -1) {
+                target_chain = num_chains;
+                chains[target_chain] = array_initialize(8);
+                num_chains++;
+            }
+
+            chains[target_chain] = array_insert(chains[target_chain], obs);
+        }
+
+        for (int c = 0; c < num_chains; c++) {
+            struct estimated_payment* est = (struct estimated_payment*)malloc(sizeof(struct estimated_payment));
+            if (est == NULL) {
+                continue;
+            }
+
+            long chain_len = array_len(chains[c]);
+            struct htlc_observation* first_obs = (struct htlc_observation*)array_get(chains[c], 0);
+            struct htlc_observation* last_obs = (struct htlc_observation*)array_get(chains[c], chain_len - 1);
+
+            // Reconstruct path
+            int path_len = 0;
+            est->complete_path = reconstruct_payment_path_from_chain(chains[c], &path_len);
+            est->path_length = path_len;
+            est->amount = first_obs->amount;
+            est->upstream_amount = first_obs->amount;
+            est->downstream_amount = last_obs->amount;
+            est->num_observations = chain_len;
+
+            // Estimate success and confidence
+            strcpy(est->success_status, "estimated");
+            est->confidence_level = (float)est->num_observations / 10.0f;  // Simple heuristic
+            if (est->confidence_level > 1.0f) est->confidence_level = 1.0f;
+
+            estimated_payments = array_insert(estimated_payments, est);
+        }
+
+        for (int c = 0; c < num_chains; c++) {
+            array_free(chains[c]);
+        }
+        free(chains);
     }
     
     // Cleanup
@@ -244,7 +289,6 @@ struct array* integrate_observations_from_monitors(struct network* network) {
     }
     free(observation_groups);
     free(group_ids);
-    free(processed);
     
     return estimated_payments;
 }
@@ -411,7 +455,7 @@ void share_monitor_information_and_update_reputation(
     printf("[Monitoring] Total observations: %d\n", num_observations);
     
     // Integrate observations to get estimated payment paths
-    struct array* estimated_payments = integrate_observations_from_monitors(network);
+    struct array* estimated_payments = integrate_observations_from_monitors(network, NULL);
     
     if (estimated_payments == NULL) {
         return;
@@ -519,3 +563,180 @@ void share_monitor_information_and_update_reputation(
     }
 }
 
+void report_attacked_node_to_monitors(
+    struct network* network,
+    long reporter_node_id,
+    long attacked_node_id,
+    uint64_t payment_id,
+    uint64_t timestamp,
+    struct network_params net_params
+) {
+    if (network == NULL || !net_params.monitoring_strategy || !net_params.enable_reputation_system) {
+        return;
+    }
+
+    if (attacked_node_id < 0 || attacked_node_id >= array_len(network->nodes)) {
+        return;
+    }
+
+    struct node* attacked_node = (struct node*)array_get(network->nodes, attacked_node_id);
+    if (attacked_node == NULL) {
+        return;
+    }
+
+    printf("[Monitoring] reporter=%ld reported attack on node=%ld for payment=%" PRIu64 "\n",
+           reporter_node_id,
+           attacked_node_id,
+           payment_id);
+
+    update_node_reputation_on_detection(
+        attacked_node,
+        net_params.reputation_penalty_on_detection,
+        timestamp
+    );
+}
+
+/**
+ * === Hypothesis Testing: Log-Normal p-value Calculation ===
+ * 
+ * Model: Latency under H0 (normal congestion) follows log-normal distribution
+ * H0: ln(latency + 1) ~ N(μ, σ²)
+ * H1: ln(latency + 1) is significantly higher (one-tailed test)
+ * 
+ * Z-score: Z = (ln(latency + 1) - μ) / σ
+ * p-value: P(Z > observed_z) [cumulative normal distribution]
+ */
+
+/**
+ * Cumulative normal distribution (standard normal CDF)
+ * Using error function approximation
+ * Returns P(X ≤ x) for X ~ N(0, 1)
+ */
+static double normal_cdf(double z) {
+    // Approximation using error function (erf)
+    // CDF(z) = 0.5 * (1 + erf(z / sqrt(2)))
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)));
+}
+
+/**
+ * Calculate p-value from Z-score (one-tailed test for high values)
+ * p = 1 - CDF(z) = P(Z > z)
+ */
+static double p_value_from_z(double z) {
+    return 1.0 - normal_cdf(z);
+}
+
+double calculate_p_value_log_normal(double observed_latency_ms, double baseline_mean, double baseline_std) {
+    // Prevent division by zero
+    if (baseline_std < 1e-6) {
+        return 0.5; // No baseline yet, neutral p-value
+    }
+    
+    // Log-transform: offset by 1ms to avoid log(0)
+    double log_latency = log(observed_latency_ms + 1.0);
+    
+    // Compute Z-score
+    double z_score = (log_latency - baseline_mean) / baseline_std;
+    
+    // Get p-value (one-tailed: delay in high direction)
+    double p = p_value_from_z(z_score);
+    
+    return p;
+}
+
+/**
+ * Update baseline using exponential moving average (EMA)
+ * EMA weight: 0.99 old, 0.01 new (slow adaptation)
+ */
+void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
+    if (node == NULL) return;
+    
+    double log_latency = log(observed_latency_ms + 1.0);
+    
+    // First observation: initialize baseline
+    if (node->baseline_std < 1e-6) {
+        node->baseline_mean = log_latency;
+        node->baseline_std = 0.5; // Start with small variance estimate
+        return;
+    }
+    
+    // EMA update for mean
+    double new_mean = 0.99 * node->baseline_mean + 0.01 * log_latency;
+    
+    // Update variance estimate (simplified: use deviation from new mean)
+    double deviation = fabs(log_latency - new_mean);
+    double new_std = 0.99 * node->baseline_std + 0.01 * deviation;
+    
+    // Ensure minimum std to avoid numerical issues
+    if (new_std < 0.1) new_std = 0.1;
+    
+    node->baseline_mean = new_mean;
+    node->baseline_std = new_std;
+}
+
+/**
+ * Process HTLC result and apply hypothesis testing
+ * 
+ * Returns: 1 if attack should be reported (suspicion_score >= 3), 0 otherwise
+ * 
+ * Logic:
+ * 1. Compute p-value from observed latency
+ * 2. During warm-up (payment_count < 500): learn baseline, update score but don't report
+ * 3. After warm-up:
+ *    - If p < 0.01: increment suspicion_score
+ *    - If p >= 0.01: decrement suspicion_score (if > 0)
+ *    - If suspicion_score >= 3: return 1 (report attack)
+ * 4. Always update baseline for next iteration
+ */
+int on_payment_result_hypothesis_test(
+    struct node* forwarding_node,
+    uint64_t htlc_send_time,
+    uint64_t result_time,
+    long payment_count_global
+) {
+    if (forwarding_node == NULL || htlc_send_time >= result_time) {
+        return 0;
+    }
+    
+    // Compute observed latency [ms]
+    double observed_latency_ms = (double)(result_time - htlc_send_time);
+    
+    // Calculate p-value
+    double p_value = calculate_p_value_log_normal(
+        observed_latency_ms,
+        forwarding_node->baseline_mean,
+        forwarding_node->baseline_std
+    );
+    
+    // Increment payment count
+    forwarding_node->payment_count++;
+    
+    int should_report = 0;
+    
+    // During warm-up phase (first 500 payments): learn baseline only
+    if (payment_count_global < 500) {
+        // Update baseline but don't apply detection logic
+        update_baseline_lognormal(forwarding_node, observed_latency_ms);
+        return 0; // No reporting during warm-up
+    }
+    
+    // After warm-up: apply cumulative judgment
+    if (p_value < 0.01) {
+        // Anomaly detected: increment suspicion score
+        forwarding_node->suspicion_score++;
+        
+        if (forwarding_node->suspicion_score >= 3) {
+            should_report = 1; // 3-strike rule: report attack
+        }
+    } else {
+        // Normal behavior: decrement suspicion score (recovery)
+        if (forwarding_node->suspicion_score > 0) {
+            forwarding_node->suspicion_score--;
+        }
+        
+        // Update baseline with normal data for future adaptation
+        update_baseline_lognormal(forwarding_node, observed_latency_ms);
+    }
+    
+    return should_report;
+}
