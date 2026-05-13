@@ -365,7 +365,11 @@ echo "  防御モード     : ${DEFENSE_MODES[*]}"
 echo ""
 echo "シナリオ: detection_only（攻撃あり・検知のみ）"
 echo ""
-n_combinations=$(( ${#N_PAYMENTS[@]} * ${#MONITOR_NODE_COUNTS[@]} * ${#PAYMENT_AMOUNTS[@]} * ${#MONITORING_METHODS[@]} * ${#DEFENSE_MODES[@]} ))
+# Calculate actual combinations considering that monitor_disable uses 1 count, others use 5
+# = 10 * 3 * ((1 * 2) + (5 * 2) + (5 * 2))
+# = 10 * 3 * (2 + 10 + 10)
+# = 10 * 3 * 22 = 660
+n_combinations=$(( ${#N_PAYMENTS[@]} * ${#PAYMENT_AMOUNTS[@]} * ((1 * ${#DEFENSE_MODES[@]}) + (${#MONITOR_NODE_COUNTS[@]} * ${#DEFENSE_MODES[@]}) + (${#MONITOR_NODE_COUNTS[@]} * ${#DEFENSE_MODES[@]})) ))
 n_total_sims=$n_combinations
 echo "  組み合わせ数            : $n_combinations"
 echo "  合計シミュレーション数  : $n_total_sims"
