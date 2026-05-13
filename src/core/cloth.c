@@ -342,9 +342,44 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         }
       }
       
-      /* Calculate coverage rate based on non-warmup payments only */
+      /* Calculate coverage rate: count unique monitored payments */
+      long unique_monitored_payments = 0;
+      
+      if (g_htlc_observations != NULL && array_len(g_htlc_observations) > 0) {
+        // Count unique payment IDs that were observed
+        struct array* observed_payment_ids = array_initialize(100);
+        for (int i = 0; i < array_len(g_htlc_observations); i++) {
+          struct htlc_observation* obs = (struct htlc_observation*)array_get(g_htlc_observations, i);
+          if (obs != NULL && !obs->is_balance_adjustment) {
+            // Check if this payment ID is already in our set
+            int found = 0;
+            for (int j = 0; j < array_len(observed_payment_ids); j++) {
+              uint64_t* pid = (uint64_t*)array_get(observed_payment_ids, j);
+              if (*pid == obs->payment_id) {
+                found = 1;
+                break;
+              }
+            }
+            // Add if not found
+            if (!found) {
+              uint64_t* new_pid = (uint64_t*)malloc(sizeof(uint64_t));
+              *new_pid = obs->payment_id;
+              array_insert(observed_payment_ids, new_pid);
+            }
+          }
+        }
+        unique_monitored_payments = array_len(observed_payment_ids);
+        
+        // Clean up
+        for (int i = 0; i < array_len(observed_payment_ids); i++) {
+          free(array_get(observed_payment_ids, i));
+        }
+        array_free(observed_payment_ids);
+      }
+      
+      /* Calculate coverage rate based on unique monitored payments */
       double coverage_rate = (total_payments > 0) ? 
-        ((double)total_payments_captured / (double)total_payments * 100.0) : 0.0;
+        ((double)unique_monitored_payments / (double)total_payments * 100.0) : 0.0;
       
       double success_rate = (total_payments > 0) ? 
         ((double)successful_payments / (double)total_payments * 100.0) : 0.0;
@@ -357,7 +392,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       /* Monitoring System */
       fprintf(csv_metrics, "num_monitors,%d\n", network->num_monitors);
       fprintf(csv_metrics, "monitoring_strategy,%d\n", net_params.monitoring_strategy);
-      fprintf(csv_metrics, "total_payments_captured,%ld\n", total_payments_captured);
+      fprintf(csv_metrics, "total_payments_captured,%ld\n", unique_monitored_payments);
       fprintf(csv_metrics, "monitoring_coverage_rate_percent,%.2f\n", coverage_rate);
       fprintf(csv_metrics, "avg_htlcs_observed_per_monitor,%.2f\n",
               (network->num_monitors > 0) ? ((double)total_htlcs_observed / network->num_monitors) : 0.0);
@@ -1420,7 +1455,22 @@ int main(int argc, char *argv[]) {
     printf("group_cover_rate on init : %f\n", (float)(array_len(network->edges) - list_len(group_add_queue)) / (float)(array_len(network->edges)));
 
   printf("PAYMENTS INITIALIZATION\n");
+  
+  /* Add 500 warm-up payments to total */
+  pay_params.n_payments += 500;
   payments = initialize_payments(pay_params, n_nodes, simulation->random_generator);
+  
+  /* Mark first 500 payments as warm-up phase */
+  for (int i = 0; i < 500 && i < array_len(payments); i++) {
+    struct payment* p = (struct payment*)array_get(payments, i);
+    if (p != NULL) {
+      p->is_warmup = 1;
+    }
+  }
+  
+  /* Set total_payments for warm-up calculation */
+  simulation->total_payments = array_len(payments);
+  simulation->processed_payments = 0;
 
   /* === Stage ② Monitoring: Initialize Trust Scores and Balance Adjustment Payments === */
   if (net_params.monitoring_strategy > 0) {

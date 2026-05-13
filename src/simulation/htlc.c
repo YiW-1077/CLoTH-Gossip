@@ -259,13 +259,15 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
   enum pathfind_error error;
   long shard1_id, shard2_id;
   
-  /* === Stage ④ Hypothesis Testing: Detect warm-up phase === */
+  /* === Stage ④ Hypothesis Testing: Detect warm-up phase ===
+   * Warm-up is always the first 500 payments (fixed)
+   */
   int is_warmup_phase = (simulation->processed_payments < 500);
 
   payment = event->payment;
   
-  /* Mark payment as warm-up if it's in the warm-up phase */
-  if (is_warmup_phase) {
+  /* is_warmup flag should already be set during initialization, but ensure it's correct */
+  if (is_warmup_phase && !payment->is_warmup) {
     payment->is_warmup = 1;
   }
 
