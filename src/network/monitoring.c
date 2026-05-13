@@ -515,11 +515,6 @@ void share_monitor_information_and_update_reputation(
             reputation -= avg_suspicion * 0.5;  // Suspicion reduces reputation by up to 50%
         }
         
-        // Known malicious nodes get very low reputation
-        if (node->is_malicious) {
-            reputation *= 0.1;  // 10% of normal reputation
-        }
-        
         // Clamp reputation to [0.0, 1.0]
         if (reputation < 0.0) reputation = 0.0;
         if (reputation > 1.0) reputation = 1.0;
@@ -721,13 +716,15 @@ int on_payment_result_hypothesis_test(
     }
     
     // After warm-up: apply cumulative judgment
+    // Use standard p-value threshold of 0.01 for reasonable detection sensitivity
     if (p_value < 0.01) {
         // Anomaly detected: increment suspicion score
         forwarding_node->suspicion_score++;
         
         if (forwarding_node->suspicion_score >= 3) {
-            should_report = 1; // 3-strike rule: report attack
+            should_report = 1; // 3-strike rule: standard hypothesis testing
         }
+        // Do NOT update baseline during anomalies to avoid pollution
     } else {
         // Normal behavior: decrement suspicion score (recovery)
         if (forwarding_node->suspicion_score > 0) {
