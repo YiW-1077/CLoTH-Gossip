@@ -33,7 +33,9 @@ struct htlc_observation {
 struct estimated_payment {
     long* complete_path;       // Reconstructed complete path
     int path_length;           // Number of hops in path
-    uint64_t amount;           // Estimated payment amount
+    uint64_t amount;           // Estimated payment amount (observed at first monitor)
+    uint64_t upstream_amount;  // Amount observed upstream (closest to sender)
+    uint64_t downstream_amount;// Amount observed downstream (closest to receiver)
     int num_observations;      // Number of observations used
     char success_status[16];   // "success" or "failure"
     float confidence_level;    // 0.0 to 1.0
@@ -99,7 +101,7 @@ struct array* generate_balance_adjustment_payments(
  * Called at end of simulation
  * Returns array of estimated_payment structures
  */
-struct array* integrate_observations_from_monitors(struct network* network);
+struct array* integrate_observations_from_monitors(struct network* network, struct array* payments);
 
 /**
  * Share monitor observations across monitors and update global reputation scores
@@ -108,6 +110,19 @@ struct array* integrate_observations_from_monitors(struct network* network);
  */
 void share_monitor_information_and_update_reputation(
     struct network* network,
+    struct network_params net_params
+);
+
+/**
+ * Report an attacked node from the one-hop upstream node to the monitoring layer.
+ * This is invoked at the node that first observes the failure.
+ */
+void report_attacked_node_to_monitors(
+    struct network* network,
+    long reporter_node_id,
+    long attacked_node_id,
+    uint64_t payment_id,
+    uint64_t timestamp,
     struct network_params net_params
 );
 
@@ -163,5 +178,33 @@ void initialize_monitor_trust_scores(struct network* network);
  * Update monitor trust score based on observation accuracy
  */
 void update_monitor_trust_score(long monitor_id, int is_correct);
+
+/**
+ * Calculate p-value using log-normal distribution hypothesis test
+ * H0: latency is normal network congestion
+ * H1: latency is intentional attack (too high)
+ * Uses Z-test on log-transformed latency: Z = (ln(latency + 1) - μ) / σ
+ * Returns p-value [0.0, 1.0]; p < 0.01 indicates likely attack
+ */
+double calculate_p_value_log_normal(double observed_latency_ms, double baseline_mean, double baseline_std);
+
+/**
+ * Update node's baseline latency statistics using exponential moving average (EMA)
+ * μ_new = μ_old × 0.99 + ln(latency + 1) × 0.01
+ * σ_new updated to match observed variance around new μ
+ */
+void update_baseline_lognormal(struct node* node, double observed_latency_ms);
+
+/**
+ * Process payment completion/failure result: compute latency, check for attacks via p-value
+ * Called when HTLC result is received (Fulfill or Fail event)
+ * Returns 1 if node should be reported (p < 0.01 and suspicion_score >= 3), 0 otherwise
+ */
+int on_payment_result_hypothesis_test(
+    struct node* forwarding_node,
+    uint64_t htlc_send_time,
+    uint64_t result_time,
+    long payment_count_global
+);
 
 #endif

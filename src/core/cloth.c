@@ -322,17 +322,16 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       double detection_rate = (total_malicious_nodes > 0) ?
         ((double)detected_malicious_nodes / (double)total_malicious_nodes * 100.0) : 0.0;
       
-      double coverage_rate = (array_len(payments) > 0) ? 
-        ((double)total_payments_captured / (double)array_len(payments) * 100.0) : 0.0;
-      
-      /* Calculate payment statistics */
+      /* Count non-warmup payments for metrics calculation */
+      long total_payments = 0;
       long successful_payments = 0;
       long total_attempts = 0;
       long prt_abort_count = 0;
       
       for (int i = 0; i < array_len(payments); i++) {
         struct payment* payment = (struct payment*)array_get(payments, i);
-        if (payment != NULL) {
+        if (payment != NULL && !payment->is_warmup) {
+          total_payments++;
           if (payment->is_success) {
             successful_payments++;
           }
@@ -343,7 +342,10 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         }
       }
       
-      long total_payments = array_len(payments);
+      /* Calculate coverage rate based on non-warmup payments only */
+      double coverage_rate = (total_payments > 0) ? 
+        ((double)total_payments_captured / (double)total_payments * 100.0) : 0.0;
+      
       double success_rate = (total_payments > 0) ? 
         ((double)successful_payments / (double)total_payments * 100.0) : 0.0;
       double avg_attempts_per_payment = (total_payments > 0) ? 
@@ -742,7 +744,7 @@ void write_output(struct network* network, struct array* payments, char output_d
     printf("ERROR cannot open payment_output.csv\n");
     exit(-1);
   }
-  fprintf(csv_payment_output, "id,sender_id,receiver_id,amount,start_time,max_fee_limit,end_time,mpp,is_success,no_balance_count,offline_node_count,timeout_exp,attack_delay_total,attack_delay_events,attempts,route,total_fee,attempts_history\n");
+  fprintf(csv_payment_output, "id,sender_id,receiver_id,amount,start_time,max_fee_limit,end_time,mpp,is_success,no_balance_count,offline_node_count,timeout_exp,attack_delay_total,attack_delay_events,attempts,route,total_fee,is_warmup,attempts_history\n");
   for(i=0; i<array_len(payments); i++)  {
     payment = array_get(payments, i);
     if (payment->id == -1) continue;
@@ -761,6 +763,8 @@ void write_output(struct network* network, struct array* payments, char output_d
       }
       fprintf(csv_payment_output, "%llu,",route->total_fee);
     }
+    // Add is_warmup field
+    fprintf(csv_payment_output, "%u,", payment->is_warmup);
     // build attempts history json
     if(payment->history != NULL) {
         fprintf(csv_payment_output, "\"[");

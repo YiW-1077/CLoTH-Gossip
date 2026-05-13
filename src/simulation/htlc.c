@@ -263,6 +263,11 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
   int is_warmup_phase = (simulation->processed_payments < 500);
 
   payment = event->payment;
+  
+  /* Mark payment as warm-up if it's in the warm-up phase */
+  if (is_warmup_phase) {
+    payment->is_warmup = 1;
+  }
 
   ++(payment->attempts);
 

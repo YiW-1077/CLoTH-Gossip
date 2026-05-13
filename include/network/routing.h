@@ -129,11 +129,23 @@ struct array* dijkstra_with_reputation(long source, long destination, uint64_t a
                                        enum routing_method routing_method,
                                        double rbr_weight);
 
+/**
+ * Dijkstra that avoids malicious nodes (for warm-up phase)
+ * Used during baseline learning to ensure clean latency data
+ */
+struct array* dijkstra_avoid_malicious_nodes(long source, long destination, uint64_t amount,
+                                            struct network* network, uint64_t current_time,
+                                            long p, enum pathfind_error *error,
+                                            enum routing_method routing_method,
+                                            uint64_t max_fee_limit);
+
 struct route* transform_path_into_route(struct array* path_hops, uint64_t amount_to_send, struct network* network, uint64_t time);
 
 int compare_distance(struct distance* a, struct distance* b);
 
 void free_route(struct route* route);
 
+/* === Stage ④ Warm-up Phase: Invalidate pre-computed paths === */
+void invalidate_all_paths(long n_payments);
 
 #endif

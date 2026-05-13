@@ -6,6 +6,9 @@
 #include "core/cloth.h"
 #include "data_structures/list.h"
 
+// Forward declaration
+struct route;
+
 #define MAXMSATOSHI 5E17 //5 millions  bitcoin
 #define MAXTIMELOCK 100
 #define MINTIMELOCK 10
@@ -45,6 +48,12 @@ struct node {
   long last_movement_time;          // last time this monitor relocated (for movement tracking)
   uint64_t first_attack_time;       // first simulation time this malicious node triggered attack
   uint64_t first_detection_time;    // first simulation time this node was detected
+  
+  /* === Stage ④ Research: Hypothesis Testing (p-value) Fields === */
+  double baseline_mean;             // log-normal baseline mean (μ)
+  double baseline_std;              // log-normal baseline std dev (σ)
+  int suspicion_score;              // cumulative anomaly score (3 strikes rule)
+  long payment_count;               // count of payments processed (for warm-up detection)
 };
 
 /* a bidirectional payment channel of the payment-channel network open between two nodes */
@@ -189,6 +198,9 @@ struct network {
   int monitor_rotation_epoch;          // incremented each relocation cycle
   HubInfo* hubs;                       // Array of hub information
   int num_hubs;
+  
+  /* === Stage ② Multi-Monitor Correlation === */
+  struct element* observed_payments;      // List of PaymentObservability structures
 };
 
 
@@ -213,7 +225,7 @@ void initialize_hub_info(struct network* network, int hub_threshold);
 void analyze_leaf_neighbors(struct network* network, int leaf_threshold);
 int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf_threshold);
 int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold, int leaf_threshold, int top_hub_count);
-void detect_and_record_htlc_observation(struct network* network, long payment_id, uint64_t amount, int node_id, int direction);
+void detect_and_record_htlc_observation(struct network* network, long payment_id, uint64_t amount, int node_id, int direction, uint64_t timestamp, struct route* route);
 
 /* === Stage ③ Reputation System Functions === */
 void initialize_reputation_scores(struct network* network);

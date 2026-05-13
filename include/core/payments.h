@@ -49,6 +49,14 @@ struct payment {
   long last_reconstruction_time;         // Timestamp of last reconstruction
   unsigned int prt_abort_triggered;      // 1 if threshold exceeded and aborted
   uint64_t prt_abort_time;               // When abort was triggered
+  
+  /* === Stage ④ Research: Hypothesis Testing (p-value) Tracking === */
+  uint64_t* hop_send_times;         // array of HTLC send timestamps per hop (malloc'd size = route length)
+  int hop_send_times_capacity;      // allocated size for hop_send_times
+  int hop_send_times_initialized;   // flag: 1 if malloc'd, 0 if not
+  
+  /* === Warm-up phase tracking === */
+  unsigned int is_warmup;           // 1 if payment was processed during warm-up phase (< 500 payments)
 };
 
 struct attempt {

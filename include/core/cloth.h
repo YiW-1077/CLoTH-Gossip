@@ -169,6 +169,10 @@ struct simulation {
     uint64_t current_time; //milliseconds
     struct heap *events;
     gsl_rng *random_generator;
+    /* === Stage ④ Hypothesis Testing: Global payment counter === */
+    long processed_payments;  // Count of payments completed (for warm-up detection)
+    /* === Stage ④ Warm-up: Delayed malicious node activation === */
+    double delayed_malicious_ratio;  // Malicious ratio to activate after warm-up (500+ payments)
 };
 
 #endif
