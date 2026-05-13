@@ -3,10 +3,12 @@
 # run_all_simulations_change_groupparams.sh に倣い、
 # 監視ノード数 (monitor_node_limit) をスイープ変数として
 # a〜e の5シナリオを各組み合わせで実行する。
-# Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir_or_smb_uri]
+# Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]
+# Example: ./run_monitor_sweep.sh 42 /output/dir monitoring_strategy=method1
 
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <seed> <output_base_dir> [remote_output_dir_or_smb_uri]"
+    echo "Usage: $0 <seed> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]"
+    echo "Example: $0 42 /output/dir monitoring_strategy=method1"
     exit 1
 fi
 
@@ -15,18 +17,67 @@ output_base_arg="$2"
 remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
 project_root="$(cd "$(dirname "$0")" && pwd)"
 
+# Process additional keyword arguments for monitoring_strategy override
+MONITORING_METHODS_OVERRIDE=""
+for ((i=4; i<=$#; i++)); do
+    arg="${!i}"
+    if [[ "$arg" == monitoring_strategy=* ]]; then
+        strategy_value="${arg#monitoring_strategy=}"
+        case "$strategy_value" in
+            disabled|disable)
+                MONITORING_METHODS_OVERRIDE="monitor_disable"
+                ;;
+            method1)
+                MONITORING_METHODS_OVERRIDE="monitor_method1"
+                ;;
+            method2)
+                MONITORING_METHODS_OVERRIDE="monitor_method2"
+                ;;
+            all)
+                MONITORING_METHODS_OVERRIDE="monitor_disable monitor_method1 monitor_method2"
+                ;;
+            *)
+                echo "ERROR: Invalid monitoring_strategy: $strategy_value"
+                echo "Valid options: disabled, method1, method2, all"
+                exit 1
+                ;;
+        esac
+        echo "[Config] Override MONITORING_METHODS: $MONITORING_METHODS_OVERRIDE"
+    fi
+    if [[ "$arg" == defense_mode=* ]]; then
+        def_value="${arg#defense_mode=}"
+        case "$def_value" in
+            none|no_defense|off)
+                DEFENSE_MODE_OVERRIDE="no_defense"
+                ;;
+            avoid_low_reputation|avoid_reputation|avoid)
+                DEFENSE_MODE_OVERRIDE="avoid_low_reputation"
+                ;;
+            all)
+                DEFENSE_MODE_OVERRIDE="no_defense avoid_low_reputation"
+                ;;
+            *)
+                echo "ERROR: Invalid defense_mode: $def_value"
+                echo "Valid options: none,no_defense,avoid_low_reputation,all"
+                exit 1
+                ;;
+        esac
+        echo "[Config] Override DEFENSE_MODES: $DEFENSE_MODE_OVERRIDE"
+    fi
+done
+
 # Create timestamped output directory (always local)
 timestamp=$(date "+%Y%m%d%H%M%S")
 
 # ---------------------------------------------------------------------------
 # Fixed parameters
 # ---------------------------------------------------------------------------
-N_PAYMENTS=(100 300 500 800 1000 1500 2000 2700 3500 4500 5800 7000 8500 10000)
+N_PAYMENTS=(100 300 500 800 1000 1500 2000 2700 3500 4500)
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=0.80
 TOP_HUB_COUNT=10
 
-ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_time=0 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
+ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_time=3000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
 
 # ---------------------------------------------------------------------------
 # Sweep parameters
@@ -35,8 +86,22 @@ NODE_SCALES=6000
 PAYMENT_AMOUNTS=(1000 5000 10000)
 
 # 監視ノード数の絶対数リスト
-MONITOR_NODE_COUNTS=(0 10 50 100 300 500 800 1000)
+MONITOR_NODE_COUNTS=(10 50 100 300 500)
 MONITORING_METHODS=(monitor_disable monitor_method1 monitor_method2)
+
+# Defense modes: compare with and without avoiding low-reputation nodes
+DEFENSE_MODES=(no_defense avoid_low_reputation)
+DEFENSE_MODE_OVERRIDE=""
+
+# Apply MONITORING_METHODS override if specified
+if [[ -n "$MONITORING_METHODS_OVERRIDE" ]]; then
+    MONITORING_METHODS=($MONITORING_METHODS_OVERRIDE)
+fi
+
+# Apply DEFENSE_MODES override if specified
+if [[ -n "$DEFENSE_MODE_OVERRIDE" ]]; then
+    DEFENSE_MODES=($DEFENSE_MODE_OVERRIDE)
+fi
 
 # ---------------------------------------------------------------------------
 max_processes=12
@@ -318,41 +383,62 @@ for n_payment in "${N_PAYMENTS[@]}"; do
         var_pmt=$((avg_pmt / 10))
         for method in "${MONITORING_METHODS[@]}"; do
 
-            if [[ "$method" == "monitor_disable" ]]; then
-                # 監視なし: monitor_count 不要・1本のみ
-                strategy_val="disabled"
-                enable_rep_val="false"
-                monitor_counts_iter=(0)
-            elif [[ "$method" == "monitor_method1" ]]; then
-                strategy_val="method1"
-                enable_rep_val="true"
-                monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
-            else
-                strategy_val="method2"
-                enable_rep_val="true"
-                monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
-            fi
+            # Determine strategy and reputation values based on method
+            case "$method" in
+                monitor_disable)
+                    strategy_val="disabled"
+                    enable_rep_val="false"
+                    monitor_counts_iter=(0)
+                    ;;
+                monitor_method1)
+                    strategy_val="method1"
+                    enable_rep_val="true"
+                    monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
+                    ;;
+                monitor_method2)
+                    strategy_val="method2"
+                    enable_rep_val="true"
+                    monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
+                    ;;
+                *)
+                    echo "ERROR: Unknown monitoring method: $method"
+                    exit 1
+                    ;;
+            esac
 
-            for monitor_count in "${monitor_counts_iter[@]}"; do
-                if [[ "$method" == "monitor_disable" ]]; then
-                    output_dir="$output_base/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
+            for defense in "${DEFENSE_MODES[@]}"; do
+                if [[ "$defense" == "no_defense" ]]; then
+                    avoid_low_rep_val="false"
+                    enable_rep_system_val="$enable_rep_val"
+                    enable_rbr_val="false"
                 else
-                    output_dir="$output_base/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                    avoid_low_rep_val="true"
+                    enable_rep_system_val="true"
+                    enable_rbr_val="true"
                 fi
 
-                enqueue_simulation "./run-simulation.sh $seed_base $output_dir \
-                    n_additional_nodes=$NODE_SCALES \
-                    n_payments=$n_payment \
-                    mpp=0 payment_timeout=200000 \
-                    malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE \
-                    monitoring_strategy=$strategy_val \
-                    top_hub_count=$TOP_HUB_COUNT \
-                    monitor_node_limit=$monitor_count \
-                    enable_reputation_system=$enable_rep_val \
-                    enable_monitor_movement=false movement_credit_limit=0 \
-                    enable_pra=false enable_prt=false enable_rbr=false \
-                    average_payment_amount=$avg_pmt variance_payment_amount=$var_pmt \
-                    $ATTACK_DELAY_PARAMS_ON"
+                for monitor_count in "${monitor_counts_iter[@]}"; do
+                    if [[ "$method" == "monitor_disable" ]]; then
+                        output_dir="$output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
+                    else
+                        output_dir="$output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                    fi
+
+                    enqueue_simulation "./run-simulation.sh $seed_base $output_dir \
+                        n_additional_nodes=$NODE_SCALES \
+                        n_payments=$n_payment \
+                        mpp=0 payment_timeout=200000 \
+                        malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE \
+                        monitoring_strategy=$strategy_val \
+                        top_hub_count=$TOP_HUB_COUNT \
+                        monitor_node_limit=$monitor_count \
+                        enable_reputation_system=$enable_rep_system_val \
+                        avoid_low_reputation=$avoid_low_rep_val \
+                        enable_monitor_movement=false movement_credit_limit=0 \
+                        enable_pra=false enable_prt=false enable_rbr=$enable_rbr_val \
+                        average_payment_amount=$avg_pmt variance_payment_amount=$var_pmt \
+                        $ATTACK_DELAY_PARAMS_ON"
+                done
             done
         done
     done
@@ -430,93 +516,119 @@ function get_summary_value() {
 }
 
 {
-    # ヘッダ
-    echo "node_count,payment_amount_msat,monitor_node_count,status,monitor_method,\
-          n_payments,n_successful,n_failed,\
-          success_rate_raw,payment_success_rate_pct,\
-          total_attacks_triggered,total_malicious_nodes,\
-          malicious_detection_rate_pct,\
-          rbr_detected_nodes,rbr_over_detected_rate,\
-          avg_delay,total_attacks_triggered,\
-          monitoring_coverage_rate_pct,num_monitors_actual"
+    # ヘッダ（defense_mode を追加）
+     echo "node_count,payment_amount_msat,monitor_node_count,defense_mode,status,monitor_method,n_payments,n_successful,n_failed,success_rate_raw,payment_success_rate_pct,total_attacks_triggered,total_malicious_nodes,malicious_detection_rate_pct,rbr_detected_nodes,rbr_over_detected_rate,avg_delay,total_attacks_triggered,monitoring_coverage_rate_pct,num_monitors_actual"
 
-    for n_payment in "${N_PAYMENTS[@]}"; do
-        for avg_pmt in "${PAYMENT_AMOUNTS[@]}"; do
-            for method in "${MONITORING_METHODS[@]}"; do
-                if [[ "$method" == "monitor_disable" ]]; then
-                    monitor_counts_csv=(0)
-                else
-                    monitor_counts_csv=("${MONITOR_NODE_COUNTS[@]}")
-                fi
-                for monitor_count in "${monitor_counts_csv[@]}"; do
-                    if [[ "$method" == "monitor_disable" ]]; then
-                        sim_dir="$remote_output_base/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
-                    else
-                        sim_dir="$remote_output_base/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
-                    fi
-                  # --- ステータス判定 ---
-                  status="PENDING"
-                  if [ -f "$sim_dir/progress.tmp" ]; then
-                      progress=$(cat "$sim_dir/progress.tmp" 2>/dev/null || echo "0")
-                      if   [ "$progress" = "1" ];      then status="OK"
-                      elif [ "$progress" = "failed" ]; then status="FAILED"
-                      else                                   status="RUNNING"
-                      fi
-                  fi
+     for n_payment in "${N_PAYMENTS[@]}"; do
+         for avg_pmt in "${PAYMENT_AMOUNTS[@]}"; do
+             for method in "${MONITORING_METHODS[@]}"; do
+                 if [[ "$method" == "monitor_disable" ]]; then
+                     monitor_counts_csv=(0)
+                 else
+                     monitor_counts_csv=("${MONITOR_NODE_COUNTS[@]}")
+                 fi
+                 for monitor_count in "${monitor_counts_csv[@]}"; do
+                     # 各防御モードの存在を確認して出力（両方あれば両方出力）
+                     def_options=(no_defense avoid_low_reputation)
+                     defenses_found=()
+                     for d in "${def_options[@]}"; do
+                         if [[ "$method" == "monitor_disable" ]]; then
+                             check_dir="$remote_output_base/$d/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
+                         else
+                             check_dir="$remote_output_base/$d/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                         fi
+                         if [[ -d "$check_dir" ]]; then
+                             defenses_found+=("$d")
+                         fi
+                     done
 
-                  # --- baseline_metrics.csv から取得 ---
-                  n_payments="N/A"
-                  n_successful="N/A"
-                  n_failed="N/A"
-                  success_rate_raw="N/A"
-                  avg_delay="N/A"
-                  total_attacks_triggered="N/A"
-                  total_malicious_nodes="N/A"
-                  rbr_over_detected_rate="N/A"
-                  rbr_detected_nodes="N/A"
+                     # 見つからなければ旧来のパスを使う（防御無し扱い／unknown 表示）
+                     if [ ${#defenses_found[@]} -eq 0 ]; then
+                         if [[ "$method" == "monitor_disable" ]]; then
+                             sim_dir="$remote_output_base/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
+                         else
+                             sim_dir="$remote_output_base/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                         fi
+                         defenses_found=("unknown")
+                     fi
 
-                  bm="$sim_dir/baseline_metrics.csv"
-                  if [ -f "$bm" ]; then
-                      data_line=$(tail -1 "$bm")
-                      n_payments=$(echo "$data_line"            | cut -d',' -f1)
-                      n_successful=$(echo "$data_line"          | cut -d',' -f2)
-                      n_failed=$(echo "$data_line"              | cut -d',' -f3)
-                      success_rate_raw=$(echo "$data_line"      | cut -d',' -f4)
-                      avg_delay=$(echo "$data_line"             | cut -d',' -f5)
-                      total_attacks_triggered=$(echo "$data_line" | cut -d',' -f8)
-                      total_malicious_nodes=$(echo "$data_line" | cut -d',' -f13)
-                      rbr_over_detected_rate=$(echo "$data_line"   | cut -d',' -f14)
-                      rbr_detected_nodes=$(echo "$data_line"       | cut -d',' -f15)
-                  fi
+                     for defense in "${defenses_found[@]}"; do
+                         if [[ "$defense" == "unknown" ]]; then
+                             # sim_dir already set above
+                             :
+                         else
+                             if [[ "$method" == "monitor_disable" ]]; then
+                                 sim_dir="$remote_output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
+                             else
+                                 sim_dir="$remote_output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                             fi
+                         fi
 
-                      # --- summary.csv から取得 (key=value 形式) ---
-                   total_malicious_nodes="N/A"
-                   malicious_detection_rate_pct="N/A"
-                   payment_success_rate_pct="N/A"
-                   monitoring_coverage_rate_pct="N/A"
-                   num_monitors_actual="N/A"
+                         # --- ステータス判定 ---
+                         status="PENDING"
+                         if [ -f "$sim_dir/progress.tmp" ]; then
+                             progress=$(cat "$sim_dir/progress.tmp" 2>/dev/null || echo "0")
+                             if   [ "$progress" = "1" ];      then status="OK"
+                             elif [ "$progress" = "failed" ]; then status="FAILED"
+                             else                                   status="RUNNING"
+                             fi
+                         fi
 
-                  sm="$sim_dir/summary.csv"
-                  if [ -f "$sm" ]; then
-                      total_malicious_nodes=$(get_summary_value "$sm" "total_malicious_nodes")
-                      malicious_detection_rate_pct=$(get_summary_value "$sm" "malicious_detection_rate_percent")
-                      payment_success_rate_pct=$(get_summary_value "$sm" "payment_success_rate_percent")
-                      monitoring_coverage_rate_pct=$(get_summary_value "$sm" "monitoring_coverage_rate_percent")
-                      num_monitors_actual=$(get_summary_value "$sm" "num_monitors")
-                  fi
+                         # --- baseline_metrics.csv から取得 ---
+                         n_payments="N/A"
+                         n_successful="N/A"
+                         n_failed="N/A"
+                         success_rate_raw="N/A"
+                         avg_delay="N/A"
+                         total_attacks_triggered="N/A"
+                         total_malicious_nodes="N/A"
+                         rbr_over_detected_rate="N/A"
+                         rbr_detected_nodes="N/A"
 
-                  echo "$NODE_SCALES,$avg_pmt,$monitor_count,$status,$method\
-                        $n_payments,$n_successful,$n_failed,\
-                        $success_rate_raw,$payment_success_rate_pct,\
-                        $total_attacks_triggered,$total_malicious_nodes,\
-                        $malicious_detection_rate_pct,\
-                        $rbr_detected_nodes,$rbr_over_detected_rate,\
-                        $avg_delay,$total_attacks_triggered,\
-                        $monitoring_coverage_rate_pct,$num_monitors_actual"
-                done  # monitor_count
-            done  # method
-        done  # avg_pmt
-    done  # n_payment
+                         bm="$sim_dir/baseline_metrics.csv"
+                         if [ -f "$bm" ]; then
+                             data_line=$(tail -1 "$bm")
+                             n_payments=$(echo "$data_line"            | cut -d',' -f1)
+                             n_successful=$(echo "$data_line"          | cut -d',' -f2)
+                             n_failed=$(echo "$data_line"              | cut -d',' -f3)
+                             success_rate_raw=$(echo "$data_line"      | cut -d',' -f4)
+                             avg_delay=$(echo "$data_line"             | cut -d',' -f5)
+                             total_attacks_triggered=$(echo "$data_line" | cut -d',' -f8)
+                             total_malicious_nodes=$(echo "$data_line" | cut -d',' -f13)
+                             rbr_over_detected_rate=$(echo "$data_line"   | cut -d',' -f14)
+                             rbr_detected_nodes=$(echo "$data_line"       | cut -d',' -f15)
+                         fi
+
+                         # --- summary.csv から取得 (key=value 形式) ---
+                         total_malicious_nodes="N/A"
+                         malicious_detection_rate_pct="N/A"
+                         payment_success_rate_pct="N/A"
+                         monitoring_coverage_rate_pct="N/A"
+                         num_monitors_actual="N/A"
+
+                         sm="$sim_dir/summary.csv"
+                         if [ -f "$sm" ]; then
+                             total_malicious_nodes=$(get_summary_value "$sm" "total_malicious_nodes")
+                             malicious_detection_rate_pct=$(get_summary_value "$sm" "malicious_detection_rate_percent")
+                             payment_success_rate_pct=$(get_summary_value "$sm" "payment_success_rate_percent")
+                             monitoring_coverage_rate_pct=$(get_summary_value "$sm" "monitoring_coverage_rate_percent")
+                             num_monitors_actual=$(get_summary_value "$sm" "num_monitors")
+                         fi
+
+                         echo "$NODE_SCALES,$avg_pmt,$monitor_count,$defense,$status,$method,\
+                               $n_payments,$n_successful,$n_failed,\
+                               $success_rate_raw,$payment_success_rate_pct,\
+                               $total_attacks_triggered,$total_malicious_nodes,\
+                               $malicious_detection_rate_pct,\
+                               $rbr_detected_nodes,$rbr_over_detected_rate,\
+                               $avg_delay,$total_attacks_triggered,\
+                               $monitoring_coverage_rate_pct,$num_monitors_actual"
+                     done  # defense entries
+                 done  # monitor_count
+             done  # method
+         done  # avg_pmt
+     done  # n_payment
+
 } > "$csv_output"
 
 echo "Summary CSV: $csv_output"
