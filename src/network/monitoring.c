@@ -683,6 +683,38 @@ void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
  *    - If suspicion_score >= 3: return 1 (report attack)
  * 4. Always update baseline for next iteration
  */
+int on_payment_result_hypothesis_test(
+    struct node* forwarding_node,
+    uint64_t htlc_send_time,
+    uint64_t result_time,
+    long payment_count_global
+) {
+    if (forwarding_node == NULL || htlc_send_time >= result_time) {
+        return 0;
+    }
+    
+    // Compute observed latency [ms]
+    double observed_latency_ms = (double)(result_time - htlc_send_time);
+    
+    // Calculate p-value
+    double p_value = calculate_p_value_log_normal(
+        observed_latency_ms,
+        forwarding_node->baseline_mean,
+        forwarding_node->baseline_std
+    );
+    
+    // Increment payment count
+    forwarding_node->payment_count++;
+    
+    int should_report = 0;
+    
+    // During warm-up phase (first 500 payments): learn baseline only
+    if (payment_count_global < 500) {
+        // Update baseline but don't apply detection logic
+        update_baseline_lognormal(forwarding_node, observed_latency_ms);
+        return 0; // No reporting during warm-up
+    }
+    
     // After warm-up: apply cumulative judgment
     // Use standard p-value threshold of 0.01 for reasonable detection sensitivity
     if (p_value < 0.01) {
@@ -704,3 +736,4 @@ void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
     }
     
     return should_report;
+}
