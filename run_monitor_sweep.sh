@@ -360,10 +360,12 @@ echo "スイープパラメータ:"
 echo "  取引回数       : ${N_PAYMENTS[*]}"
 echo "  監視ノード数       : ${MONITOR_NODE_COUNTS[*]}"
 echo "  平均支払額（msat） : ${PAYMENT_AMOUNTS[*]}"
+echo "  監視方法       : ${MONITORING_METHODS[*]}"
+echo "  防御モード     : ${DEFENSE_MODES[*]}"
 echo ""
 echo "シナリオ: detection_only（攻撃あり・検知のみ）"
 echo ""
-n_combinations=$(( ${#N_PAYMENTS[@]} * ${#MONITOR_NODE_COUNTS[@]} * ${#PAYMENT_AMOUNTS[@]} ))
+n_combinations=$(( ${#N_PAYMENTS[@]} * ${#MONITOR_NODE_COUNTS[@]} * ${#PAYMENT_AMOUNTS[@]} * ${#MONITORING_METHODS[@]} * ${#DEFENSE_MODES[@]} ))
 n_total_sims=$n_combinations
 echo "  組み合わせ数            : $n_combinations"
 echo "  合計シミュレーション数  : $n_total_sims"
