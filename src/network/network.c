@@ -867,7 +867,10 @@ void initialize_reputation_scores(struct network* network) {
 
 /* === Stage ③ Update Node Reputation on Detection ===
  * Called when a monitor detects malicious activity from a node
- * Reduces reputation by penalty amount
+ * Reduces reputation by penalty amount.
+ * Note: This function applies the penalty but DOES NOT increment the report counter.
+ * Counting of independent reports is handled by the reporter side to enable
+ * requiring multiple independent reports before applying penalties.
  */
 void update_node_reputation_on_detection(struct node* node, double penalty, uint64_t detection_time) {
     if (node == NULL) {
@@ -878,15 +881,18 @@ void update_node_reputation_on_detection(struct node* node, double penalty, uint
         node->first_detection_time = detection_time;
     }
 
-    node->malicious_reports++;
+    /* Apply penalty (do NOT change malicious_reports here) */
     node->reputation_score -= penalty;
-    
-    // Clamp to [0.0, 1.0]
+
+    /* Clamp to [0.0, 1.0] */
     if (node->reputation_score < 0.0) {
         node->reputation_score = 0.0;
     } else if (node->reputation_score > 1.0) {
         node->reputation_score = 1.0;
     }
+
+    /* Diagnostic log */
+    printf("[Reputation] node=%ld applied_penalty=%.4f new_rep=%.4f\n", node->id, penalty, node->reputation_score);
 }
 
 

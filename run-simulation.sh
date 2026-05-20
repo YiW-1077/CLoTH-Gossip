@@ -10,7 +10,7 @@ fi
 seed="$1"
 environment_dir="$2/environment"
 result_dir="$2"
-max_attempts=2
+max_attempts=5
 project_root="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$result_dir"

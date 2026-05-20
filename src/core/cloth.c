@@ -158,7 +158,8 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
   FILE* csv_metrics;
   char output_filename[512];
   long i;
-  long n_payments = array_len(payments);
+  long total_payments = array_len(payments);
+  long n_payments = 0;
   long n_successful = 0;
   long n_failed = 0;
   long total_delay = 0;
@@ -188,9 +189,11 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
   detection_rate = (total_malicious_nodes > 0) ? ((double)rbr_detected_nodes / (double)total_malicious_nodes) : 0.0;
 
   // Count successful payments and collect statistics
-  for (i = 0; i < n_payments; i++) {
+  for (i = 0; i < total_payments; i++) {
     payment = array_get(payments, i);
-    if (payment->id == -1) continue;
+    if (payment == NULL || payment->id == -1 || payment->is_warmup) continue;
+
+    n_payments++;
 
     if (payment->is_success) {
       n_successful++;
@@ -539,7 +542,7 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   }
   
   // Calculate statistics
-  int total_payments = array_len(payments);
+  int total_payments = 0;
   int successful_payments = 0;
   int aborted_payments = 0;
   int high_recon_count = 0;
@@ -549,22 +552,22 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   uint64_t total_attack_delay_events = 0;
   int total_attempts = 0;
   
-  for (int i = 0; i < total_payments; i++) {
+  for (int i = 0; i < array_len(payments); i++) {
     struct payment* pmt = (struct payment*)array_get(payments, i);
-    if (pmt != NULL) {
-      if (pmt->is_success) successful_payments++;
-      if (pmt->prt_abort_triggered) aborted_payments++;
-      if (pmt->reconstruction_count > 5) high_recon_count++;
-      if (pmt->end_time > pmt->start_time) {
-        total_delay += (pmt->end_time - pmt->start_time);
-      }
-      total_attack_delay += pmt->attack_delay_added_total;
-      total_attack_delay_events += pmt->attack_delay_event_count;
-      if (pmt->attack_delay_added_total > 0) {
-        payments_with_attack_delay++;
-      }
-      total_attempts += pmt->attempts;
+    if (pmt == NULL || pmt->id == -1 || pmt->is_warmup) continue;
+    total_payments++;
+    if (pmt->is_success) successful_payments++;
+    if (pmt->prt_abort_triggered) aborted_payments++;
+    if (pmt->reconstruction_count > 5) high_recon_count++;
+    if (pmt->end_time > pmt->start_time) {
+      total_delay += (pmt->end_time - pmt->start_time);
     }
+    total_attack_delay += pmt->attack_delay_added_total;
+    total_attack_delay_events += pmt->attack_delay_event_count;
+    if (pmt->attack_delay_added_total > 0) {
+      payments_with_attack_delay++;
+    }
+    total_attempts += pmt->attempts;
   }
   
   // Count malicious nodes that were detected (reported at least once)
@@ -1397,21 +1400,22 @@ int main(int argc, char *argv[]) {
   n_nodes = array_len(network->nodes);
   n_edges = array_len(network->edges);
 
-  /* === Stage ① Initialize Malicious Nodes === */
-  if (net_params.malicious_node_ratio > 0.0) {
-    initialize_malicious_nodes(network,
-                               net_params.malicious_node_ratio,
-                               net_params.malicious_failure_probability,
-                               simulation->random_generator);
-  }
-
-  /* === Stage ② Deploy Monitoring Agents === */
+  /* === Stage ① Initialize Malicious Nodes AND Deploy Monitoring Agents (order swapped) === */
+  /* Deploy monitors first so malicious nodes can be chosen from non-monitor nodes */
   if (net_params.monitoring_strategy > 0) {
     if (net_params.monitoring_strategy == 1) {
       deploy_monitors_method1(network, net_params.hub_degree_threshold, 5);  // leaf_threshold=5
     } else if (net_params.monitoring_strategy == 2) {
       deploy_monitors_method2_enhanced(network, net_params.hub_degree_threshold, 5, net_params.top_hub_count);
     }
+  }
+
+  if (net_params.malicious_node_ratio > 0.0) {
+    /* Select malicious nodes only from nodes that are not monitors */
+    initialize_malicious_nodes(network,
+                               net_params.malicious_node_ratio,
+                               net_params.malicious_failure_probability,
+                               simulation->random_generator);
   }
 
   /* === Stage ③ Initialize Reputation System === */

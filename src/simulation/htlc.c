@@ -246,6 +246,7 @@ struct payment* create_payment_shard(long shard_id, uint64_t shard_amount, struc
   shard = new_payment(shard_id, payment->sender, payment->receiver, shard_amount, payment->start_time, payment->max_fee_limit);
   shard->attempts = 1;
   shard->is_shard = 1;
+  shard->is_warmup = payment->is_warmup;
   return shard;
 }
 
@@ -259,17 +260,7 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
   enum pathfind_error error;
   long shard1_id, shard2_id;
   
-  /* === Stage ④ Hypothesis Testing: Detect warm-up phase ===
-   * Warm-up is always the first 500 payments (fixed)
-   */
-  int is_warmup_phase = (simulation->processed_payments < 500);
-
   payment = event->payment;
-  
-  /* is_warmup flag should already be set during initialization, but ensure it's correct */
-  if (is_warmup_phase && !payment->is_warmup) {
-    payment->is_warmup = 1;
-  }
 
   ++(payment->attempts);
 
@@ -288,13 +279,13 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
-          } else if (is_warmup_phase) {
-              // === Stage ④ Warm-up: Avoid malicious nodes during baseline learning ===
-              path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
-                                                   network, simulation->current_time,
-                                                   0, &error,
-                                                   net_params.routing_method,
-                                                   payment->max_fee_limit);
+            } else if (payment->is_warmup) {
+                // === Stage ④ Warm-up: Avoid malicious nodes during baseline learning ===
+                path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
+                                                     network, simulation->current_time,
+                                                     0, &error,
+                                                     net_params.routing_method,
+                                                     payment->max_fee_limit);
           } else {
               path = paths[payment->id];
           }
@@ -305,12 +296,12 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
-          } else if (is_warmup_phase) {
-              // === Warm-up retry: Still avoid malicious nodes ===
-              path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
-                                                   network, simulation->current_time,
-                                                   0, &error,
-                                                   net_params.routing_method,
+            } else if (payment->is_warmup) {
+                // === Warm-up retry: Still avoid malicious nodes ===
+                path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
+                                                     network, simulation->current_time,
+                                                     0, &error,
+                                                     net_params.routing_method,
                                                    payment->max_fee_limit);
           } else if (net_params.monitoring_strategy > 0 && net_params.enable_reputation_system) {
               // === Retry: Use reputation-weighted dijkstra when monitoring is active ===

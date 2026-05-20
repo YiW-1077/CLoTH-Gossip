@@ -16,9 +16,12 @@ if [ ! -f "$csv_file" ]; then
     exit 1
 fi
 
-# Extract start_time and end_time columns and calculate duration
-# Skip header line (1d) and calculate: end_time(col7) - start_time(col5)
+# Extract start_time and end_time columns and calculate duration.
+# Skip warm-up payments so the summary matches the post-warm-up metrics.
 awk -F',' 'NR > 1 {
+    if ($18 == 1) {
+        next
+    }
     duration = $7 - $5
     total_duration += duration
     count++

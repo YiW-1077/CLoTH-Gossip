@@ -56,7 +56,7 @@ struct payment {
   int hop_send_times_initialized;   // flag: 1 if malloc'd, 0 if not
   
   /* === Warm-up phase tracking === */
-  unsigned int is_warmup;           // 1 if payment was processed during warm-up phase (< 500 payments)
+  unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments
   
   /* === Monitoring: Observation tracking === */
   unsigned int is_observed;         // 1 if at least one monitor observed this payment

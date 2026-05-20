@@ -40,6 +40,8 @@ struct payment* new_payment(long id, long sender, long receiver, uint64_t amount
   p->shards_id[0] = p->shards_id[1] = -1;
   p->history = NULL;
   p->max_fee_limit = max_fee_limit;
+  p->is_warmup = 0;
+  p->is_observed = 0;
   /* === Stage ④ PRT Initialization === */
   p->reconstruction_count = 0;
   p->last_reconstruction_time = 0;

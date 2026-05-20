@@ -9,6 +9,26 @@
 #include "network/network.h"
 #include "core/payments.h"
 
+/* Runtime-configurable detection parameters (via env vars):
+ * CLOTH_PVALUE_THRESHOLD - p-value threshold for anomaly (default 0.005)
+ * CLOTH_TIME_WINDOW_MS  - time window for chaining observations in ms (default 10000)
+ */
+static double get_pvalue_threshold() {
+    char *env = getenv("CLOTH_PVALUE_THRESHOLD");
+    if (env == NULL) return 0.005;
+    double v = atof(env);
+    if (v <= 0.0) return 0.005;
+    return v;
+}
+
+static uint64_t get_time_window_ms() {
+    char *env = getenv("CLOTH_TIME_WINDOW_MS");
+    if (env == NULL) return 10000;
+    uint64_t v = strtoull(env, NULL, 10);
+    if (v == 0) return 10000;
+    return v;
+}
+
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
 int g_monitoring_enabled = 1;
@@ -193,7 +213,7 @@ struct array* integrate_observations_from_monitors(struct network* network, stru
     
     // Convert groups to estimated payments
     // Use route-consistent chaining within each payment_id group.
-    uint64_t time_window = 10000;  // 10 second window for matching observations
+    uint64_t time_window = get_time_window_ms();  // time window for matching observations (ms), configurable via CLOTH_TIME_WINDOW_MS
     for (int g = 0; g < num_groups; g++) {
         long group_len = array_len(observation_groups[g]);
         if (group_len <= 0) {
@@ -477,18 +497,32 @@ void share_monitor_information_and_update_reputation(
             continue;
         }
         
-        // If payment failed and has high confidence, nodes in path are suspects
-        if (strcmp(est_pmt->success_status, "failure") == 0 && est_pmt->confidence_level > 0.7) {
-            // Distribute suspicion across path nodes
-            double suspicion_increment = (1.0 - est_pmt->confidence_level) * 0.3;  // Partial suspicion
+        // If payment failed and has high confidence, identify the failing node
+        if (strcmp(est_pmt->success_status, "failure") == 0 && est_pmt->confidence_level > 0.5) {
+            // Heuristic: Identify the most likely failing node
+            // Primary strategy: Check for amount discrepancy (upstream vs downstream)
+            // This indicates which node(s) handled the payment before failure
             
-            for (int j = 1; j < est_pmt->path_length - 1; j++) {  // Skip sender and receiver
-                long node_id = est_pmt->complete_path[j];
-                
-                if (node_id >= 0 && node_id < (long)array_len(network->nodes)) {
-                    node_suspicion[node_id] += suspicion_increment;
-                    node_suspicion_count[node_id]++;
-                }
+            long suspected_node_id = -1;
+            double suspicion_strength = 0.2;  // Conservative: 0.2 for low confidence
+            
+            // If upstream_amount != downstream_amount, a node on the path modified it
+            // The downstream node (closest to receiver) is most likely the culprit
+            if (est_pmt->downstream_amount > 0 && est_pmt->path_length > 1) {
+                suspected_node_id = est_pmt->complete_path[est_pmt->path_length - 2];
+                suspicion_strength = 0.15;  // Gradual penalization
+            }
+            
+            // Fallback: if path_length >= 3, suspect the last intermediate node (hop before receiver)
+            if (suspected_node_id < 0 && est_pmt->path_length > 2) {
+                suspected_node_id = est_pmt->complete_path[est_pmt->path_length - 2];
+                suspicion_strength = 0.1;  // Very conservative
+            }
+            
+            // Apply suspicion only to the suspected node (not all path nodes)
+            if (suspected_node_id >= 0 && suspected_node_id < (long)array_len(network->nodes)) {
+                node_suspicion[suspected_node_id] += suspicion_strength;
+                node_suspicion_count[suspected_node_id]++;
             }
         }
     }
@@ -509,10 +543,33 @@ void share_monitor_information_and_update_reputation(
         // Base reputation: 1.0 (trusted)
         double reputation = 1.0;
         
-        // Adjust based on suspicion from monitoring
+        // Adjust based on number of malicious reports (not suspicion score)
+        // Using a linear + diminishing decay model: each report reduces reputation
+        // Strong initial penalty for first few reports, then slower diminishing
         if (node_suspicion_count[i] > 0) {
-            double avg_suspicion = node_suspicion[i] / node_suspicion_count[i];
-            reputation -= avg_suspicion * 0.5;  // Suspicion reduces reputation by up to 50%
+            int report_count = node_suspicion_count[i];
+            
+            // Linear model: each report reduces reputation by a fixed amount
+            // First 10 reports: 0.08 each = -0.80
+            // Additional reports: diminishing returns
+            // Total cap: 0.95 (node can stay at 0.05)
+            double penalty = 0.0;
+            
+            if (report_count <= 12) {
+                // Linear: 0.08 per report (12 reports → 0.96, capped at 0.95)
+                penalty = report_count * 0.08;
+            } else {
+                // After 12 reports, diminishing returns
+                // 12 * 0.08 + log(report_count - 12) * 0.05
+                penalty = 12 * 0.08 + log(report_count - 11.0) * 0.05;
+            }
+            
+            // Cap maximum penalty at 0.95
+            if (penalty > 0.95) {
+                penalty = 0.95;
+            }
+            
+            reputation -= penalty;
         }
         
         // Clamp reputation to [0.0, 1.0]
@@ -523,7 +580,7 @@ void share_monitor_information_and_update_reputation(
         double old_rep = node->reputation_score;
         node->reputation_score = reputation;
         
-        if (reputation != old_rep) {
+        if (fabs(reputation - old_rep) > 1e-6) {  // Only count if significantly changed
             nodes_updated++;
         }
     }
@@ -584,11 +641,31 @@ void report_attacked_node_to_monitors(
            attacked_node_id,
            payment_id);
 
-    update_node_reputation_on_detection(
-        attacked_node,
-        net_params.reputation_penalty_on_detection,
-        timestamp
-    );
+    /* Require multiple independent reports before applying reputation penalty */
+    const int REPORTS_REQUIRED = 2; /* configurable constant: require 2 reports */
+
+    /* Increment the report counter (represents independent reports received) */
+    attacked_node->malicious_reports++;
+
+    /* Apply penalty only when enough reports accumulated; apply per-batch: every REPORTS_REQUIRED reports */
+    if (attacked_node->malicious_reports % REPORTS_REQUIRED == 0) {
+        /* Hub protection: scale penalty down for high-degree (hub) nodes to avoid over-penalizing central nodes */
+        long degree = 0;
+        if (attacked_node->open_edges != NULL) degree = array_len(attacked_node->open_edges);
+        double degree_scale = 1.0 / (1.0 + ((double)degree) / 500.0); /* degree 500 -> 0.5, 1000 -> 0.333 */
+        if (degree_scale < 0.1) degree_scale = 0.1; /* floor to avoid zeroing out penalty */
+
+        double scaled_penalty = net_params.reputation_penalty_on_detection * degree_scale;
+
+        printf("[Monitoring] applying scaled penalty to node=%ld degree=%ld scale=%.4f base_penalty=%.4f scaled_penalty=%.4f\n",
+               attacked_node_id, degree, degree_scale, net_params.reputation_penalty_on_detection, scaled_penalty);
+
+        update_node_reputation_on_detection(
+            attacked_node,
+            scaled_penalty,
+            timestamp
+        );
+    }
 }
 
 /**
@@ -672,15 +749,15 @@ void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
 /**
  * Process HTLC result and apply hypothesis testing
  * 
- * Returns: 1 if attack should be reported (suspicion_score >= 3), 0 otherwise
+ * Returns: 1 if attack should be reported (suspicion_score >= 2), 0 otherwise
  * 
  * Logic:
  * 1. Compute p-value from observed latency
  * 2. During warm-up (payment_count < 500): learn baseline, update score but don't report
  * 3. After warm-up:
- *    - If p < 0.01: increment suspicion_score
- *    - If p >= 0.01: decrement suspicion_score (if > 0)
- *    - If suspicion_score >= 3: return 1 (report attack)
+ *    - If p < 0.005: increment suspicion_score
+ *    - If p >= 0.005: decrement suspicion_score (if > 0)
+ *    - If suspicion_score >= 2: return 1 (report attack)
  * 4. Always update baseline for next iteration
  */
 int on_payment_result_hypothesis_test(
@@ -707,22 +784,49 @@ int on_payment_result_hypothesis_test(
     forwarding_node->payment_count++;
     
     int should_report = 0;
+
+    int old_suspicion = forwarding_node->suspicion_score;
     
     // During warm-up phase (first 500 payments): learn baseline only
     if (payment_count_global < 500) {
         // Update baseline but don't apply detection logic
         update_baseline_lognormal(forwarding_node, observed_latency_ms);
+        // Log warm-up observation for diagnostics
+        {
+            const char* path = "/tmp/cloth_detection_events.csv";
+            FILE* fh = fopen(path, "r");
+            int need_header = 0;
+            if (fh == NULL) need_header = 1; else fclose(fh);
+            fh = fopen(path, "a");
+            if (fh != NULL) {
+                if (need_header) {
+                    fprintf(fh, "timestamp,node_id,payment_count_global,observed_latency_ms,p_value,suspicion_score_before,suspicion_score_after,should_report\n");
+                }
+                fprintf(fh, "%" PRIu64 ",%ld,%ld,%.6f,%.6f,%d,%d,%d\n",
+                    result_time,
+                    forwarding_node->id,
+                    payment_count_global,
+                    observed_latency_ms,
+                    p_value,
+                    old_suspicion,
+                    forwarding_node->suspicion_score,
+                    0
+                );
+                fclose(fh);
+            }
+        }
         return 0; // No reporting during warm-up
     }
     
     // After warm-up: apply cumulative judgment
-    // Use standard p-value threshold of 0.01 for reasonable detection sensitivity
-    if (p_value < 0.01) {
+    // Use a stricter p-value threshold with a shorter strike window.
+    double p_threshold = get_pvalue_threshold();
+        if (p_value < p_threshold) {
         // Anomaly detected: increment suspicion score
         forwarding_node->suspicion_score++;
         
-        if (forwarding_node->suspicion_score >= 3) {
-            should_report = 1; // 3-strike rule: standard hypothesis testing
+        if (forwarding_node->suspicion_score >= 2) {
+            should_report = 1; // 2-strike rule for higher sensitivity
         }
         // Do NOT update baseline during anomalies to avoid pollution
     } else {
@@ -733,6 +837,31 @@ int on_payment_result_hypothesis_test(
         
         // Update baseline with normal data for future adaptation
         update_baseline_lognormal(forwarding_node, observed_latency_ms);
+    }
+
+    // Append diagnostic entry for this observation
+    {
+        const char* path = "/tmp/cloth_detection_events.csv";
+        FILE* fh = fopen(path, "r");
+        int need_header = 0;
+        if (fh == NULL) need_header = 1; else fclose(fh);
+        fh = fopen(path, "a");
+        if (fh != NULL) {
+            if (need_header) {
+                fprintf(fh, "timestamp,node_id,payment_count_global,observed_latency_ms,p_value,suspicion_score_before,suspicion_score_after,should_report\n");
+            }
+            fprintf(fh, "%" PRIu64 ",%ld,%ld,%.6f,%.6f,%d,%d,%d\n",
+                result_time,
+                forwarding_node->id,
+                payment_count_global,
+                observed_latency_ms,
+                p_value,
+                old_suspicion,
+                forwarding_node->suspicion_score,
+                should_report
+            );
+            fclose(fh);
+        }
     }
     
     return should_report;
