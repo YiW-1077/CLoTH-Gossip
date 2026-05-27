@@ -417,39 +417,60 @@ void initialize_malicious_nodes(struct network* network,
                                  gsl_rng* rng) {
     long n_nodes = array_len(network->nodes);
     long n_malicious = (long)(n_nodes * malicious_ratio);
-    
+
     if (n_malicious <= 0) {
         // No malicious nodes
         printf("[Malicious Nodes] Disabled (ratio=%.2f)\n", malicious_ratio);
         return;
     }
-    
+
     printf("[Malicious Nodes] Initializing: %ld nodes out of %ld will be malicious\n",
            n_malicious, n_nodes);
-    
-    // Create a shuffled array of node indices and select first n_malicious
-    long* node_indices = (long*)malloc(n_nodes * sizeof(long));
+
+    /* Build candidate list: nodes with degree >= 3 (and not monitors if monitors present) */
+    long* candidates = (long*)malloc(n_nodes * sizeof(long));
+    long cand_count = 0;
     for (long i = 0; i < n_nodes; i++) {
-        node_indices[i] = i;
+        struct node* node = (struct node*)array_get(network->nodes, i);
+        int degree = (int)array_len(node->open_edges);
+        if (degree >= 3 && !node->is_monitor) {
+            candidates[cand_count++] = i;
+        }
     }
-    
-    // Fisher-Yates shuffle
-    for (long i = n_nodes - 1; i > 0; i--) {
+
+    /* Fallbacks: if no candidates (e.g., no monitors set), relax to non-monitor nodes, then to all nodes */
+    if (cand_count == 0) {
+        for (long i = 0; i < n_nodes; i++) {
+            struct node* node = (struct node*)array_get(network->nodes, i);
+            if (!node->is_monitor) candidates[cand_count++] = i;
+        }
+    }
+    if (cand_count == 0) {
+        for (long i = 0; i < n_nodes; i++) {
+            candidates[cand_count++] = i;
+        }
+    }
+
+    if (n_malicious > cand_count) {
+        n_malicious = cand_count; // cannot select more than available candidates
+    }
+
+    /* Shuffle candidates using Fisher-Yates with GSL RNG and pick first n_malicious */
+    for (long i = cand_count - 1; i > 0; i--) {
         long j = gsl_rng_uniform_int(rng, i + 1);
-        long temp = node_indices[i];
-        node_indices[i] = node_indices[j];
-        node_indices[j] = temp;
+        long tmp = candidates[i];
+        candidates[i] = candidates[j];
+        candidates[j] = tmp;
     }
-    
-    // Mark first n_malicious nodes as malicious
+
     for (long i = 0; i < n_malicious; i++) {
-        struct node* node = (struct node*)array_get(network->nodes, node_indices[i]);
+        struct node* node = (struct node*)array_get(network->nodes, candidates[i]);
         node->is_malicious = 1;
         node->attack_probability = failure_prob;
     }
-    
-    free(node_indices);
-    
+
+    free(candidates);
+
     printf("[Malicious Nodes] Deployment complete: %ld malicious nodes, failure_prob=%.2f\n",
            n_malicious, failure_prob);
 }
