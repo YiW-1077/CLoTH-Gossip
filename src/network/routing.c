@@ -821,49 +821,6 @@ struct array* dijkstra_avoid_malicious_nodes(long source, long destination, uint
     return path;
 }
 
-/* === Stage ④ PRA Context Management === */
-struct pra_context* pra_context_new() {
-    struct pra_context* ctx = (struct pra_context*)malloc(sizeof(struct pra_context));
-    ctx->failed_nodes = NULL;
-    ctx->num_failed_nodes = 0;
-    ctx->max_failed_nodes = 10;  // Initial capacity
-    ctx->reconstruction_attempts = 0;
-    ctx->first_attempt_time = 0;
-    ctx->last_reconstruction_time = 0;
-    
-    ctx->failed_nodes = (long*)malloc(ctx->max_failed_nodes * sizeof(long));
-    return ctx;
-}
-
-void pra_context_add_failed_node(struct pra_context* ctx, long node_id) {
-    if (ctx == NULL) return;
-    
-    // Check if node already tracked
-    for (int i = 0; i < ctx->num_failed_nodes; i++) {
-        if (ctx->failed_nodes[i] == node_id) {
-            return;  // Already tracked
-        }
-    }
-    
-    // Resize if needed
-    if (ctx->num_failed_nodes >= ctx->max_failed_nodes) {
-        ctx->max_failed_nodes *= 2;
-        ctx->failed_nodes = (long*)realloc(ctx->failed_nodes,
-                                           ctx->max_failed_nodes * sizeof(long));
-    }
-    
-    ctx->failed_nodes[ctx->num_failed_nodes++] = node_id;
-    ctx->reconstruction_attempts++;
-}
-
-void pra_context_free(struct pra_context* ctx) {
-    if (ctx != NULL) {
-        if (ctx->failed_nodes != NULL) {
-            free(ctx->failed_nodes);
-        }
-        free(ctx);
-    }
-}
 
 /* === Stage ④ RBR Implementation: Reputation-Based Routing ===
  *
@@ -1015,25 +972,35 @@ struct array* find_reputation_based_route(
             if (N == NULL) continue;
             
             // Line 8: If node has low reputation and not yet avoided
-            if (N->reputation_score < 0.3 && !is_node_in_avoided_list(avoided_nodes, num_avoided, N->id)) {
+            // Dynamic threshold: high-degree hubs require stronger evidence
+            // (lower score) before being hard-excluded, matching the degree-
+            // scaled penalty applied during monitoring sweeps.
+            // degree=0: threshold=0.30, degree=200: threshold=0.15, degree=1000: threshold=0.05
+            long node_degree = (N->open_edges != NULL) ? (long)array_len(N->open_edges) : 0L;
+            double blacklist_threshold = 0.3 / (1.0 + (double)node_degree / 200.0);
+            if (blacklist_threshold < 0.05) blacklist_threshold = 0.05;
+
+            if (N->reputation_score < blacklist_threshold && !is_node_in_avoided_list(avoided_nodes, num_avoided, N->id)) {
                 // Line 9: Print detection message
-                printf("[RBR] Faulty node %ld detected on path\n", N->id);
-                
+                if (cloth_debug_enabled())
+                    printf("[RBR] Faulty node %ld detected on path (score=%.3f < threshold=%.3f, degree=%ld)\n",
+                           N->id, N->reputation_score, blacklist_threshold, node_degree);
+
                 // Line 10: Decrease reputation (Equation 10)
                 if (net_params.enable_reputation_system) {
                     update_node_reputation_on_detection(N, reputation_penalty, current_time);
                 }
-                
+
                 // Line 11: Add to avoided nodes list
                 add_node_to_avoided_list(&avoided_nodes, &num_avoided, &capacity, N->id);
-                
+
                 // Line 12-17: Reconstruct path with new weights
                 // Will use dijkstra_exclude_nodes in next iteration
-                
+
                 // Line 18: RL ← True (trigger reconstruction loop)
                 reconstruction_loop = 1;
                 break;  // Break from node loop, restart path search
-            } else if (N->reputation_score >= 0.3) {
+            } else if (N->reputation_score >= blacklist_threshold) {
                 // Line 28: Increase reputation for good behavior (honest node)
                 if (net_params.enable_reputation_system) {
                     N->reputation_score += reputation_reward;

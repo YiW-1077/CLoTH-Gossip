@@ -5,6 +5,8 @@
 #include "data_structures/array.h"
 #include "network/network.h"
 
+struct payment; /* forward declaration */
+
 /* === Stage ② Monitoring: HTLC Information Observation ===
  * 
  * Monitors deployed on the network observe HTLC forwarding events.
@@ -180,6 +182,17 @@ void initialize_monitor_trust_scores(struct network* network);
 void update_monitor_trust_score(long monitor_id, int is_correct);
 
 /**
+ * Register node_id as having filed an attack report for payment.
+ * Called when hypothesis test fires (should_report=1) on a failed payment.
+ */
+void register_attack_reporter(struct payment* payment, long node_id);
+
+/**
+ * Return 1 if node_id has already filed an attack report for payment, 0 otherwise.
+ */
+int has_attack_reporter(struct payment* payment, long node_id);
+
+/**
  * Calculate p-value using log-normal distribution hypothesis test
  * H0: latency is normal network congestion
  * H1: latency is intentional attack (too high)
@@ -204,7 +217,8 @@ int on_payment_result_hypothesis_test(
     struct node* forwarding_node,
     uint64_t htlc_send_time,
     uint64_t result_time,
-    long payment_count_global
+    long payment_count_global,
+    int is_fail
 );
 
 #endif

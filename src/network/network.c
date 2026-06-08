@@ -42,10 +42,10 @@ struct node* new_node(long id) {
   node->first_attack_time = 0;
   node->first_detection_time = 0;
   /* === Stage ④ Initialize Hypothesis Testing Fields === */
-  node->baseline_mean = 0.0;        // Log-normal baseline mean (not yet learned)
-  node->baseline_std = 0.0;         // Log-normal baseline std (0 = not yet learned)
-  node->suspicion_score = 0;        // No suspicion initially
-  node->payment_count = 0;          // No payments processed yet
+  node->baseline_mean = 0.0;
+  node->baseline_std = 0.0;
+  node->suspicion_score = 0;
+  node->payment_count = 0;
   return node;
 }
 
@@ -411,8 +411,8 @@ struct network* generate_network_from_files(char nodes_filename[256], char chann
  *   - failure_prob: probability of HTLC failure on malicious nodes
  *   - rng: GSL random generator
  */
-void initialize_malicious_nodes(struct network* network, 
-                                 double malicious_ratio, 
+void initialize_malicious_nodes(struct network* network,
+                                 double malicious_ratio,
                                  double failure_prob,
                                  gsl_rng* rng) {
     long n_nodes = array_len(network->nodes);
@@ -484,7 +484,7 @@ void initialize_malicious_nodes(struct network* network,
 void initialize_hub_info(struct network* network, int hub_threshold) {
     long n_nodes = array_len(network->nodes);
     int temp_hub_count = 0;
-    
+
     // Pass 1: Count hubs
     for (long i = 0; i < n_nodes; i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
@@ -492,35 +492,35 @@ void initialize_hub_info(struct network* network, int hub_threshold) {
             temp_hub_count++;
         }
     }
-    
+
     network->hubs = (HubInfo*)malloc(temp_hub_count * sizeof(HubInfo));
     network->num_hubs = 0;
-    
+
     // Pass 2: Extract hub info
     for (long i = 0; i < n_nodes; i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
         int degree = (int)array_len(node->open_edges);
-        
+
         if (degree > hub_threshold) {
             HubInfo* hub = &network->hubs[network->num_hubs];
             hub->hub_id = (int)i;
             hub->degree = degree;
             hub->neighbor_ids = (int*)malloc(degree * sizeof(int));
             hub->num_neighbors = 0;
-            
+
             // Extract neighbor IDs from edges
             for (long j = 0; j < array_len(node->open_edges); j++) {
                 long edge_id = *(long*)array_get(node->open_edges, j);
                 struct edge* edge = (struct edge*)array_get(network->edges, edge_id);
-                int neighbor_id = (edge->from_node_id == i) ? 
+                int neighbor_id = (edge->from_node_id == i) ?
                     (int)edge->to_node_id : (int)edge->from_node_id;
                 hub->neighbor_ids[hub->num_neighbors++] = neighbor_id;
             }
-            
+
             network->num_hubs++;
         }
     }
-    
+
     printf("[Hub Detection] Found %d hubs (degree > %d)\n", network->num_hubs, hub_threshold);
 }
 
@@ -533,34 +533,34 @@ void initialize_hub_info(struct network* network, int hub_threshold) {
 void analyze_leaf_neighbors(struct network* network, int leaf_threshold) {
     for (int h = 0; h < network->num_hubs; h++) {
         HubInfo* hub = &network->hubs[h];
-        
+
         // Pass 1: Count leaf neighbors
         int leaf_count = 0;
         for (int n = 0; n < hub->num_neighbors; n++) {
             int neighbor_id = hub->neighbor_ids[n];
             struct node* neighbor = (struct node*)array_get(network->nodes, neighbor_id);
             int neighbor_degree = (int)array_len(neighbor->open_edges);
-            
+
             if (neighbor_degree <= leaf_threshold) {
                 leaf_count++;
             }
         }
-        
+
         // Pass 2: Store leaf neighbor IDs
         hub->leaf_neighbor_ids = (int*)malloc(leaf_count * sizeof(int));
         hub->num_leaf_neighbors = 0;
-        
+
         for (int n = 0; n < hub->num_neighbors; n++) {
             int neighbor_id = hub->neighbor_ids[n];
             struct node* neighbor = (struct node*)array_get(network->nodes, neighbor_id);
             int neighbor_degree = (int)array_len(neighbor->open_edges);
-            
+
             if (neighbor_degree <= leaf_threshold) {
                 hub->leaf_neighbor_ids[hub->num_leaf_neighbors++] = neighbor_id;
             }
         }
     }
-    
+
     printf("[Leaf Analysis] Leaf nodes categorized for all hubs\n");
 }
 
@@ -579,24 +579,24 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
     // Stage 1: Hub detection
     initialize_hub_info(network, hub_threshold);
     analyze_leaf_neighbors(network, leaf_threshold);
-    
+
     // Stage 2: Deploy monitors on leaf nodes
     int total_monitors = 0;
     network->monitors = NULL;
-    
+
     for (int h = 0; h < network->num_hubs; h++) {
         HubInfo* hub = &network->hubs[h];
-        
+
         for (int l = 0; l < hub->num_leaf_neighbors; l++) {
             if (total_monitors >= MONITOR_NODE_LIMIT) {
                 break;
             }
             int leaf_node_id = hub->leaf_neighbor_ids[l];
-            
+
             // Allocate monitor
-            network->monitors = (MonitorAgent*)realloc(network->monitors, 
+            network->monitors = (MonitorAgent*)realloc(network->monitors,
                 (total_monitors + 1) * sizeof(MonitorAgent));
-            
+
             MonitorAgent* m = &network->monitors[total_monitors];
             m->monitor_id = total_monitors;
             m->node_id = leaf_node_id;
@@ -604,17 +604,17 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
             m->watching_hub_id = hub->hub_id;
             m->direct_hub_connections = NULL;
             m->num_direct_hubs = 0;
-            
+
             // Initialize observation statistics
             m->total_htlcs_observed = 0;
             m->htlcs_with_correlated_pairs = 0;
             m->payments_captured = 0;
-            
+
             // Mark node as having a monitor
             struct node* leaf_node = (struct node*)array_get(network->nodes, leaf_node_id);
             leaf_node->is_monitor = 1;
             leaf_node->monitor_id = total_monitors;
-            
+
             total_monitors++;
         }
 
@@ -622,24 +622,16 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
             break;
         }
     }
-    
+
     network->num_monitors = total_monitors;
     network->cumulative_monitor_assignments = total_monitors;
     network->cumulative_monitor_relocations = 0;
     printf("[Method1 Deployment] Placed %d monitors on leaf nodes\n", total_monitors);
     fflush(stdout);
-    
+
     return total_monitors;
 }
 
-
-/* === Stage ② Utility: Get Top Hubs by Degree ===
- *
- * Sorts hubs by degree and returns top K hub IDs.
- */
-static int compare_hub_by_degree(const void* a, const void* b) {
-    return ((HubInfo*)b)->degree - ((HubInfo*)a)->degree;
-}
 
 typedef struct {
     int node_id;
@@ -652,77 +644,74 @@ static int compare_node_degree_desc(const void* a, const void* b) {
     return nb->degree - na->degree;
 }
 
-static int* get_top_hubs_by_degree(struct network* network, int top_k) {
-    if (top_k > network->num_hubs) {
-        top_k = network->num_hubs;
-    }
-    
-    // Sort hubs by degree
-    HubInfo* sorted_hubs = (HubInfo*)malloc(network->num_hubs * sizeof(HubInfo));
-    memcpy(sorted_hubs, network->hubs, network->num_hubs * sizeof(HubInfo));
-    qsort(sorted_hubs, network->num_hubs, sizeof(HubInfo), compare_hub_by_degree);
-    
-    // Extract top K hub IDs
-    int* top_hub_ids = (int*)malloc(top_k * sizeof(int));
-    for (int i = 0; i < top_k; i++) {
-        top_hub_ids[i] = sorted_hubs[i].hub_id;
-    }
-    
-    free(sorted_hubs);
-    return top_hub_ids;
-}
+/* Minimum node degree for a node to be an observation target under Method 2.
+ * Every node with degree >= this value is watched by exactly one monitor. */
+#define METHOD2_OBSERVE_DEGREE_THRESHOLD 10
 
-
-/* === Stage ② Method 2: Enhanced with Top Hub Connections ===
+/* === Stage ② Method 2: Full degree-based coverage, partitioned across monitors ===
  *
- * Extends Method 1 by adding direct virtual connections to top K hubs.
- * Expected coverage: ~85% of payment paths
+ * Unlike the previous "top-K hubs watched by every monitor" design (which gave
+ * heavy overlap and tiny coverage), Method 2 now watches EVERY node whose degree
+ * is >= METHOD2_OBSERVE_DEGREE_THRESHOLD, and distributes those target nodes
+ * across the deployed monitors round-robin so that no two monitors watch the
+ * same node (disjoint assignment).
  *
  * Algorithm:
- *   1. Deploy all Method 1 monitors
- *   2. Identify top K hubs by degree
- *   3. Add virtual direct connections from all monitors to top K hubs
+ *   1. Deploy all Method 1 monitors (placed on leaf nodes).
+ *   2. Collect every node with degree >= threshold as an observation target.
+ *   3. Assign targets to monitors round-robin (target t -> monitor t % M),
+ *      so each target is watched by exactly one monitor.
+ *
+ * top_hub_count is retained in the signature for ABI compatibility but is no
+ * longer used for target selection.
  */
-int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold, 
+int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
                                       int leaf_threshold, int top_hub_count) {
+    (void)top_hub_count; /* superseded by degree-threshold coverage */
+
     // Stage 1: Deploy Method 1
     deploy_monitors_method1(network, hub_threshold, leaf_threshold);
-    int deployed_method1_count = network->num_monitors;
-    
-    // Stage 2: Get top hubs
-    int* top_hubs = get_top_hubs_by_degree(network, top_hub_count);
-    
-    printf("[Method2] Top %d hubs by degree:\n", top_hub_count);
-    for (int i = 0; i < top_hub_count; i++) {
-        HubInfo* hub_info = NULL;
-        for (int h = 0; h < network->num_hubs; h++) {
-            if (network->hubs[h].hub_id == top_hubs[i]) {
-                hub_info = &network->hubs[h];
-                break;
-            }
-        }
-        if (hub_info) {
-            printf("  Hub %d: degree=%d\n", top_hubs[i], hub_info->degree);
+    int num_monitors = network->num_monitors;
+    if (num_monitors <= 0) {
+        return network->num_monitors;
+    }
+
+    // Stage 2: Collect every node with degree >= threshold as an observation target
+    int n_nodes = array_len(network->nodes);
+    int* targets = (int*)malloc(sizeof(int) * (n_nodes > 0 ? n_nodes : 1));
+    int num_targets = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        struct node* nd = (struct node*)array_get(network->nodes, i);
+        if (nd == NULL) continue;
+        long degree = (nd->open_edges != NULL) ? array_len(nd->open_edges) : 0L;
+        if (degree >= METHOD2_OBSERVE_DEGREE_THRESHOLD) {
+            targets[num_targets++] = (int)nd->id;
         }
     }
-    
-    // Stage 3: Add virtual connections to all monitors
-    for (int m = 0; m < deployed_method1_count; m++) {
+
+    // Stage 3: Partition targets across monitors round-robin (disjoint assignment)
+    int* counts = (int*)calloc(num_monitors, sizeof(int));
+    for (int t = 0; t < num_targets; t++) {
+        counts[t % num_monitors]++;
+    }
+    for (int m = 0; m < num_monitors; m++) {
         MonitorAgent* monitor = &network->monitors[m];
-        
-        monitor->direct_hub_connections = (int*)malloc(top_hub_count * sizeof(int));
-        for (int h = 0; h < top_hub_count; h++) {
-            monitor->direct_hub_connections[h] = top_hubs[h];
-        }
-        monitor->num_direct_hubs = top_hub_count;
-        monitor->deployed_at_stage = 2;  // Mark as Method 2
+        monitor->direct_hub_connections =
+            (counts[m] > 0) ? (int*)malloc(sizeof(int) * counts[m]) : NULL;
+        monitor->num_direct_hubs = 0;          /* filled in below */
+        monitor->deployed_at_stage = 2;        /* Mark as Method 2 */
     }
-    
-    free(top_hubs);
-    
-    printf("[Method2 Enhancement] Added top-%d hub connections to all %d monitors\n",
-           top_hub_count, deployed_method1_count);
-    
+    for (int t = 0; t < num_targets; t++) {
+        MonitorAgent* monitor = &network->monitors[t % num_monitors];
+        monitor->direct_hub_connections[monitor->num_direct_hubs++] = targets[t];
+    }
+
+    free(counts);
+    free(targets);
+
+    printf("[Method2] Watching %d nodes (degree>=%d) partitioned across %d monitors (no overlap)\n",
+           num_targets, METHOD2_OBSERVE_DEGREE_THRESHOLD, num_monitors);
+
     return network->num_monitors;
 }
 
@@ -731,34 +720,34 @@ int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
  *
  * When an HTLC passes through a monitor node, record the observation.
  * Multiple monitors observing the same payment enables information correlation.
- * 
+ *
  * Method1: Single hub observation
  * Method2: Multiple hub sources via direct_hub_connections
  */
-int detect_and_record_htlc_observation(struct network* network, long payment_id, 
+int detect_and_record_htlc_observation(struct network* network, long payment_id,
                                         uint64_t amount, int node_id, int direction, uint64_t timestamp,
                                         struct route* route) {
     int was_observed = 0;
-    
+
     if (!network || network->num_monitors == 0) {
         return 0;
     }
-    
+
     if (direction != 0) {  // Only process incoming HTLC
         return 0;
     }
-    
+
     struct node* node = (struct node*)array_get(network->nodes, node_id);
     if (!node) {
         return 0;
     }
-    
+
     // Check each monitor for observation capability
     for (int m = 0; m < network->num_monitors; m++) {
         MonitorAgent* monitor = &network->monitors[m];
         int can_observe = 0;
         struct route_hop* matched_hop = NULL;
-        
+
         // Method 1: Direct observation (payment passes through monitor's node)
         if (node_id == monitor->node_id) {
             can_observe = 1;
@@ -771,7 +760,7 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                     struct route_hop* hop = (struct route_hop*)array_get(route->route_hops, h);
                     if (hop) {
                         int hop_node_id = hop->to_node_id;
-                        
+
                         // Check if this hop node is in monitor's direct_hub_connections
                         for (int d = 0; d < monitor->num_direct_hubs; d++) {
                             if (hop_node_id == monitor->direct_hub_connections[d]) {
@@ -785,13 +774,13 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                 }
             }
         }
-        
+
         // Record observation if monitor can observe this payment
         if (can_observe) {
             was_observed = 1;
             monitor->total_htlcs_observed++;
             monitor->payments_captured++;
-            
+
             // If this is an indirect observation (monitor not colocated with node), record a detailed HTLC observation
             if (node_id != monitor->node_id && matched_hop != NULL) {
                 long prev_node = matched_hop->from_node_id;
@@ -815,7 +804,7 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
 
             // Record observation for correlation detection
             PaymentObservability* payment_obs = NULL;
-            
+
             // Search for existing payment observation
             struct element* it = network->observed_payments;
             while (it != NULL) {
@@ -826,7 +815,7 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                 }
                 it = it->next;
             }
-            
+
             // Create new observation if not found
             if (payment_obs == NULL) {
                 payment_obs = (PaymentObservability*)malloc(sizeof(PaymentObservability));
@@ -836,10 +825,10 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                 payment_obs->num_observers = 0;
                 payment_obs->sender_proximity = -1;
                 payment_obs->receiver_proximity = -1;
-                
+
                 network->observed_payments = push(network->observed_payments, payment_obs);
             }
-            
+
             // Check if this monitor already observed this payment
             int already_observed = 0;
             for (int i = 0; i < payment_obs->num_observers; i++) {
@@ -848,20 +837,53 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                     break;
                 }
             }
-            
+
             // Add observer if not already added
             if (!already_observed && payment_obs->num_observers < network->num_monitors) {
                 payment_obs->observers[payment_obs->num_observers++] = m;
             }
-            
+
             // Correlation detection: Multiple monitors observing same payment
             if (payment_obs->num_observers > 1) {
                 monitor->htlcs_with_correlated_pairs++;
             }
         }
     }
-    
+
     return was_observed;
+}
+
+
+/* See network.h. Mirrors the observation capability of
+ * detect_and_record_htlc_observation() but as a stateless predicate. */
+int is_node_observed_by_monitors(struct network* network, long node_id) {
+    if (network == NULL || network->num_monitors == 0) {
+        return 0;
+    }
+    for (int m = 0; m < network->num_monitors; m++) {
+        MonitorAgent* monitor = &network->monitors[m];
+        /* method1: monitor co-located with the node */
+        if ((long)monitor->node_id == node_id) {
+            return 1;
+        }
+        /* method2: node is one of the monitor's directly-watched hubs */
+        for (int d = 0; d < monitor->num_direct_hubs; d++) {
+            if ((long)monitor->direct_hub_connections[d] == node_id) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+
+/* See network.h. Caches the CLOTH_DEBUG env lookup on first use. */
+int cloth_debug_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("CLOTH_DEBUG") != NULL) ? 1 : 0;
+    }
+    return v;
 }
 
 
@@ -872,7 +894,7 @@ void initialize_reputation_scores(struct network* network) {
     if (network == NULL || network->nodes == NULL) {
         return;
     }
-    
+
     for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
         if (node != NULL) {
@@ -925,13 +947,13 @@ void apply_reputation_decay_all_nodes(struct network* network, double decay_rate
     if (network == NULL || network->nodes == NULL) {
         return;
     }
-    
+
     for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
         if (node != NULL && !node->is_malicious) {
             // Honest nodes recover reputation over time (decay is negative penalty)
             node->reputation_score += decay_rate;
-            
+
             // Clamp to [0.0, 1.0]
             if (node->reputation_score > 1.0) {
                 node->reputation_score = 1.0;
@@ -1061,7 +1083,7 @@ struct network* initialize_network(struct network_params net_params, gsl_rng* ra
   network->cumulative_monitor_assignments = 0;
   network->cumulative_monitor_relocations = 0;
   network->monitor_rotation_epoch = 0;
-  
+
   /* === Initialize multi-monitor correlation tracking === */
   network->observed_payments = NULL;
 

@@ -13,6 +13,7 @@ enum payment_error_type{
   NOERROR,
   NOBALANCE,
   OFFLINENODE, //it corresponds to `FailUnknownNextPeer` in lnd
+  NORESPONSE,
 };
 
 /* register an eventual error occurred when the payment traversed a hop */
@@ -60,6 +61,11 @@ struct payment {
   
   /* === Monitoring: Observation tracking === */
   unsigned int is_observed;         // 1 if at least one monitor observed this payment
+
+  /* === Attack Report Tracking (per payment) === */
+  long* attack_reporters;          // node IDs that filed an attack report for this payment
+  int   num_attack_reporters;
+  int   attack_reporters_capacity;
 };
 
 struct attempt {

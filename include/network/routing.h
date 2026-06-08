@@ -100,9 +100,6 @@ struct array* dijkstra_exclude_nodes(long source, long destination, uint64_t amo
                                       long* excluded_node_ids, int num_excluded,
                                       long p, enum pathfind_error *error);
 
-struct pra_context* pra_context_new();
-void pra_context_add_failed_node(struct pra_context* ctx, long node_id);
-void pra_context_free(struct pra_context* ctx);
 
 /* === Stage ④ RBR: Reputation-Based Routing with Path Reconstruction === */
 struct array* find_reputation_based_route(

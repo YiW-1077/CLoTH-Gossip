@@ -308,22 +308,41 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         }
       }
       
-      /* Count malicious nodes (expected) and detected malicious nodes */
+      /* Count malicious nodes (expected) and detected malicious nodes.
+       * A node is "flagged" (judged malicious by the defense) when it has been
+       * reported at least once or its reputation has dropped below 0.5.
+       *   - detected_malicious_nodes : flagged AND actually malicious  (true positives)
+       *   - false_positive_nodes     : flagged BUT actually legitimate (false positives) */
       int total_malicious_nodes = 0;
       int detected_malicious_nodes = 0;
-      
+      int false_positive_nodes = 0;
+      int observable_malicious_nodes = 0; /* malicious nodes any monitor can even see */
+
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
-        if (node != NULL && node->is_malicious) {
+        if (node == NULL) continue;
+        int flagged = (node->malicious_reports > 0 || node->reputation_score < 0.5);
+        if (node->is_malicious) {
           total_malicious_nodes++;
-          if (node->malicious_reports > 0 || node->reputation_score < 0.5) {
-            detected_malicious_nodes++;
-          }
+          if (is_node_observed_by_monitors(network, node->id)) observable_malicious_nodes++;
+          if (flagged) detected_malicious_nodes++;
+        } else if (flagged) {
+          false_positive_nodes++;
         }
       }
-      
+
+      int total_flagged_nodes = detected_malicious_nodes + false_positive_nodes;
+
+      /* detection_rate = recall vs ALL malicious nodes (capped by observability) */
       double detection_rate = (total_malicious_nodes > 0) ?
         ((double)detected_malicious_nodes / (double)total_malicious_nodes * 100.0) : 0.0;
+      /* detection_rate_observable = recall vs only the malicious nodes a monitor
+       * could actually observe; isolates detector quality from monitor coverage */
+      double detection_rate_observable = (observable_malicious_nodes > 0) ?
+        ((double)detected_malicious_nodes / (double)observable_malicious_nodes * 100.0) : 0.0;
+      /* detection_precision = of the nodes flagged as malicious, how many really were */
+      double detection_precision = (total_flagged_nodes > 0) ?
+        ((double)detected_malicious_nodes / (double)total_flagged_nodes * 100.0) : 0.0;
       
       /* Count non-warmup payments for metrics calculation */
       long total_payments = 0;
@@ -377,8 +396,13 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       
       /* Attack Detection Results */
       fprintf(csv_metrics, "total_malicious_nodes,%d\n", total_malicious_nodes);
+      fprintf(csv_metrics, "observable_malicious_nodes,%d\n", observable_malicious_nodes);
       fprintf(csv_metrics, "detected_malicious_nodes,%d\n", detected_malicious_nodes);
+      fprintf(csv_metrics, "false_positive_nodes,%d\n", false_positive_nodes);
+      fprintf(csv_metrics, "total_flagged_nodes,%d\n", total_flagged_nodes);
       fprintf(csv_metrics, "malicious_detection_rate_percent,%.2f\n", detection_rate);
+      fprintf(csv_metrics, "malicious_detection_rate_observable_percent,%.2f\n", detection_rate_observable);
+      fprintf(csv_metrics, "malicious_detection_precision_percent,%.2f\n", detection_precision);
       
       /* Payment Results */
       fprintf(csv_metrics, "total_payments,%ld\n", total_payments);
@@ -395,8 +419,9 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       
       fclose(csv_metrics);
       printf("[Output] Wrote unified summary.csv\n");
-      printf("  - Detection: %d/%d malicious nodes (%.2f%%)\n", 
-             detected_malicious_nodes, total_malicious_nodes, detection_rate);
+      printf("  - Detection: %d/%d malicious nodes (rate=%.2f%%, precision=%.2f%%, FP=%d)\n",
+             detected_malicious_nodes, total_malicious_nodes,
+             detection_rate, detection_precision, false_positive_nodes);
       printf("  - Success: %.2f%% (%ld/%ld payments)\n", 
              success_rate, successful_payments, total_payments);
       printf("  - Monitoring: %.2f%% coverage\n", coverage_rate);
@@ -473,7 +498,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
 
   /* === Write Payment Estimation CSV (from monitoring) === */
   if (net_params.monitoring_strategy > 0) {
-    printf("[Monitoring] Starting payment information integration...\n");
+    if (cloth_debug_enabled()) printf("[Monitoring] Starting payment information integration...\n");
     fflush(stdout);
     struct array* estimated_payments = integrate_observations_from_monitors(network, payments);
     printf("[Monitoring] Integration complete: %ld estimated payments\n", array_len(estimated_payments));
@@ -1345,14 +1370,6 @@ int main(int argc, char *argv[]) {
       net_params.enable_monitor_movement = (strcmp(env_val, "true") == 0) ? 1 : 0;
       printf("[Config] Override enable_monitor_movement from env: %d\n", net_params.enable_monitor_movement);
     }
-    if ((env_val = getenv("CLOTH_ENABLE_PRA")) != NULL) {
-      net_params.enable_pra = (strcmp(env_val, "true") == 0) ? 1 : 0;
-      printf("[Config] Override enable_pra from env: %d\n", net_params.enable_pra);
-    }
-    if ((env_val = getenv("CLOTH_ENABLE_PRT")) != NULL) {
-      net_params.enable_prt = (strcmp(env_val, "true") == 0) ? 1 : 0;
-      printf("[Config] Override enable_prt from env: %d\n", net_params.enable_prt);
-    }
     if ((env_val = getenv("CLOTH_ENABLE_RBR")) != NULL) {
       net_params.enable_rbr = (strcmp(env_val, "true") == 0) ? 1 : 0;
       printf("[Config] Override enable_rbr from env: %d\n", net_params.enable_rbr);
@@ -1385,6 +1402,14 @@ int main(int argc, char *argv[]) {
         net_params.top_hub_count = (int)v;
       }
     }
+
+    /* Keep monitoring and defense in sync:
+     * - monitoring enabled  -> reputation updates enabled
+     * - monitoring disabled -> no detection / no reputation updates
+     */
+    net_params.enable_reputation_system = (net_params.monitoring_strategy > 0) ? 1 : 0;
+    printf("[Config] Normalized enable_reputation_system from monitoring_strategy: %d\n",
+           net_params.enable_reputation_system);
 
     fflush(stdout);
   }

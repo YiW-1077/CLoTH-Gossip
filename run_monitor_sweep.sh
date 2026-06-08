@@ -86,7 +86,7 @@ timestamp=$(date "+%Y%m%d%H%M%S")
 # ---------------------------------------------------------------------------
 # Fixed parameters
 # ---------------------------------------------------------------------------
-N_PAYMENTS=(200 400 800 1600 3200 6400 12800)
+N_PAYMENTS=(200 400 800 1600 3200 6400)
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=1.0
 TOP_HUB_COUNT=10
@@ -97,15 +97,14 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 # Sweep parameters
 # ---------------------------------------------------------------------------
 NODE_SCALES=6000
-PAYMENT_AMOUNTS=(1000 5000 10000)
+PAYMENT_AMOUNTS=(100 500 1000)
 
 # 監視ノード数の絶対数リスト
-MONITOR_NODE_COUNTS=(10 50)
+MONITOR_NODE_COUNTS=(10 20 50)
 MONITORING_METHODS=(monitor_disable monitor_method1 monitor_method2)
 
-# Defense modes: compare with and without avoiding low-reputation nodes
+# Defense modes: no_defense uses monitoring disabled, defense uses monitoring enabled
 DEFENSE_MODES=(no_defense avoid_low_reputation)
-MONITOR_DISABLE_DEFENSE_MODES=(no_defense)
 DEFENSE_MODE_OVERRIDE=""
 
 # Apply MONITORING_METHODS override if specified
@@ -373,15 +372,31 @@ echo "  攻撃成功率    : $ATTACK_SUCCESS_RATE"
 echo ""
 echo "スイープパラメータ:"
 echo "  取引回数       : ${N_PAYMENTS[*]}"
-echo "  監視ノード数       : ${MONITOR_NODE_COUNTS[*]}"
 echo "  平均支払額（msat） : ${PAYMENT_AMOUNTS[*]}"
+echo "  監視ノード数   : ${MONITOR_NODE_COUNTS[*]}"
 echo "  監視方法       : ${MONITORING_METHODS[*]}"
 echo "  防御モード     : ${DEFENSE_MODES[*]}"
+echo "  p値（閾値）    : ${P_VALUES[*]}"
 echo ""
-echo "シナリオ: detection_only（攻撃あり・検知のみ）"
+p_combo_count=$(( ${#P_VALUES[@]} > 0 ? ${#P_VALUES[@]} : 1 ))
 echo ""
-n_combinations=$(( ${#N_PAYMENTS[@]} * ${#PAYMENT_AMOUNTS[@]} * (1 * ${#MONITOR_DISABLE_DEFENSE_MODES[@]} + 2 * ${#MONITOR_NODE_COUNTS[@]} * ${#DEFENSE_MODES[@]}) ))
+disable_method_count=0
+enabled_method_count=0
+for method in "${MONITORING_METHODS[@]}"; do
+    if [[ "$method" == "monitor_disable" ]]; then
+        ((disable_method_count++))
+    else
+        ((enabled_method_count++))
+    fi
+done
+n_disable_combos=$(( disable_method_count * 1 * p_combo_count ))
+n_method_combos=$(( enabled_method_count * ${#MONITOR_NODE_COUNTS[@]} * 1 * p_combo_count ))
+n_combinations=$(( ${#N_PAYMENTS[@]} * ${#PAYMENT_AMOUNTS[@]} * (n_disable_combos + n_method_combos) ))
 n_total_sims=$n_combinations
+echo "  監視無効パターン        : $n_disable_combos"
+echo "  監視有効パターン        : $n_method_combos"
+echo "  計測パターン合計         :$(( n_disable_combos + n_method_combos ))"
+echo ""
 echo "  組み合わせ数            : $n_combinations"
 echo "  合計シミュレーション数  : $n_total_sims"
 echo "  並列プロセス数          : $max_processes"
@@ -400,25 +415,25 @@ for n_payment in "${N_PAYMENTS[@]}"; do
         var_pmt=$((avg_pmt / 10))
             for method in "${MONITORING_METHODS[@]}"; do
 
-                # Determine strategy and reputation values based on method
+                # Pair no_defense with monitoring disabled, and defense with monitoring enabled
                 case "$method" in
                     monitor_disable)
                         strategy_val="disabled"
                         enable_rep_val="false"
                         monitor_counts_iter=(0)
-                        defense_modes_iter=("${MONITOR_DISABLE_DEFENSE_MODES[@]}")
+                        defense_modes_iter=(no_defense)
                         ;;
                     monitor_method1)
                         strategy_val="method1"
                         enable_rep_val="true"
                         monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
-                        defense_modes_iter=("${DEFENSE_MODES[@]}")
+                        defense_modes_iter=(avoid_low_reputation)
                         ;;
                     monitor_method2)
                         strategy_val="method2"
                         enable_rep_val="true"
                         monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
-                        defense_modes_iter=("${DEFENSE_MODES[@]}")
+                        defense_modes_iter=(avoid_low_reputation)
                         ;;
                     *)
                         echo "ERROR: Unknown monitoring method: $method"
@@ -516,7 +531,8 @@ echo "=========================================="
 # 改善されたフォーマット:
 #   defense_strategy, monitor_method, payment_amount_sat, payment_amount_msat,
 #   monitor_count, n_transactions, n_successful, n_failed,
-#   success_rate_pct, avg_delay_ms, attacks_triggered, detection_rate_pct
+#   success_rate_pct, avg_delay_ms, attacks_triggered, detection_rate_pct,
+#   avg_fee_msat, avg_fee_rate_pct
 # ---------------------------------------------------------------------------
 csv_output="$output_base/results_summary.csv"
 echo "Generating CSV summary: $csv_output"
@@ -529,9 +545,40 @@ function get_summary_value() {
     grep "^${key}," "$file" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]' || echo "N/A"
 }
 
+# payments_output.csv から手数料統計を計算するヘルパー関数
+# 成功した支払い (is_success==1) の total_fee (col17) と amount (col4) を集計
+# 出力: "avg_fee_msat avg_fee_rate_pct" を空白区切りで返す
+function calc_fee_stats() {
+    local payments_file="$1"
+    if [[ ! -f "$payments_file" ]]; then
+        echo "N/A N/A"
+        return
+    fi
+    awk -F',' '
+    NR==1 {
+        for (i=1; i<=NF; i++) {
+            if ($i=="is_success")  col_ok=i
+            if ($i=="total_fee")   col_fee=i
+            if ($i=="amount")      col_amt=i
+        }
+        next
+    }
+    col_ok && col_fee && col_amt && $col_ok=="1" {
+        fee_sum += $col_fee
+        if ($col_amt > 0) rate_sum += $col_fee / $col_amt * 100
+        n++
+    }
+    END {
+        if (n > 0)
+            printf "%.2f %.6f", fee_sum/n, rate_sum/n
+        else
+            printf "N/A N/A"
+    }' "$payments_file"
+}
+
 {
-    # 改善されたヘッダ
-    echo "defense_strategy,monitor_method,p_value,payment_amount_sat,payment_amount_msat,monitor_count,n_transactions,n_successful,n_failed,success_rate_pct,avg_delay_ms,attacks_triggered,detection_rate_pct"
+    # 改善されたヘッダ（手数料列を追加）
+    echo "defense_strategy,monitor_method,p_value,payment_amount_sat,payment_amount_msat,monitor_count,n_transactions,n_successful,n_failed,success_rate_pct,avg_delay_ms,attacks_triggered,detection_rate_pct,detection_precision_pct,avg_fee_msat,avg_fee_rate_pct"
 
     for n_payment in "${N_PAYMENTS[@]}"; do
         for avg_pmt in "${PAYMENT_AMOUNTS[@]}"; do
@@ -547,9 +594,9 @@ function get_summary_value() {
                 for monitor_count in "${monitor_counts_csv[@]}"; do
                     # Determine per-method defense options
                     if [[ "$method" == "monitor_disable" ]]; then
-                        def_options=("${MONITOR_DISABLE_DEFENSE_MODES[@]}")
+                        def_options=(no_defense)
                     else
-                        def_options=("${DEFENSE_MODES[@]}")
+                        def_options=(avoid_low_reputation)
                     fi
 
                     # Iterate over p-values; if none provided, use a single placeholder "N/A"
@@ -616,6 +663,9 @@ function get_summary_value() {
                             avg_delay_ms="N/A"
                             attacks_triggered="0"
                             detection_rate_pct="N/A"
+                            detection_precision_pct="N/A"
+                            avg_fee_msat="N/A"
+                            avg_fee_rate_pct="N/A"
 
                             sm="$sim_dir/summary.csv"
                             if [ -f "$sm" ]; then
@@ -623,6 +673,7 @@ function get_summary_value() {
                                 n_successful=$(get_summary_value "$sm" "successful_payments")
                                 success_rate_pct=$(get_summary_value "$sm" "payment_success_rate_percent")
                                 detection_rate_pct=$(get_summary_value "$sm" "malicious_detection_rate_percent")
+                                detection_precision_pct=$(get_summary_value "$sm" "malicious_detection_precision_percent")
 
                                 # Calculate n_failed
                                 if [[ "$n_transactions" != "N/A" ]] && [[ "$n_successful" != "N/A" ]]; then
@@ -661,8 +712,14 @@ function get_summary_value() {
                                 avg_delay_ms=$(get_summary_value "$summary_file" "time/average")
                             fi
 
-                            # CSV行を出力 (include p value)
-                            printf '%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s\n' \
+                            # --- 手数料統計: payments_output.csv から計算 ---
+                            payments_file="$sim_dir/payments_output.csv"
+                            if [ -f "$payments_file" ]; then
+                                read -r avg_fee_msat avg_fee_rate_pct <<< "$(calc_fee_stats "$payments_file")"
+                            fi
+
+                            # CSV行を出力 (手数料列を追加)
+                            printf '%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
                                 "$defense_strategy" \
                                 "$monitor_method_short" \
                                 "$p" \
@@ -675,7 +732,10 @@ function get_summary_value() {
                                 "$success_rate_pct" \
                                 "$avg_delay_ms" \
                                 "$attacks_triggered" \
-                                "$detection_rate_pct"
+                                "$detection_rate_pct" \
+                                "$detection_precision_pct" \
+                                "$avg_fee_msat" \
+                                "$avg_fee_rate_pct"
                         done # defense
                     done # p
                 done  # monitor_count

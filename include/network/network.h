@@ -227,6 +227,19 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
 int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold, int leaf_threshold, int top_hub_count);
 int detect_and_record_htlc_observation(struct network* network, long payment_id, uint64_t amount, int node_id, int direction, uint64_t timestamp, struct route* route);
 
+/* Returns 1 if any deployed monitor can observe the given node, using the same
+ * capability model as detect_and_record_htlc_observation():
+ *   - method1: a monitor co-located with the node (monitor->node_id == node_id)
+ *   - method2: a monitor watching the node as one of its direct hubs
+ * Used to gate attack reporting so only monitor-observable nodes can be flagged.
+ * This is what makes monitoring method1 and method2 produce different results. */
+int is_node_observed_by_monitors(struct network* network, long node_id);
+
+/* Debug logging toggle: returns nonzero when the CLOTH_DEBUG env var is set.
+ * Used to gate hot-path diagnostic output (per-payment / per-detection logs)
+ * that otherwise floods stdout/stderr and cripples large sweeps. */
+int cloth_debug_enabled(void);
+
 /* === Stage ③ Reputation System Functions === */
 void initialize_reputation_scores(struct network* network);
 void update_node_reputation_on_detection(struct node* node, double penalty, uint64_t detection_time);
