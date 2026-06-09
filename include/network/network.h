@@ -51,7 +51,8 @@ struct node {
   
   /* === Stage ④ Research: Hypothesis Testing (p-value) Fields === */
   double baseline_mean;             // log-normal baseline mean (μ)
-  double baseline_std;              // log-normal baseline std dev (σ)
+  double baseline_std;              // log-normal baseline std dev (σ) = sqrt(baseline_var)
+  double baseline_var;              // log-normal baseline variance (σ²): EMA of squared deviation
   int suspicion_score;              // cumulative anomaly score (3 strikes rule)
   long payment_count;               // count of payments processed (for warm-up detection)
 };

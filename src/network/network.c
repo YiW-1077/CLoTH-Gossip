@@ -44,6 +44,7 @@ struct node* new_node(long id) {
   /* === Stage ④ Initialize Hypothesis Testing Fields === */
   node->baseline_mean = 0.0;
   node->baseline_std = 0.0;
+  node->baseline_var = 0.0;
   node->suspicion_score = 0;
   node->payment_count = 0;
   return node;

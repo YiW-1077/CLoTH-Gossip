@@ -39,7 +39,6 @@ static long get_warmup_payments() {
     if (v <= 0) return 500;
     return v;
 }
-
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
 int g_monitoring_enabled = 1;
@@ -755,25 +754,29 @@ void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
 
     double log_latency = log(observed_latency_ms + 1.0);
 
-    // First observation: initialize baseline
+    // First observation: initialize baseline (σ²=0.25 → σ=0.5)
     if (node->baseline_std < 1e-6) {
         node->baseline_mean = log_latency;
-        node->baseline_std = 0.5; // Start with small variance estimate
+        node->baseline_var = 0.25;
+        node->baseline_std = 0.5;
         return;
     }
 
     // EMA update for mean
     double new_mean = 0.99 * node->baseline_mean + 0.01 * log_latency;
 
-    // Update variance estimate (simplified: use deviation from new mean)
-    double deviation = fabs(log_latency - new_mean);
-    double new_std = 0.99 * node->baseline_std + 0.01 * deviation;
+    // Variance estimate: EMA of SQUARED deviation → sqrt = true std dev (σ).
+    // (絶対偏差 EMA は MAD≈0.8σ で σ を 2 割過小評価し z 検定を過敏にするため、
+    //  二乗偏差で分散を推定し √ で正しい σ を得る)
+    double dev    = log_latency - new_mean;
+    double new_var = 0.99 * node->baseline_var + 0.01 * (dev * dev);
 
-    // Ensure minimum std to avoid numerical issues
-    if (new_std < 0.1) new_std = 0.1;
+    // Ensure minimum variance to avoid numerical issues (σ_min = 0.1)
+    if (new_var < 0.01) new_var = 0.01;
 
     node->baseline_mean = new_mean;
-    node->baseline_std = new_std;
+    node->baseline_var  = new_var;
+    node->baseline_std  = sqrt(new_var);
 }
 
 /**
@@ -830,7 +833,8 @@ int on_payment_result_hypothesis_test(
     }
 
     /* ============================================================
-     * 検定本体: 1 ホップ分のレイテンシを対数正規分布で検定
+     * 検定本体: 1 ホップ分のレイテンシを対数正規分布で検定。
+     * baseline_std は二乗偏差 EMA から得た正しい標準偏差 σ。
      * ============================================================ */
     double p_threshold = get_pvalue_threshold();
     double p_value = calculate_p_value_log_normal(
