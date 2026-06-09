@@ -29,6 +29,17 @@ static uint64_t get_time_window_ms() {
     return v;
 }
 
+/* CLOTH_WARMUP_PAYMENTS - baseline 学習に充てる先頭支払い数 (default 500)。
+ * これを超えてから仮説検定(報告)を開始する。学習サンプルを増やすと baseline
+ * (μ,σ) 推定が安定するが、検定に使える期間は短くなる。 */
+static long get_warmup_payments() {
+    char *env = getenv("CLOTH_WARMUP_PAYMENTS");
+    if (env == NULL) return 500;
+    long v = atol(env);
+    if (v <= 0) return 500;
+    return v;
+}
+
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
 int g_monitoring_enabled = 1;
@@ -813,7 +824,7 @@ int on_payment_result_hypothesis_test(
     /* ============================================================
      * ウォームアップ（最初の 500 支払い）: ベースライン学習のみ
      * ============================================================ */
-    if (payment_count_global < 500) {
+    if (payment_count_global < get_warmup_payments()) {
         update_baseline_lognormal(forwarding_node, latency_ms);
         return 0;
     }

@@ -49,12 +49,26 @@ static uint64_t sample_base_forward_delay(struct simulation* simulation, struct 
                      gsl_ran_ugaussian(simulation->random_generator)));
 }
 
+/* CLOTH_WARMUP_PAYMENTS と連動して baseline 学習期間を保護するためのしきい値。
+ * monitoring.c::get_warmup_payments と同じ既定値・同じ環境変数を用いる。 */
+static long get_attack_warmup_threshold(void) {
+  char *env = getenv("CLOTH_WARMUP_PAYMENTS");
+  if (env == NULL) return 500;
+  long v = atol(env);
+  if (v <= 0) return 500;
+  return v;
+}
+
+/* 攻撃遅延の発動判定。
+ * 従来は時刻窓 [attack_delay_start_time, +attack_delay_duration] のみで発動して
+ * いたが、既定の窓 (3000-33000ms) は warmup 期間にほぼ収まり、攻撃遅延が検定
+ * 対象にほとんど乗らなかった。これを改め、baseline 学習中
+ * (processed_payments < warmup しきい値) は発動せず、warmup 終了後は全期間で
+ * 発動するようにする。時刻窓パラメータ (start_time/duration) は使用しない。 */
 static unsigned int is_attack_delay_active(struct simulation* simulation, struct network_params net_params) {
   if (!net_params.enable_network_attack_delay) return 0;
-  if (net_params.attack_delay_duration == 0) return 0;
   if (net_params.attack_delay_intensity <= 1.0 && net_params.attack_delay_jitter <= 0.0) return 0;
-  return simulation->current_time >= net_params.attack_delay_start_time &&
-         simulation->current_time < (net_params.attack_delay_start_time + net_params.attack_delay_duration);
+  return simulation->processed_payments >= get_attack_warmup_threshold();
 }
 
 static void mark_no_response_failure(struct payment* payment, struct route_hop* hop) {
@@ -1065,7 +1079,17 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
       /* リトライをまたいで reporters が残らないよう今回の試行分だけを使う */
       payment->num_attack_reporters = 0;
 
-      /* Phase 1: 仮説検定 → 報告者を記録 */
+      /* === 案D (immediate-downstream attribution) ===
+       * 各ホップで仮説検定を行い、異常レイテンシを観測したホップの「送り先 (to_node)」
+       * を攻撃者とする。攻撃遅延は攻撃者の直前ノードが攻撃者へ HTLC を送信する区間
+       * (hop_send_times[i+1]-hop_send_times[i]) のレイテンシに現れ、攻撃者自身は
+       * HTLC を転送しない (hop_send_times が 0 のまま) ため報告者にならない。よって
+       * 「異常を報告したホップの直後のノード」が攻撃者である。従来の Phase 2
+       * 「最初の未報告ノード」走査は攻撃者手前の正常ノード (特に高次数ハブ) を
+       * 誤特定し大量の false positive を生んでいたが、これを構造的に解消する。 */
+      long attacker_id = -1;
+      long reporter_id = payment->sender;
+      /* Phase 1: 各ホップで検定 → 報告者登録 + 攻撃者候補(直後ノード)を記録 */
       for (int hop_idx = 0; hop_idx < n_hops; hop_idx++) {
           struct route_hop* hop = (struct route_hop*)array_get(
                                       payment->route->route_hops, hop_idx);
@@ -1099,19 +1123,29 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
 
           if (should_report) {
               register_attack_reporter(payment, hop_node->id);
+
+              /* 案D: 異常ホップの送り先 (直後のノード) を攻撃者候補とする。送信者・
+               * 受信者は攻撃者になり得ないため除外。hop_idx 昇順ループなので、最後に
+               * 条件を満たした最下流の異常ホップの送り先が attacker_id に残る。 */
+              long downstream = hop->to_node_id;
+              if (downstream != payment->receiver &&
+                  downstream != payment->sender) {
+                  attacker_id = downstream;
+                  reporter_id = hop->from_node_id;
+              }
           }
       }
 
-      /* Phase 2: 送信者→受信者方向にパスを走査し、最初の未報告ノードを攻撃者とする */
-      long attacker_id = -1;
-      long reporter_id = payment->sender;
+      /* Phase 2 (フォールバック): 案D で攻撃者が確定しなかった場合 (報告ホップの
+       * 送り先が送信者/受信者のみ等) に限り、従来の「経路上で最初に報告していない
+       * ノード」を攻撃者とする。 */
       for (int i = 0; i < n_hops; i++) {
           struct route_hop* hop = (struct route_hop*)array_get(
                                       payment->route->route_hops, i);
           if (hop == NULL) continue;
           long node_id = hop->from_node_id;
           if (node_id == payment->sender) continue; /* 送信者は攻撃者になり得ない */
-          if (!has_attack_reporter(payment, node_id)) {
+          if (attacker_id < 0 && !has_attack_reporter(payment, node_id)) {
               attacker_id = node_id;
               /* 直前ホップの from_node を報告者とする */
               if (i > 0) {
