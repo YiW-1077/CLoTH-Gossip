@@ -100,7 +100,7 @@ NODE_SCALES=6000
 PAYMENT_AMOUNTS=(100 500 1000)
 
 # 監視ノード数の絶対数リスト
-MONITOR_NODE_COUNTS=(10 20 50)
+MONITOR_NODE_COUNTS=(10 20 30)
 MONITORING_METHODS=(monitor_disable monitor_method1 monitor_method2)
 
 # Defense modes: no_defense uses monitoring disabled, defense uses monitoring enabled
@@ -578,7 +578,7 @@ function calc_fee_stats() {
 
 {
     # 改善されたヘッダ（手数料列を追加）
-    echo "defense_strategy,monitor_method,p_value,payment_amount_sat,payment_amount_msat,monitor_count,n_transactions,n_successful,n_failed,success_rate_pct,avg_delay_ms,attacks_triggered,detection_rate_pct,detection_precision_pct,avg_fee_msat,avg_fee_rate_pct"
+    echo "defense_strategy,monitor_method,p_value,payment_amount_sat,payment_amount_msat,monitor_count,n_transactions,n_successful,n_failed,success_rate_pct,avg_delay_ms,attacks_triggered,detection_rate_pct,detected_attackers,observable_attacked,detection_precision_pct,avg_fee_msat,avg_fee_rate_pct"
 
     for n_payment in "${N_PAYMENTS[@]}"; do
         for avg_pmt in "${PAYMENT_AMOUNTS[@]}"; do
@@ -664,6 +664,8 @@ function calc_fee_stats() {
                             attacks_triggered="0"
                             detection_rate_pct="N/A"
                             detection_precision_pct="N/A"
+                            detected_attackers="N/A"
+                            observable_attacked="N/A"
                             avg_fee_msat="N/A"
                             avg_fee_rate_pct="N/A"
 
@@ -672,7 +674,11 @@ function calc_fee_stats() {
                                 n_transactions=$(get_summary_value "$sm" "total_payments")
                                 n_successful=$(get_summary_value "$sm" "successful_payments")
                                 success_rate_pct=$(get_summary_value "$sm" "payment_success_rate_percent")
-                                detection_rate_pct=$(get_summary_value "$sm" "malicious_detection_rate_percent")
+                                # 攻撃ノード発見率 = 発見した攻撃ノード数 / 観測可能な攻撃されているノード数
+                                # (休眠悪性ノード・観測不能ノードを分母から除いた、意味のある検知率)
+                                detection_rate_pct=$(get_summary_value "$sm" "malicious_detection_rate_observable_attacked_percent")
+                                detected_attackers=$(get_summary_value "$sm" "detected_malicious_nodes")
+                                observable_attacked=$(get_summary_value "$sm" "observable_attacked_malicious_nodes")
                                 detection_precision_pct=$(get_summary_value "$sm" "malicious_detection_precision_percent")
 
                                 # Calculate n_failed
@@ -718,8 +724,8 @@ function calc_fee_stats() {
                                 read -r avg_fee_msat avg_fee_rate_pct <<< "$(calc_fee_stats "$payments_file")"
                             fi
 
-                            # CSV行を出力 (手数料列を追加)
-                            printf '%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                            # CSV行を出力 (検知率=発見攻撃ノード/観測可能な攻撃ノード、分子分母の生数も併記)
+                            printf '%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
                                 "$defense_strategy" \
                                 "$monitor_method_short" \
                                 "$p" \
@@ -733,6 +739,8 @@ function calc_fee_stats() {
                                 "$avg_delay_ms" \
                                 "$attacks_triggered" \
                                 "$detection_rate_pct" \
+                                "$detected_attackers" \
+                                "$observable_attacked" \
                                 "$detection_precision_pct" \
                                 "$avg_fee_msat" \
                                 "$avg_fee_rate_pct"

@@ -317,14 +317,31 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       int detected_malicious_nodes = 0;
       int false_positive_nodes = 0;
       int observable_malicious_nodes = 0; /* malicious nodes any monitor can even see */
+      /* observable AND actually attacked (first_attack_time>0): 監視で観測可能、かつ
+       * 実際に攻撃を発動した(=経路に乗り遅延注入した)悪性ノード。これが「検知可能で
+       * 意味のある攻撃者」の母集団。休眠悪性(経路に乗らず無害)や観測不能ノードを
+       * 分母から除く、検知率の正しい分母。 */
+      int observable_attacked_malicious_nodes = 0;
+
+      /* 検知フラグの最小独立報告数。env CLOTH_FLAG_MIN_REPORTS (default 1)。
+       * 1 を超える値にすると、単発の誤報告(正常ハブに多い)を「検知」とみなさず
+       * precision を上げる。FP の報告回数中央=1, TP(悪性)中央=6 という差を利用。 */
+      int flag_min_reports = 1;
+      {
+        const char* env = getenv("CLOTH_FLAG_MIN_REPORTS");
+        if (env != NULL) { int v = atoi(env); if (v >= 1) flag_min_reports = v; }
+      }
 
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
         if (node == NULL) continue;
-        int flagged = (node->malicious_reports > 0 || node->reputation_score < 0.5);
+        int flagged = (node->malicious_reports >= flag_min_reports || node->reputation_score < 0.5);
         if (node->is_malicious) {
           total_malicious_nodes++;
-          if (is_node_observed_by_monitors(network, node->id)) observable_malicious_nodes++;
+          int observed = is_node_observed_by_monitors(network, node->id);
+          int attacked = (node->first_attack_time > 0);
+          if (observed) observable_malicious_nodes++;
+          if (observed && attacked) observable_attacked_malicious_nodes++;
           if (flagged) detected_malicious_nodes++;
         } else if (flagged) {
           false_positive_nodes++;
@@ -340,6 +357,11 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
        * could actually observe; isolates detector quality from monitor coverage */
       double detection_rate_observable = (observable_malicious_nodes > 0) ?
         ((double)detected_malicious_nodes / (double)observable_malicious_nodes * 100.0) : 0.0;
+      /* detection_rate_observable_attacked = recall vs 観測可能かつ攻撃発動した悪性
+       * ノード = 「検知可能な実攻撃者」に対する発見率。休眠ノード・観測不能ノードを
+       * 分母から除いた、検知器の実力を表す最も意味のある分母。 */
+      double detection_rate_observable_attacked = (observable_attacked_malicious_nodes > 0) ?
+        ((double)detected_malicious_nodes / (double)observable_attacked_malicious_nodes * 100.0) : 0.0;
       /* detection_precision = of the nodes flagged as malicious, how many really were */
       double detection_precision = (total_flagged_nodes > 0) ?
         ((double)detected_malicious_nodes / (double)total_flagged_nodes * 100.0) : 0.0;
@@ -397,11 +419,13 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       /* Attack Detection Results */
       fprintf(csv_metrics, "total_malicious_nodes,%d\n", total_malicious_nodes);
       fprintf(csv_metrics, "observable_malicious_nodes,%d\n", observable_malicious_nodes);
+      fprintf(csv_metrics, "observable_attacked_malicious_nodes,%d\n", observable_attacked_malicious_nodes);
       fprintf(csv_metrics, "detected_malicious_nodes,%d\n", detected_malicious_nodes);
       fprintf(csv_metrics, "false_positive_nodes,%d\n", false_positive_nodes);
       fprintf(csv_metrics, "total_flagged_nodes,%d\n", total_flagged_nodes);
       fprintf(csv_metrics, "malicious_detection_rate_percent,%.2f\n", detection_rate);
       fprintf(csv_metrics, "malicious_detection_rate_observable_percent,%.2f\n", detection_rate_observable);
+      fprintf(csv_metrics, "malicious_detection_rate_observable_attacked_percent,%.2f\n", detection_rate_observable_attacked);
       fprintf(csv_metrics, "malicious_detection_precision_percent,%.2f\n", detection_precision);
       
       /* Payment Results */
@@ -1419,14 +1443,40 @@ int main(int argc, char *argv[]) {
 
   simulation->random_generator = initialize_random_generator();
 
+  /* === RNG ストリーム分離 ===
+   * 防御設定(監視ノード数)を変えても、悪性ノード集合と支払い列が固定される
+   * ようにするための独立乱数源。従来は単一ストリームを
+   *   network生成 → 監視配置 → 悪性選定 → 支払い生成 → 実行時イベント
+   * の順で共有しており、(1)悪性候補プールが監視ノードを除外するため候補配列が
+   * 監視数で変わり、(2)悪性選定の Fisher-Yates が消費する乱数数が候補数に依存して
+   * 後続の支払い生成の乱数状態をずらす、という2経路で「監視数→悪性集合/支払い列」
+   * の交絡を生んでいた。
+   * ここでは悪性選定用と支払い生成用に、ベースシード(GSL_RNG_SEED)から決定的に
+   * 派生した専用ストリームを与え、他ストリームの消費量に影響されないようにする。
+   * simulation->random_generator は network生成・実行時イベント専用に残す。 */
+  unsigned long base_seed = gsl_rng_default_seed;
+  gsl_rng* rng_malicious = gsl_rng_alloc(gsl_rng_default);
+  gsl_rng_set(rng_malicious, base_seed + 0x9E3779B9UL);   /* 黄金比定数でオフセット */
+  gsl_rng* rng_payment = gsl_rng_alloc(gsl_rng_default);
+  gsl_rng_set(rng_payment, base_seed + 0x7F4A7C15UL);
 
   printf("NETWORK INITIALIZATION\n");
   network = initialize_network(net_params, simulation->random_generator);
   n_nodes = array_len(network->nodes);
   n_edges = array_len(network->edges);
 
-  /* === Stage ① Initialize Malicious Nodes AND Deploy Monitoring Agents (order swapped) === */
-  /* Deploy monitors first so malicious nodes can be chosen from non-monitor nodes */
+  /* === Stage ① 悪性ノードを先に選定(監視非依存) → 監視配置は悪性を避ける ===
+   * 悪性選定を監視配置より前に、かつ専用ストリームで行う。この時点では
+   * is_monitor は全ノード 0 なので候補プールは「degree>=3」だけで決まり、
+   * 監視数に依存しない固定集合になる。監視配置側で悪性ノードをスキップする
+   * ことで、両者の排他性(監視∩悪性=∅)を維持する。 */
+  if (net_params.malicious_node_ratio > 0.0) {
+    initialize_malicious_nodes(network,
+                               net_params.malicious_node_ratio,
+                               net_params.malicious_failure_probability,
+                               rng_malicious);
+  }
+
   if (net_params.monitoring_strategy > 0) {
     if (net_params.monitoring_strategy == 1) {
       deploy_monitors_method1(network, net_params.hub_degree_threshold, 5);  // leaf_threshold=5
@@ -1435,17 +1485,28 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (net_params.malicious_node_ratio > 0.0) {
-    /* Select malicious nodes only from nodes that are not monitors */
-    initialize_malicious_nodes(network,
-                               net_params.malicious_node_ratio,
-                               net_params.malicious_failure_probability,
-                               simulation->random_generator);
-  }
-
   /* === Stage ③ Initialize Reputation System === */
   if (net_params.enable_reputation_system) {
     initialize_reputation_scores(network);
+
+    /* === Oracle reputation (テスト専用・完全検知の上限効果測定) ===
+     * 環境変数 CLOTH_ORACLE_REPUTATION=true のとき、地上真値で悪性ノードの
+     * 評判を 0.0 に固定する。これにより RBR が全悪性ノードを回避するので、
+     * 「検知が完璧なら RBR が出せる効果の上限」を統制ハーネス上で測れる。
+     * apply_reputation_decay_all_nodes は !is_malicious のみ回復させるため、
+     * 悪性ノードの評判は 0.0 のまま維持される。 */
+    const char* oracle_env = getenv("CLOTH_ORACLE_REPUTATION");
+    if (oracle_env != NULL && strcmp(oracle_env, "true") == 0) {
+      long n_pinned = 0;
+      for (long i = 0; i < array_len(network->nodes); i++) {
+        struct node* nd = (struct node*)array_get(network->nodes, i);
+        if (nd != NULL && nd->is_malicious) {
+          nd->reputation_score = 0.0;
+          n_pinned++;
+        }
+      }
+      printf("[Oracle] Pinned %ld malicious nodes to reputation=0.0 (perfect detection)\n", n_pinned);
+    }
   }
 
     // add edge which is not a member of any group to group_add_queue
@@ -1462,7 +1523,7 @@ int main(int argc, char *argv[]) {
   
   /* Add 500 warm-up payments to total */
   pay_params.n_payments += 500;
-  payments = initialize_payments(pay_params, n_nodes, simulation->random_generator);
+  payments = initialize_payments(pay_params, n_nodes, rng_payment);
   
   /* Mark first 500 payments as warm-up phase */
   for (int i = 0; i < 500 && i < array_len(payments); i++) {
@@ -1681,6 +1742,8 @@ int main(int argc, char *argv[]) {
   write_output(network, payments, output_dir_name);
 
     list_free(group_add_queue);
+    gsl_rng_free(rng_malicious);
+    gsl_rng_free(rng_payment);
     free(simulation->random_generator);
     heap_free(simulation->events);
   free(simulation);

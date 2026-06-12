@@ -29,6 +29,22 @@ static uint64_t get_time_window_ms() {
     return v;
 }
 
+/* Hub-protection escalation:
+ * 高次数ノードへのペナルティ減免 (degree_scale) は「正常ハブが稀に誤報告される」
+ * ケースを守るための措置だが、何百回も独立に報告される常習攻撃者 (証拠が圧倒的)
+ * まで保護してしまい、評判が下がらず RBR が回避できない主因になっていた。
+ * 累積報告数 (malicious_reports) が閾値に達するほど degree_scale を 1.0 (=保護なし)
+ * へ寄せ、常習犯にはフルペナルティを科す。env CLOTH_HUB_ESCALATION_REPORTS で
+ * 閾値調整、<=0 で無効化 (従来挙動)。 */
+static double hub_escalated_scale(double degree_scale, long malicious_reports) {
+    char *env = getenv("CLOTH_HUB_ESCALATION_REPORTS");
+    double thresh = (env != NULL) ? atof(env) : 10.0;
+    if (thresh <= 0.0) return degree_scale; /* escalation disabled */
+    double esc = (double)malicious_reports / thresh;
+    if (esc > 1.0) esc = 1.0;
+    return degree_scale + (1.0 - degree_scale) * esc;
+}
+
 /* CLOTH_WARMUP_PAYMENTS - baseline 学習に充てる先頭支払い数 (default 500)。
  * これを超えてから仮説検定(報告)を開始する。学習サンプルを増やすと baseline
  * (μ,σ) 推定が安定するが、検定に使える期間は短くなる。 */
@@ -37,6 +53,31 @@ static long get_warmup_payments() {
     if (env == NULL) return 500;
     long v = atol(env);
     if (v <= 0) return 500;
+    return v;
+}
+
+/* === k-of-m 窓検定 (n=1 → n=k 集約) ===
+ * 単発レイテンシ外れ値(n=1)ではなく、同一ノードの直近 m 観測のうち k 回以上が
+ * 異常(p<α)なら報告する。H0(正常ノード,異常率α)では P(>=k of m) が二項分布の裾で
+ * α より桁違いに小さくなるため偽陽性(precision低下)を抑制。攻撃者は traversed
+ * のたびに異常を出し異常率が高いので k-of-m を満たし recall は維持される。 */
+static int get_detect_kofm() {   /* 1=k-of-m有効, 0=従来のsuspicion_score */
+    char *env = getenv("CLOTH_DETECT_KOFM");
+    return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
+}
+static int get_detect_window() { /* m: 窓長 (1..32) */
+    char *env = getenv("CLOTH_DETECT_WINDOW");
+    if (env == NULL) return 20;
+    int v = atoi(env);
+    if (v < 1) return 20;
+    if (v > 32) v = 32;
+    return v;
+}
+static int get_detect_k() {      /* k: 窓内の異常回数しきい値 */
+    char *env = getenv("CLOTH_DETECT_K");
+    if (env == NULL) return 3;
+    int v = atoi(env);
+    if (v < 1) return 3;
     return v;
 }
 /* === Global observation storage === */
@@ -580,6 +621,8 @@ void share_monitor_information_and_update_reputation(
             if (node->open_edges != NULL) degree = array_len(node->open_edges);
             double degree_scale = 1.0 / (1.0 + (double)degree / 200.0);
             if (degree_scale < 0.1) degree_scale = 0.1;
+            /* 常習犯ほどハブ保護を弱める (realtime 側と同じエスカレーション) */
+            degree_scale = hub_escalated_scale(degree_scale, node->malicious_reports);
 
             double penalty = 0.0;
 
@@ -605,7 +648,15 @@ void share_monitor_information_and_update_reputation(
 
         // Update node reputation
         double old_rep = node->reputation_score;
-        node->reputation_score = reputation;
+        /* このバッチ統合は「疑い」に基づく更新なので評判を上げてはならない。
+         * 従来は 1.0 基準で再計算した値をそのまま代入しており、realtime 検知
+         * (report_attacked_node_to_monitors) が積み上げたペナルティを毎スイープ
+         * 帳消しにして高次数攻撃者 (node2 等) の評判を 1.0 に戻していた。
+         * 下げる方向のみ反映する。正常ハブの誤報による低下は apply_reputation_
+         * decay_all_nodes (!is_malicious のみ回復) で戻る。 */
+        if (reputation < old_rep) {
+            node->reputation_score = reputation;
+        }
 
         if (fabs(reputation - old_rep) > 1e-6) {  // Only count if significantly changed
             nodes_updated++;
@@ -669,8 +720,15 @@ void report_attacked_node_to_monitors(
                attacked_node_id,
                payment_id);
 
-    /* Require multiple independent reports before applying reputation penalty */
-    const int REPORTS_REQUIRED = 2; /* configurable constant: require 2 reports */
+    /* Require multiple independent reports before applying reputation penalty.
+     * env CLOTH_REPORTS_REQUIRED で調整可。複数の独立報告を要求することは
+     * 「単一支払い内のホップ集約」ではなく「支払いをまたぐ集約」であり、
+     * FP(正常ハブの単発誤報告, 報告中央=1)を落とし precision を上げる主レバー。 */
+    int REPORTS_REQUIRED = 2;
+    {
+        const char* env = getenv("CLOTH_REPORTS_REQUIRED");
+        if (env != NULL) { int v = atoi(env); if (v >= 1) REPORTS_REQUIRED = v; }
+    }
 
     /* Increment the report counter (represents independent reports received) */
     attacked_node->malicious_reports++;
@@ -682,6 +740,8 @@ void report_attacked_node_to_monitors(
         if (attacked_node->open_edges != NULL) degree = array_len(attacked_node->open_edges);
         double degree_scale = 1.0 / (1.0 + ((double)degree) / 500.0); /* degree 500 -> 0.5, 1000 -> 0.333 */
         if (degree_scale < 0.1) degree_scale = 0.1; /* floor to avoid zeroing out penalty */
+        /* 常習犯ほどハブ保護を弱める (証拠ベースのエスカレーション) */
+        degree_scale = hub_escalated_scale(degree_scale, attacked_node->malicious_reports);
 
         double scaled_penalty = net_params.reputation_penalty_on_detection * degree_scale;
 
@@ -842,20 +902,40 @@ int on_payment_result_hypothesis_test(
                          forwarding_node->baseline_mean,
                          forwarding_node->baseline_std);
 
-    if (p_value < p_threshold) {
-        /* 異常: suspicion を上げ、forward_fail 時のみ報告 */
-        forwarding_node->suspicion_score++;
-        if (is_fail && forwarding_node->suspicion_score >= 2)
-            should_report = 1;
+    int anomalous = (p_value < p_threshold);
+
+    if (get_detect_kofm()) {
+        /* === k-of-m 窓検定: 直近 m 観測中の異常回数で判定 === */
+        int m = get_detect_window();
+        int k = get_detect_k();
+        forwarding_node->anomaly_window =
+            (forwarding_node->anomaly_window << 1) | (anomalous ? 1u : 0u);
+        uint32_t mask = (m >= 32) ? 0xFFFFFFFFu : ((1u << m) - 1u);
+        int cnt = __builtin_popcount(forwarding_node->anomaly_window & mask);
+        if (anomalous) {
+            forwarding_node->suspicion_score = cnt; /* 診断用に窓カウントを反映 */
+            if (is_fail && cnt >= k)
+                should_report = 1;
+        } else {
+            /* 正常観測でベースライン更新(攻撃レイテンシでの汚染を避ける) */
+            update_baseline_lognormal(forwarding_node, latency_ms);
+        }
     } else {
-        /* 正常: suspicion を回復してベースラインを更新 */
-        if (forwarding_node->suspicion_score > 0)
-            forwarding_node->suspicion_score--;
-        update_baseline_lognormal(forwarding_node, latency_ms);
+        /* === 従来: suspicion_score ランダムウォーク (+1異常/-1正常, +2で報告) === */
+        if (anomalous) {
+            forwarding_node->suspicion_score++;
+            if (is_fail && forwarding_node->suspicion_score >= 2)
+                should_report = 1;
+        } else {
+            if (forwarding_node->suspicion_score > 0)
+                forwarding_node->suspicion_score--;
+            update_baseline_lognormal(forwarding_node, latency_ms);
+        }
     }
 
-    /* ---- 診断ログ (CLOTH_DEBUG 時のみ。毎検定で fopen するため通常は無効) ---- */
-    if (cloth_debug_enabled()) {
+    /* ---- 診断ログ (CLOTH_DEBUG_EVENTS 時のみ。毎検定で fopen し非常に遅いため
+     *      CLOTH_DEBUG とは別env に分離。attribution計測には不要なので通常OFF) ---- */
+    if (getenv("CLOTH_DEBUG_EVENTS") != NULL) {
         const char* path = "/tmp/cloth_detection_events.csv";
         FILE* fh = fopen(path, "r");
         int need_header = (fh == NULL);

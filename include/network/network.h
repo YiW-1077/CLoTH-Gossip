@@ -55,6 +55,7 @@ struct node {
   double baseline_var;              // log-normal baseline variance (σ²): EMA of squared deviation
   int suspicion_score;              // cumulative anomaly score (3 strikes rule)
   long payment_count;               // count of payments processed (for warm-up detection)
+  uint32_t anomaly_window;          // k-of-m: bitmask of recent anomaly flags (newest=LSB)
 };
 
 /* a bidirectional payment channel of the payment-channel network open between two nodes */

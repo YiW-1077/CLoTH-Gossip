@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-BASE_CONFIG="/Users/oukihisashi/CLionProjects/CLoTH-Gossip/config/cloth_input.txt"
-BUILD_DIR="/Users/oukihisashi/CLionProjects/CLoTH-Gossip/cmake-build-debug"
+PROJECT_ROOT="/Users/oukihisashi/CLionProjects/CLoTH-Gossip"
+BASE_CONFIG="$PROJECT_ROOT/config/cloth_input.txt"
+BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
 BASE_TEMPLATE='generate_network_from_file=true
 nodes_filename=config/data/nodes_ln.csv
 channels_filename=config/data/channels_ln.csv
@@ -68,15 +69,19 @@ monitoring_strategy=$monitoring"
   
   echo "$config" > "$BASE_CONFIG"
   
-  cd "$BUILD_DIR"
-  cmake .. >/dev/null 2>&1
-  make >/dev/null 2>&1
-  
+  # ビルドは build ディレクトリで実行
+  ( cd "$BUILD_DIR" && cmake .. >/dev/null 2>&1 && make >/dev/null 2>&1 ) || { echo "build failed"; return 1; }
+
   local outdir="/tmp/scenario-$name"
   rm -rf "$outdir"
   mkdir -p "$outdir"
-  
-  GSL_RNG_SEED=42 ./CLoTH_Gossip "$outdir/" 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
+
+  # 実行は PROJECT_ROOT をカレントにする。CLoTH_Gossip はカレントの config/cloth_input.txt
+  # (fallback: cloth_input.txt) を読むため、build ディレクトリで実行すると CMake が
+  # build/config/ へコピーした設定 (CMakeLists.txt:9 でルート直下 cloth_input.txt 由来)
+  # が読まれ、本スクリプトが $BASE_CONFIG に書いたシナリオ設定が反映されない。
+  # ルートで実行すれば $BASE_CONFIG と config/data/ が直接使われる。
+  ( cd "$PROJECT_ROOT" && GSL_RNG_SEED=42 "$BUILD_DIR/CLoTH_Gossip" "$outdir/" ) 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
   
   echo "Metrics:"
   cat "$outdir/baseline_metrics.csv" | awk -F',' '{print "  Success: " $4 "%, Avg Delay: " $5}'

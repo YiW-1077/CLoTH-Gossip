@@ -47,6 +47,7 @@ struct node* new_node(long id) {
   node->baseline_var = 0.0;
   node->suspicion_score = 0;
   node->payment_count = 0;
+  node->anomaly_window = 0;
   return node;
 }
 
@@ -593,6 +594,13 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
                 break;
             }
             int leaf_node_id = hub->leaf_neighbor_ids[l];
+
+            /* RNGストリーム分離: 悪性ノードは先に確定済み。監視と悪性の排他性を
+             * 保つため、悪性ノード上には監視を置かずスキップする。 */
+            struct node* cand_leaf = (struct node*)array_get(network->nodes, leaf_node_id);
+            if (cand_leaf != NULL && cand_leaf->is_malicious) {
+                continue;
+            }
 
             // Allocate monitor
             network->monitors = (MonitorAgent*)realloc(network->monitors,

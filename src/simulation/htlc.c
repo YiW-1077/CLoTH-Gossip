@@ -567,17 +567,72 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   
   /* === Stage ④ Hypothesis Testing: Record first hop HTLC send time ===
    * リトライのたびに send_payment が呼ばれるため、前の試行の時刻をゼロクリアしてから記録する。 */
-  if (!payment->hop_send_times_initialized && route->route_hops != NULL) {
+  if (route->route_hops != NULL) {
       int num_hops = route->route_hops->size;
-      payment->hop_send_times = (uint64_t*)malloc(num_hops * sizeof(uint64_t));
-      payment->hop_send_times_capacity = num_hops;
-      payment->hop_send_times_initialized = 1;
+      /* リトライで経路が初回より長くなる場合への対応。旧実装は容量を「初回経路
+       * 長」に固定していたため、より長い再経路では境界 index (capacity-1) の
+       * t_end が範囲外参照で 0 になり current_time にフォールスルー → 正常ノードを
+       * 攻撃者と誤特定していた (FP の根因)。現試行の経路長が容量を超えたら再確保
+       * して容量を現経路長まで拡張する。 */
+      if (!payment->hop_send_times_initialized) {
+          payment->hop_send_times = (uint64_t*)malloc(num_hops * sizeof(uint64_t));
+          payment->hop_send_times_capacity = num_hops;
+          payment->hop_send_times_initialized = 1;
+      } else if (num_hops > payment->hop_send_times_capacity) {
+          free(payment->hop_send_times);
+          payment->hop_send_times = (uint64_t*)malloc(num_hops * sizeof(uint64_t));
+          payment->hop_send_times_capacity = num_hops;
+      }
   }
   if (payment->hop_send_times != NULL) {
       /* 各試行の先頭でゼロクリア: 前試行の残留値が新経路の検定を汚染しないようにする */
       for (int i = 0; i < payment->hop_send_times_capacity; i++)
           payment->hop_send_times[i] = 0;
       payment->hop_send_times[0] = simulation->current_time;
+  }
+
+  /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
+   * 送信者の最初のホップ先が悪意ノードの場合も、中継 (forward_payment) と同様に
+   * HTLC を失敗させる。send_payment にこの判定が無かったため、送信者に隣接する
+   * 攻撃ハブ(特に高次数ノード)は攻撃せず転送成功し、成功時の評判ブースト
+   * (htlc.c の Success Path) で reputation が回復して RBR 回避を免れていた。
+   * 受信者が悪意の場合は攻撃しない (forward_payment の !is_last_hop と対称)。
+   * hop_send_times[0] 設定後に置くことで、receive_fail() の案D attribution が
+   * 攻撃者(hop[0].to_node)を正しく特定できる。 */
+  {
+    struct node* first_hop_node = array_get(network->nodes, first_route_hop->to_node_id);
+    if (first_hop_node != NULL && first_hop_node->is_malicious &&
+        first_route_hop->to_node_id != payment->receiver) {
+      double attack_roll = gsl_rng_uniform(simulation->random_generator);
+      if (attack_roll < first_hop_node->attack_probability) {
+        uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
+        uint64_t forward_delay = apply_attack_delay_if_needed(
+          simulation, net_params, payment, base_delay, 1
+        );
+        uint64_t attack_event_time = simulation->current_time + forward_delay;
+
+        if (first_hop_node->first_attack_time == 0) {
+          first_hop_node->first_attack_time = attack_event_time;
+        }
+
+        /* 上の 562-566 で減算した最初のホップの残高/フロー計上を取り消す
+         * (攻撃で HTLC は転送されない)。receive_fail() は error が最初のホップの
+         * とき残高を復元しない前提のため、ここで戻しておく。 */
+        next_edge->balance += first_route_hop->amount_to_forward;
+        next_edge->tot_flows -= 1;
+
+        /* HTLC fails due to malicious node attack. 攻撃者の特定は receive_fail() の
+         * 観測ベース attribution に委ねる (悪意ノードの hop_send_times は 0 のまま)。 */
+        payment->error.type = OFFLINENODE;
+        payment->error.hop = first_route_hop;
+        payment->offline_node_count += 1;
+
+        next_event_time = attack_event_time + OFFLINELATENCY;
+        next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
+        simulation->events = heap_insert(simulation->events, next_event, compare_event);
+        return;
+      }
+    }
   }
 
   // success sending
@@ -1089,6 +1144,9 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
        * 誤特定し大量の false positive を生んでいたが、これを構造的に解消する。 */
       long attacker_id = -1;
       long reporter_id = payment->sender;
+      double attacker_latency = 0; /* DEBUG: 報告を誘発したホップのレイテンシ */
+      int attacker_hopidx = -1;    /* DEBUG: 攻撃者を確定したホップ index */
+      int attacker_tend_fallthrough = 0; /* DEBUG: t_end が current_time に落ちたか(=to_node未転送) */
       /* Phase 1: 各ホップで検定 → 報告者登録 + 攻撃者候補(直後ノード)を記録 */
       for (int hop_idx = 0; hop_idx < n_hops; hop_idx++) {
           struct route_hop* hop = (struct route_hop*)array_get(
@@ -1104,12 +1162,14 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
           if (t_start == 0) continue;
 
           uint64_t t_end;
+          int tend_fallthrough = 0;
           if (hop_idx + 1 < n_hops &&
               hop_idx + 1 < payment->hop_send_times_capacity &&
               payment->hop_send_times[hop_idx + 1] > t_start) {
               t_end = payment->hop_send_times[hop_idx + 1];
           } else {
               t_end = simulation->current_time;
+              tend_fallthrough = 1;
           }
           if (t_end <= t_start) continue;
 
@@ -1132,6 +1192,9 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
                   downstream != payment->sender) {
                   attacker_id = downstream;
                   reporter_id = hop->from_node_id;
+                  attacker_latency = (double)(t_end - t_start);
+                  attacker_hopidx = hop_idx;
+                  attacker_tend_fallthrough = tend_fallthrough;
               }
           }
       }
@@ -1167,6 +1230,44 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
        *      (also watches its assigned high-degree nodes). */
       if (attacker_id >= 0 && payment->num_attack_reporters > 0 &&
           is_node_observed_by_monitors(network, attacker_id)) {
+          /* 診断計装: 報告された攻撃者の TP/FP 内訳を /tmp/cloth_attribution.csv に記録。
+           * 専用 env CLOTH_ATTRIBUTION_LOG 設定時のみ有効 (cloth_debug_enabled() の重い
+           * ログ群とは独立)。本番では env 未設定でこのブロック全体 (経路文脈ループ +
+           * ファイル出力) を完全スキップしゼロコスト。analyze_attribution.py で集計。
+           * 列: pid,attacker,is_mal,degree,reporter,n_rep,latency,route_mal,
+           *     attacker_pos,nearest_mal_pos,attempts,rn,capacity,hopidx,fallthrough */
+          if (getenv("CLOTH_ATTRIBUTION_LOG") != NULL) {
+              struct node* an = (struct node*)array_get(network->nodes, attacker_id);
+              long adeg = (an != NULL && an->open_edges != NULL) ? array_len(an->open_edges) : 0;
+              /* 経路文脈: この経路に悪性ノードが乗っているか / 攻撃者と最寄り悪性の位置 */
+              int route_mal = 0;          /* 経路上の悪性ノード数 */
+              int attacker_pos = -1;      /* 攻撃者の経路上 from_node 位置 */
+              int nearest_mal_pos = -1;   /* 最寄り悪性ノードの位置 */
+              int rn = (payment->route != NULL) ? array_len(payment->route->route_hops) : 0;
+              for (int ri = 0; ri < rn; ri++) {
+                  struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, ri);
+                  if (rh == NULL) continue;
+                  struct node* fn = (struct node*)array_get(network->nodes, rh->from_node_id);
+                  if (fn != NULL && fn->is_malicious) { route_mal++; if (nearest_mal_pos < 0) nearest_mal_pos = ri; }
+                  if (rh->from_node_id == attacker_id) attacker_pos = ri;
+                  /* 受信者側(最後のto_node)の悪性も確認 */
+                  if (ri == rn - 1) {
+                      struct node* tn = (struct node*)array_get(network->nodes, rh->to_node_id);
+                      if (tn != NULL && tn->is_malicious) route_mal++;
+                  }
+              }
+              FILE* fh = fopen("/tmp/cloth_attribution.csv", "a");
+              if (fh) {
+                  fprintf(fh, "%llu,%ld,%d,%ld,%ld,%d,%.0f,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                          (unsigned long long)payment->id, attacker_id,
+                          (an != NULL) ? (int)an->is_malicious : -1, adeg,
+                          reporter_id, payment->num_attack_reporters, attacker_latency,
+                          route_mal, attacker_pos, nearest_mal_pos,
+                          payment->attempts, rn, payment->hop_send_times_capacity,
+                          attacker_hopidx, attacker_tend_fallthrough);
+                  fclose(fh);
+              }
+          }
           report_attacked_node_to_monitors(
               network,
               reporter_id,
