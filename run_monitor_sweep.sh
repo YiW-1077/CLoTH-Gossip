@@ -303,6 +303,7 @@ function display_progress() {
 
     done_simulations=0
     failed_simulations=0
+    last_lines=0   # 多行インプレース描画で前回出力した行数(カーソル巻き戻し用)
 
     while [ "$done_simulations" -lt "$total_simulations" ]; do
         move_completed_to_remote
@@ -310,13 +311,19 @@ function display_progress() {
 
         done_simulations=0
         failed_simulations=0
+        running_entries=()   # 実行中シミュレーション "progress|rel_path" を収集
         for file in "${simulation_progress_files[@]}"; do
             progress=$(cat "$file" 2>/dev/null || echo "0")
-            if [ "$progress" = "1" ] || [ "$progress" = "failed" ]; then
+            if [ "$progress" = "1" ]; then
                 done_simulations=$((done_simulations + 1))
-            fi
-            if [ "$progress" = "failed" ]; then
+            elif [ "$progress" = "failed" ]; then
+                done_simulations=$((done_simulations + 1))
                 failed_simulations=$((failed_simulations + 1))
+            elif [[ "$progress" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+                # 実行中 (0<=progress<1): 進捗と出力先(相対パス)を保持
+                sim_dir="$(dirname "$file")"
+                rel_path="${sim_dir#$output_base/}"
+                running_entries+=("$progress|$rel_path")
             fi
         done
 
@@ -345,10 +352,32 @@ function display_progress() {
             progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Failed %d\t Time remaining %02d:%02d:%02d\t NAS: %d transferred / %d failed" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$failed_simulations" "$remaining_hours" "$remaining_minutes" "$remaining_seconds" "$nas_ok" "$nas_ng")
         fi
 
-        printf "\r\033[2K%s" "$progress_line"
+        # --- 実行中シミュレーションの進捗行を構築 (進捗降順, 最大12行) ---
+        running_block=""
+        n_running_shown=0
+        if [ "${#running_entries[@]}" -gt 0 ]; then
+            while IFS='|' read -r _prog _rel; do
+                [ -z "$_prog" ] && continue
+                _pct=$(awk "BEGIN{printf \"%.1f\", ${_prog}*100}" 2>/dev/null || echo "0.0")
+                running_block+="$(printf "    [%6s%%] %s" "$_pct" "$_rel")"$'\n'
+                n_running_shown=$((n_running_shown + 1))
+            done < <(printf '%s\n' "${running_entries[@]}" | sort -t'|' -k1 -rn | head -12)
+        fi
+
+        # --- 多行インプレース描画: 前回ブロックをカーソル巻き戻し+消去して再描画 ---
+        if [ "$last_lines" -gt 0 ]; then
+            printf "\033[%dA\r\033[J" "$last_lines"
+        fi
+        printf "%s\n" "$progress_line"
+        printf "%s" "$running_block"
+        last_lines=$((1 + n_running_shown))
         sleep 1
     done
-    printf "\n"
+    # 最後のブロックを消去してメイン進捗行のみ確定表示
+    if [ "$last_lines" -gt 0 ]; then
+        printf "\033[%dA\r\033[J" "$last_lines"
+    fi
+    printf "%s\n" "$progress_line"
     # 進捗表示中に蓄積されたNASエラーがあればまとめて表示
     if [[ -s "$nas_error_log" ]]; then
         echo ""
