@@ -21,6 +21,36 @@ static double get_pvalue_threshold() {
     return v;
 }
 
+/* === Axis-3: 次数依存の null σ 膨張 ===
+ * 多忙ハブは本物の輻輳で log-latency の裾が重く、単一対数正規 null では異常率が
+ * α を超える(=null誤特定→ハブ底上げ)。σ_eff = σ·(1 + k·log(1+degree)) で次数が
+ * 高いノードほど null を広げ、honest hub の異常率を α に戻す。
+ * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.0 = 無効=従来の単一対数正規 null)。 */
+static double get_null_degree_sigma() {
+    char *env = getenv("CLOTH_NULL_DEGREE_SIGMA");
+    if (env == NULL) return 0.0;
+    double v = atof(env);
+    if (v < 0.0) return 0.0;
+    return v;
+}
+
+/* === Axis-3 試作: per-node 経験的 heavy-tail null (オンライン分位点) ===
+ * 各ノードが自分の log-latency の (1-α) 分位点 anom_q を Robbins-Monro で学習し、
+ * anomalous = (log_lat > anom_q) と判定する。これにより per-node の異常率が α に
+ * 収束 → 多忙ハブも自分の本物の裾に合わせた高い閾値を学び FP が消える(degree不使用)。
+ * 静かなノードは低い閾値のまま感度を保つ。CLOTH_NULL_QUANTILE=true で有効。 */
+static int get_null_quantile_mode() {
+    char *env = getenv("CLOTH_NULL_QUANTILE");
+    return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
+}
+static double get_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
+    char *env = getenv("CLOTH_NULL_Q_STEP");
+    if (env == NULL) return 0.05;
+    double v = atof(env);
+    if (v <= 0.0) return 0.05;
+    return v;
+}
+
 static uint64_t get_time_window_ms() {
     char *env = getenv("CLOTH_TIME_WINDOW_MS");
     if (env == NULL) return 10000;
@@ -897,12 +927,40 @@ int on_payment_result_hypothesis_test(
      * baseline_std は二乗偏差 EMA から得た正しい標準偏差 σ。
      * ============================================================ */
     double p_threshold = get_pvalue_threshold();
-    double p_value = calculate_p_value_log_normal(
-                         latency_ms,
-                         forwarding_node->baseline_mean,
-                         forwarding_node->baseline_std);
+    int anomalous;
+    double p_value = -1.0; /* 診断ログ用 (quantileモードでは未使用→-1) */
+    if (get_null_quantile_mode()) {
+        /* per-node 経験的分位点 null: log_lat が学習済み (1-α)分位点 anom_q を超えたら異常。
+         * anom_q を Robbins-Monro で更新し per-node 異常率を α に収束させる。 */
+        double log_lat = log(latency_ms + 1.0);
+        double sd = (forwarding_node->baseline_std > 1e-6) ? forwarding_node->baseline_std : 0.5;
+        /* raise-only: 閾値は Gaussian (1-α)点を下限とし、重い裾のノードでのみ上振れさせる。
+         * 両側収束だと静かなノードを α まで引き下げ過剰発火させる(実測FP=72)ため。 */
+        double gauss_thresh = forwarding_node->baseline_mean + 2.326 * sd; /* α=0.01 の z */
+        if (forwarding_node->anom_q < gauss_thresh) forwarding_node->anom_q = gauss_thresh;
+        anomalous = (log_lat > forwarding_node->anom_q);
+        double step = get_null_q_step() * sd;
+        forwarding_node->anom_q += step * ((anomalous ? 1.0 : 0.0) - p_threshold);
+        if (forwarding_node->anom_q < gauss_thresh) forwarding_node->anom_q = gauss_thresh;
+    } else {
+        /* Axis-3(degree版) or 従来: 次数依存で null σ を広げる (k=0 なら従来の baseline_std)。 */
+        double sigma_eff = forwarding_node->baseline_std;
+        double k_null = get_null_degree_sigma();
+        if (k_null > 0.0) {
+            long deg = (forwarding_node->open_edges != NULL)
+                           ? array_len(forwarding_node->open_edges) : 0;
+            sigma_eff *= (1.0 + k_null * log(1.0 + (double)deg));
+        }
+        p_value = calculate_p_value_log_normal(
+                      latency_ms,
+                      forwarding_node->baseline_mean,
+                      sigma_eff);
+        anomalous = (p_value < p_threshold);
+    }
 
-    int anomalous = (p_value < p_threshold);
+    /* Axis-2 入力: post-warmup の検定回数と異常回数を蓄積 (ノード別比率検定用)。 */
+    forwarding_node->hyp_test_count++;
+    if (anomalous) forwarding_node->hyp_anomaly_count++;
 
     if (get_detect_kofm()) {
         /* === k-of-m 窓検定: 直近 m 観測中の異常回数で判定 === */

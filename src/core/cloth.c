@@ -250,10 +250,29 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
  *
  * Records deployment location and configuration of each monitor
  */
+/* === Axis-2 helpers: ノード別比率検定 p値 + 比較関数 (Benjamini-Hochberg 用) ===
+ * H0: ノードの異常率 = 名目 α。対立: 異常率 > α。post-warmup の (異常数/検定数) を
+ * 比率の z 検定にかけ上側 p値を返す。honest 非ハブは p≈0.5、攻撃者は p≈0、null 誤特定
+ * の honest ハブは p_hat が α をわずかに上回り、N(=取引数) が増えるほど z↑ p↓ になる
+ * (=Axis-2 だけではハブ底上げが残り n とともに顕在化する、という理論の検証点)。 */
+static double cloth_node_rate_pvalue(struct node* node, double alpha) {
+  long N = node->hyp_test_count;
+  if (N <= 0) return 1.0;
+  double phat = (double)node->hyp_anomaly_count / (double)N;
+  double se = sqrt(alpha * (1.0 - alpha) / (double)N);
+  if (se <= 0.0) return 1.0;
+  double z = (phat - alpha) / se;
+  return 0.5 * erfc(z / sqrt(2.0)); /* 上側 (rate>α) p値 */
+}
+static int cloth_cmp_double(const void* a, const void* b) {
+  double x = *(const double*)a, y = *(const double*)b;
+  return (x < y) ? -1 : (x > y ? 1 : 0);
+}
+
 /* === Consolidated Summary Output Function ===
  * Writes all summary CSV files at once after simulation completion
  */
-void write_all_summary_outputs(struct network* network, struct array* payments, 
+void write_all_summary_outputs(struct network* network, struct array* payments,
                                struct network_params net_params, char output_dir_name[]) {
   if (network == NULL || payments == NULL) {
     return;
@@ -332,10 +351,110 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         if (env != NULL) { int v = atoi(env); if (v >= 1) flag_min_reports = v; }
       }
 
+      /* === Axis-2: BH-FDR フラグモード (CLOTH_FLAG_MODE=bh) ===
+       * 報告カウンタ(>=1)の代わりに、ノード別異常率の比率検定 p値へ Benjamini-Hochberg
+       * を適用し FDR<=q で flag する。多重検定の偽陽性膨張を制御。q=CLOTH_FDR_Q(既定0.05)。
+       * 既定(legacy)では従来の malicious_reports>=flag_min_reports を使用。 */
+      int flag_mode_bh = 0;
+      {
+        const char* env = getenv("CLOTH_FLAG_MODE");
+        if (env != NULL && strcmp(env, "bh") == 0) flag_mode_bh = 1;
+      }
+      double bh_alpha = 0.005;
+      { const char* e = getenv("CLOTH_PVALUE_THRESHOLD"); if (e) { double v = atof(e); if (v > 0.0) bh_alpha = v; } }
+      double bh_q = 0.05;
+      { const char* e = getenv("CLOTH_FDR_Q"); if (e) { double v = atof(e); if (v > 0.0) bh_q = v; } }
+      /* Axis-2 の参照率: 既定は【経験的 null】= テスト済みノードの異常率の中央値。
+       * 名目α(=per-hop p閾値)は per-hop null が広域に anti-conservative なため、これで
+       * 比率検定すると honest ノードが大量に flag される(実測 FP=164)。攻撃者は15%で
+       * 上側裾なので中央値は honest 背景率に頑健。CLOTH_BH_NULL=nominal で名目αに切替可。 */
+      int bh_use_emp = 1;
+      { const char* e = getenv("CLOTH_BH_NULL"); if (e && strcmp(e, "nominal") == 0) bh_use_emp = 0; }
+      long bh_min_tests = 30; /* これ未満の検定数のノードは推定にも flag にも使わない(雑音) */
+      { const char* e = getenv("CLOTH_BH_MIN_TESTS"); if (e) { long v = atol(e); if (v >= 1) bh_min_tests = v; } }
+      double bh_ref = bh_alpha;
+      double bh_p_star = -1.0; /* これ以下の p値のノードを reject(=flag)。-1=該当なし */
+      if (flag_mode_bh) {
+        int nn = array_len(network->nodes);
+        if (bh_use_emp) {
+          double* rates = (double*)malloc(sizeof(double) * (nn > 0 ? nn : 1));
+          int R = 0;
+          for (int i = 0; i < nn; i++) {
+            struct node* node = (struct node*)array_get(network->nodes, i);
+            if (node == NULL || node->hyp_test_count < bh_min_tests) continue;
+            rates[R++] = (double)node->hyp_anomaly_count / (double)node->hyp_test_count;
+          }
+          if (R > 0) { qsort(rates, R, sizeof(double), cloth_cmp_double); bh_ref = rates[R / 2]; }
+          free(rates);
+          if (bh_ref < 1e-6) bh_ref = 1e-6;
+        }
+        double* ps = (double*)malloc(sizeof(double) * (nn > 0 ? nn : 1));
+        int M = 0;
+        for (int i = 0; i < nn; i++) {
+          struct node* node = (struct node*)array_get(network->nodes, i);
+          if (node == NULL || node->hyp_test_count < bh_min_tests) continue;
+          ps[M++] = cloth_node_rate_pvalue(node, bh_ref);
+        }
+        if (M > 0) {
+          qsort(ps, M, sizeof(double), cloth_cmp_double);
+          int kmax = 0;
+          for (int i = 1; i <= M; i++)
+            if (ps[i - 1] <= ((double)i / (double)M) * bh_q) kmax = i;
+          if (kmax > 0) bh_p_star = ps[kmax - 1];
+        }
+        free(ps);
+        printf("[Axis2-BH] tested_nodes=%d ref_rate=%.4f(%s) min_tests=%ld q=%.3f p_star=%.3e\n",
+               M, bh_ref, bh_use_emp ? "emp-median" : "nominal", bh_min_tests, bh_q, bh_p_star);
+      }
+
+      /* === 報告レートゲート (Axis-3 と併用推奨; env CLOTH_RATE_GATE_TAU, 既定0=無効) ===
+       * 報告(>=1)で flag されたが rep>=0.5 のノードのうち、報告レート =
+       * malicious_reports / 露出 が τ 未満なら un-flag する。露出 = post-warmup の
+       * 全試行の下流ホップ(to_node)出現回数 (attempts_history と同じ母数)。巨大ハブの
+       * attribution ノイズ報告(レート極小, 例 node2≈6e-5)を落とし、低露出×複数報告の
+       * 攻撃者(レート大, 最小≈8e-3)は残す。Axis-3(σ膨張)が中位ハブを除いた残りの
+       * 巨大ハブだけをここで落とす相補構成。 */
+      double rate_gate_tau = 0.0;
+      { const char* e = getenv("CLOTH_RATE_GATE_TAU"); if (e) { double v = atof(e); if (v > 0.0) rate_gate_tau = v; } }
+      int nnodes_rg = array_len(network->nodes);
+      long* node_exposure = NULL;
+      if (rate_gate_tau > 0.0) {
+        node_exposure = (long*)calloc(nnodes_rg > 0 ? nnodes_rg : 1, sizeof(long));
+        for (int pi = 0; pi < array_len(payments); pi++) {
+          struct payment* pm = (struct payment*)array_get(payments, pi);
+          if (pm == NULL || pm->is_warmup || pm->history == NULL) continue;
+          for (struct element* it = pm->history; it != NULL; it = it->next) {
+            struct attempt* at = (struct attempt*)it->data;
+            if (at == NULL || at->route == NULL) continue;
+            for (int hi = 0; hi < array_len(at->route); hi++) {
+              struct edge_snapshot* es = (struct edge_snapshot*)array_get(at->route, hi);
+              if (es == NULL) continue;
+              struct edge* eg = (struct edge*)array_get(network->edges, es->id);
+              if (eg == NULL) continue;
+              long tn = eg->to_node_id;
+              if (tn >= 0 && tn < nnodes_rg) node_exposure[tn]++;
+            }
+          }
+        }
+      }
+
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
         if (node == NULL) continue;
-        int flagged = (node->malicious_reports >= flag_min_reports || node->reputation_score < 0.5);
+        int flagged;
+        if (flag_mode_bh) {
+          int rejected = (node->hyp_test_count >= bh_min_tests && bh_p_star >= 0.0 &&
+                          cloth_node_rate_pvalue(node, bh_ref) <= bh_p_star);
+          flagged = (rejected || node->reputation_score < 0.5);
+        } else {
+          flagged = (node->malicious_reports >= flag_min_reports || node->reputation_score < 0.5);
+        }
+        /* レートゲート: 報告由来の低レート flag を un-flag (rep<0.5 は据え置き) */
+        if (rate_gate_tau > 0.0 && flagged && node_exposure != NULL &&
+            node->reputation_score >= 0.5 && node_exposure[node->id] > 0) {
+          double rrate = (double)node->malicious_reports / (double)node_exposure[node->id];
+          if (rrate < rate_gate_tau) flagged = 0;
+        }
         if (node->is_malicious) {
           total_malicious_nodes++;
           int observed = is_node_observed_by_monitors(network, node->id);
@@ -347,6 +466,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
           false_positive_nodes++;
         }
       }
+      if (node_exposure != NULL) free(node_exposure);
 
       int total_flagged_nodes = detected_malicious_nodes + false_positive_nodes;
 
@@ -460,7 +580,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     
     FILE* csv_reputation = fopen(output_filename, "w");
     if (csv_reputation != NULL) {
-      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency\n");
+      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count\n");
       
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
@@ -471,7 +591,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
               node->first_detection_time >= node->first_attack_time) {
             detection_latency = (long)(node->first_detection_time - node->first_attack_time);
           }
-          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld\n",
+          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld\n",
                   node->id,
                   node->is_malicious,
                   node->is_monitor,
@@ -480,7 +600,9 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
                   degree,
                   node->first_attack_time,
                   node->first_detection_time,
-                  detection_latency);
+                  detection_latency,
+                  node->hyp_test_count,
+                  node->hyp_anomaly_count);
         }
       }
       fclose(csv_reputation);

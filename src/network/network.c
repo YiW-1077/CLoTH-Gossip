@@ -48,6 +48,9 @@ struct node* new_node(long id) {
   node->suspicion_score = 0;
   node->payment_count = 0;
   node->anomaly_window = 0;
+  node->hyp_test_count = 0;
+  node->hyp_anomaly_count = 0;
+  node->anom_q = 0.0;
   return node;
 }
 
@@ -912,6 +915,9 @@ void initialize_reputation_scores(struct network* network) {
             node->last_movement_time = 0;
             node->first_attack_time = 0;
             node->first_detection_time = 0;
+            node->hyp_test_count = 0;
+            node->hyp_anomaly_count = 0;
+            node->anom_q = 0.0;
         }
     }
 }

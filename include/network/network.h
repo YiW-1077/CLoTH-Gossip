@@ -56,6 +56,12 @@ struct node {
   int suspicion_score;              // cumulative anomaly score (3 strikes rule)
   long payment_count;               // count of payments processed (for warm-up detection)
   uint32_t anomaly_window;          // k-of-m: bitmask of recent anomaly flags (newest=LSB)
+  /* === FWER 対策実験用 (Axis-2 BH-FDR / Axis-3 better-null) ===
+   * post-warmup の仮説検定回数と異常回数。ノード別の異常率 p_hat=anomaly/test を
+   * H0率 α と比率検定し、その p値に Benjamini-Hochberg を適用して flag する (Axis-2)。 */
+  long hyp_test_count;              // post-warmup の検定総数
+  long hyp_anomaly_count;           // そのうち p<α だった回数
+  double anom_q;                    // per-node 経験的 (1-α)分位点 null 閾値 (CLOTH_NULL_QUANTILE)
 };
 
 /* a bidirectional payment channel of the payment-channel network open between two nodes */
