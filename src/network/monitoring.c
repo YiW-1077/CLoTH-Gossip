@@ -25,10 +25,12 @@ static double get_pvalue_threshold() {
  * 多忙ハブは本物の輻輳で log-latency の裾が重く、単一対数正規 null では異常率が
  * α を超える(=null誤特定→ハブ底上げ)。σ_eff = σ·(1 + k·log(1+degree)) で次数が
  * 高いノードほど null を広げ、honest hub の異常率を α に戻す。
- * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.0 = 無効=従来の単一対数正規 null)。 */
+ * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.04 = ON)。n 増に伴う forward 検知器の FWER
+ * (高次数ハブの誤報告) を抑え precision を保つ。n=12800 で precision 90->96% を実測。
+ * env で上書き可、0 を明示すると無効=従来の単一対数正規 null。 */
 static double get_null_degree_sigma() {
     char *env = getenv("CLOTH_NULL_DEGREE_SIGMA");
-    if (env == NULL) return 0.0;
+    if (env == NULL) return 0.04;
     double v = atof(env);
     if (v < 0.0) return 0.0;
     return v;
@@ -1014,6 +1016,92 @@ int on_payment_result_hypothesis_test(
         }
     }
 
+    return should_report;
+}
+
+/* === Grief-hold detection (Phase 1): 決済(backward)経路レイテンシの baseline 更新 ===
+ * フォワードの update_baseline_lognormal と同型だが settle_baseline_* を更新する。
+ * 正常観測でのみ呼ぶこと(保持攻撃のレイテンシで baseline を汚染しないため)。 */
+static void update_settle_baseline_lognormal(struct node* node, double latency_ms) {
+    double log_latency = log(latency_ms + 1.0);
+    if (node->settle_baseline_mean == 0.0 && node->settle_baseline_var == 0.0) {
+        node->settle_baseline_mean = log_latency;
+        /* 初期 σ²=0.01 (σ=0.1)。決済レイテンシは log空間で非常に密(実測 std~0.02)
+         * なので forward版の 0.25 は緩すぎ、2×保持(log+0.685)でも z=1.45 にしかならず
+         * p<0.01 を超えられない(=保持を全く検知できない)。0.01 なら保持 z=6.85 で確実に
+         * 異常、正常揺らぎ(z~0.3)は非異常。env CLOTH_SETTLE_VAR_INIT で調整可。 */
+        double var_init = 0.01;
+        const char* e = getenv("CLOTH_SETTLE_VAR_INIT");
+        if (e != NULL) { double v = atof(e); if (v > 0.0) var_init = v; }
+        node->settle_baseline_var = var_init;
+        return;
+    }
+    double dev = log_latency - node->settle_baseline_mean;
+    node->settle_baseline_mean = 0.99 * node->settle_baseline_mean + 0.01 * log_latency;
+    node->settle_baseline_var  = 0.99 * node->settle_baseline_var  + 0.01 * (dev * dev);
+}
+
+/* See monitoring.h. 決済転送レイテンシ(=preimage保持時間)を対数正規 null で検定。 */
+int on_settlement_result_hypothesis_test(
+    struct node* node,
+    double settle_latency_ms,
+    long payment_count_global,
+    double expected_settle_ms
+) {
+    if (node == NULL || settle_latency_ms <= 0.0) return 0;
+
+    /* === グローバル決済 baseline で seed ===
+     * Phase0 で決済レイテンシは次数非依存・全 honest ノードでほぼ一定(=平均転送
+     * インターバル付近)と判明。よって per-node 学習を待たず、全ノードを共通の
+     * グローバル既定値で初期化する。これで (a) 未学習ノードがゼロ=カバレッジ全域、
+     * (b) 保持(2×)は seed に対し常に異常→baseline 更新されず汚染なし、を同時に解決。
+     * 旧 per-node 学習方式は決済サンプルが疎で大半が未検定&warmup後初出ノードが保持を
+     * 学習して汚染、という二重の取りこぼしがあった。 */
+    if (node->settle_baseline_mean == 0.0) {
+        double seed = (expected_settle_ms > 0.0) ? expected_settle_ms : 100.0;
+        node->settle_baseline_mean = log(seed + 1.0);
+        double var_init = 0.01; /* σ=0.1。env CLOTH_SETTLE_VAR_INIT で調整可。 */
+        const char* e = getenv("CLOTH_SETTLE_VAR_INIT");
+        if (e != NULL) { double v = atof(e); if (v > 0.0) var_init = v; }
+        node->settle_baseline_var = var_init;
+    }
+
+    /* グローバル warmup 中は報告しない(攻撃遅延も非アクティブ)。baseline は refine のみ。 */
+    if (payment_count_global < get_warmup_payments()) {
+        update_settle_baseline_lognormal(node, settle_latency_ms);
+        return 0;
+    }
+
+    double p_threshold = get_pvalue_threshold();
+    double sd = sqrt(node->settle_baseline_var);
+    if (sd < 1e-6) sd = 0.1; /* フォールバック */
+    double p_value = calculate_p_value_log_normal(
+        settle_latency_ms, node->settle_baseline_mean, sd);
+    int anomalous = (p_value < p_threshold);
+
+    node->settle_test_count++;
+    if (anomalous) node->settle_anomaly_count++;
+
+    /* 報告に要する異常回数 (strike)。既定 1 (初回異常で報告)。
+     * 本検知器は正常ノードの異常率が ~0 (seed42/7 で honest anomaly=0) なので、
+     * 1-strike でも FP を増やさず recall を感度上限近く(47%->76%)まで上げられる
+     * ことを実測済み。保守側に戻したい場合は env CLOTH_SETTLE_REPORT_STRIKES=2。 */
+    int report_strikes = 1;
+    {
+        const char* e = getenv("CLOTH_SETTLE_REPORT_STRIKES");
+        if (e != NULL && e[0] != '\0') {
+            int v = atoi(e);
+            if (v >= 1) report_strikes = v;
+        }
+    }
+    int should_report = 0;
+    if (anomalous) {
+        node->settle_suspicion++;
+        if (node->settle_suspicion >= report_strikes) should_report = 1;
+    } else {
+        if (node->settle_suspicion > 0) node->settle_suspicion--;
+        update_settle_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
+    }
     return should_report;
 }
 

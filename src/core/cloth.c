@@ -140,6 +140,18 @@ void write_simple_view_state(char output_dir_name[],
 }
 
 
+/* === 成功率の分母調整: 悪意送信者の即失敗を除外 ===
+ * 送信者ノード自身が悪意の場合、send_payment() が HTLC を線に乗せずに即失敗
+ * させる(htlc.c:547, リトライなし)。これは正常な送金試行ではないため、成功率
+ * (=正常に送り出された payment のうち成功した割合) の分母から除外する。
+ * payment->sender の is_malicious で判定する。warmup 判定は呼び出し側で行う。 */
+static int payment_sender_is_malicious(struct network* network, struct payment* payment) {
+  if (network == NULL || payment == NULL) return 0;
+  struct node* s = (struct node*)array_get(network->nodes, payment->sender);
+  return (s != NULL && s->is_malicious) ? 1 : 0;
+}
+
+
 /* === Stage ① Write Baseline Metrics CSV ===
  *
  * Analyzes payment success rates and generates baseline metrics.
@@ -162,6 +174,7 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
   long n_payments = 0;
   long n_successful = 0;
   long n_failed = 0;
+  long n_malicious_sender = 0;  /* 悪意送信者の即失敗(分母から除外) */
   long total_delay = 0;
   long total_attacks = 0;
   uint64_t total_attack_delay = 0;
@@ -194,6 +207,7 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
     if (payment == NULL || payment->id == -1 || payment->is_warmup) continue;
 
     n_payments++;
+    if (payment_sender_is_malicious(network, payment)) n_malicious_sender++;
 
     if (payment->is_success) {
       n_successful++;
@@ -210,7 +224,10 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
     }
   }
 
-  double success_rate = (n_payments > 0) ? ((double)n_successful / (double)n_payments) : 0.0;
+  /* 分母 = 全 payment - 悪意送信者の即失敗。successful は悪意送信者では常に 0
+   * (送信時即失敗) なので分子は不変。 */
+  long n_effective = n_payments - n_malicious_sender;
+  double success_rate = (n_effective > 0) ? ((double)n_successful / (double)n_effective) : 0.0;
   double avg_delay = (n_payments > 0) ? ((double)total_delay / (double)n_payments) : 0.0;
 
   // Write metrics to CSV
@@ -222,9 +239,11 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
     return;
   }
 
-  fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered,attack_delay_total,attack_delay_avg_per_payment,payments_with_attack_delay,attack_delay_events,total_malicious_nodes,detection_rate,rbr_detected_nodes\n");
+  /* success_rate の分母は n_payments-n_malicious_sender (悪意送信者の即失敗を除外)。
+   * n_payments(全件)と n_malicious_sender(除外数)は末尾列に出力して追跡可能にする。 */
+  fprintf(csv_metrics, "n_payments,n_successful,n_failed,success_rate,avg_delay,malicious_ratio,malicious_prob,total_attacks_triggered,attack_delay_total,attack_delay_avg_per_payment,payments_with_attack_delay,attack_delay_events,total_malicious_nodes,detection_rate,rbr_detected_nodes,n_malicious_sender,n_effective\n");
 
-  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld,%" PRIu64 ",%.2f,%ld,%" PRIu64 ",%ld,%.2f,%ld\n",
+  fprintf(csv_metrics, "%ld,%ld,%ld,%.4f,%.2f,%.2f,%.2f,%ld,%" PRIu64 ",%.2f,%ld,%" PRIu64 ",%ld,%.2f,%ld,%ld,%ld\n",
           n_payments,
           n_successful,
           n_failed,
@@ -239,7 +258,9 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
           total_attack_delay_events,
           total_malicious_nodes,
           detection_rate,
-          rbr_detected_nodes); // ここにカウントした変数を追加
+          rbr_detected_nodes,
+          n_malicious_sender,
+          n_effective);
 
   fclose(csv_metrics);
   printf("[Output] Wrote baseline metrics to %s\n", output_filename);
@@ -407,15 +428,15 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
                M, bh_ref, bh_use_emp ? "emp-median" : "nominal", bh_min_tests, bh_q, bh_p_star);
       }
 
-      /* === 報告レートゲート (Axis-3 と併用推奨; env CLOTH_RATE_GATE_TAU, 既定0=無効) ===
+      /* === 報告レートゲート (Axis-3 と併用; env CLOTH_RATE_GATE_TAU, 既定0.001=ON) ===
        * 報告(>=1)で flag されたが rep>=0.5 のノードのうち、報告レート =
        * malicious_reports / 露出 が τ 未満なら un-flag する。露出 = post-warmup の
        * 全試行の下流ホップ(to_node)出現回数 (attempts_history と同じ母数)。巨大ハブの
        * attribution ノイズ報告(レート極小, 例 node2≈6e-5)を落とし、低露出×複数報告の
        * 攻撃者(レート大, 最小≈8e-3)は残す。Axis-3(σ膨張)が中位ハブを除いた残りの
        * 巨大ハブだけをここで落とす相補構成。 */
-      double rate_gate_tau = 0.0;
-      { const char* e = getenv("CLOTH_RATE_GATE_TAU"); if (e) { double v = atof(e); if (v > 0.0) rate_gate_tau = v; } }
+      double rate_gate_tau = 0.001;  /* 既定ON。env で上書き可、0 を明示すると無効。 */
+      { const char* e = getenv("CLOTH_RATE_GATE_TAU"); if (e) { double v = atof(e); rate_gate_tau = (v > 0.0) ? v : 0.0; } }
       int nnodes_rg = array_len(network->nodes);
       long* node_exposure = NULL;
       if (rate_gate_tau > 0.0) {
@@ -491,11 +512,13 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       long successful_payments = 0;
       long total_attempts = 0;
       long prt_abort_count = 0;
-      
+      long malicious_sender_payments = 0;  /* 悪意送信者の即失敗(分母から除外) */
+
       for (int i = 0; i < array_len(payments); i++) {
         struct payment* payment = (struct payment*)array_get(payments, i);
         if (payment != NULL && !payment->is_warmup) {
           total_payments++;
+          if (payment_sender_is_malicious(network, payment)) malicious_sender_payments++;
           if (payment->is_success) {
             successful_payments++;
           }
@@ -520,9 +543,15 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       double coverage_rate = (total_payments > 0) ? 
         ((double)unique_monitored_payments / (double)total_payments * 100.0) : 0.0;
       
-      double success_rate = (total_payments > 0) ? 
+      /* 成功率の分母 = 全 payment - 悪意送信者の即失敗 (htlc.c:547 でリトライなし即失敗。
+       * 正常な送金試行ではないため除外)。悪意送信者は常に is_success=0 なので分子は不変。
+       * 旧定義 (全件分母) も payment_success_rate_raw_percent として併記する。 */
+      long effective_payments = total_payments - malicious_sender_payments;
+      double success_rate = (effective_payments > 0) ?
+        ((double)successful_payments / (double)effective_payments * 100.0) : 0.0;
+      double success_rate_raw = (total_payments > 0) ?
         ((double)successful_payments / (double)total_payments * 100.0) : 0.0;
-      double avg_attempts_per_payment = (total_payments > 0) ? 
+      double avg_attempts_per_payment = (total_payments > 0) ?
         ((double)total_attempts / (double)total_payments) : 0.0;
       
       /* Write header and data as key=value pairs */
@@ -551,7 +580,10 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       /* Payment Results */
       fprintf(csv_metrics, "total_payments,%ld\n", total_payments);
       fprintf(csv_metrics, "successful_payments,%ld\n", successful_payments);
+      fprintf(csv_metrics, "malicious_sender_payments,%ld\n", malicious_sender_payments);
+      fprintf(csv_metrics, "effective_payments,%ld\n", effective_payments);
       fprintf(csv_metrics, "payment_success_rate_percent,%.2f\n", success_rate);
+      fprintf(csv_metrics, "payment_success_rate_raw_percent,%.2f\n", success_rate_raw);
       fprintf(csv_metrics, "avg_attempts_per_payment,%.2f\n", avg_attempts_per_payment);
       fprintf(csv_metrics, "prt_abort_count,%ld\n", prt_abort_count);
       
@@ -580,7 +612,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     
     FILE* csv_reputation = fopen(output_filename, "w");
     if (csv_reputation != NULL) {
-      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count\n");
+      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count\n");
       
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
@@ -591,7 +623,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
               node->first_detection_time >= node->first_attack_time) {
             detection_latency = (long)(node->first_detection_time - node->first_attack_time);
           }
-          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld\n",
+          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld,%ld,%ld\n",
                   node->id,
                   node->is_malicious,
                   node->is_monitor,
@@ -602,7 +634,9 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
                   node->first_detection_time,
                   detection_latency,
                   node->hyp_test_count,
-                  node->hyp_anomaly_count);
+                  node->hyp_anomaly_count,
+                  node->settle_test_count,
+                  node->settle_anomaly_count);
         }
       }
       fclose(csv_reputation);
@@ -717,16 +751,18 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   int successful_payments = 0;
   int aborted_payments = 0;
   int high_recon_count = 0;
+  int malicious_sender_payments = 0;  /* 悪意送信者の即失敗(分母から除外) */
   uint64_t total_delay = 0;
   uint64_t total_attack_delay = 0;
   int payments_with_attack_delay = 0;
   uint64_t total_attack_delay_events = 0;
   int total_attempts = 0;
-  
+
   for (int i = 0; i < array_len(payments); i++) {
     struct payment* pmt = (struct payment*)array_get(payments, i);
     if (pmt == NULL || pmt->id == -1 || pmt->is_warmup) continue;
     total_payments++;
+    if (payment_sender_is_malicious(network, pmt)) malicious_sender_payments++;
     if (pmt->is_success) successful_payments++;
     if (pmt->prt_abort_triggered) aborted_payments++;
     if (pmt->reconstruction_count > 5) high_recon_count++;
@@ -760,7 +796,12 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   fprintf(csv_stage4, "metric,value\n");
   fprintf(csv_stage4, "total_payments,%d\n", total_payments);
   fprintf(csv_stage4, "successful_payments,%d\n", successful_payments);
-  fprintf(csv_stage4, "success_rate,%.4f\n", (double)successful_payments / total_payments);
+  fprintf(csv_stage4, "malicious_sender_payments,%d\n", malicious_sender_payments);
+  /* 分母から悪意送信者の即失敗を除外 (htlc.c:547)。分子は不変(常に is_success=0)。 */
+  fprintf(csv_stage4, "success_rate,%.4f\n",
+          (total_payments - malicious_sender_payments > 0)
+            ? (double)successful_payments / (double)(total_payments - malicious_sender_payments)
+            : 0.0);
   fprintf(csv_stage4, "prt_aborted_payments,%d\n", aborted_payments);
   fprintf(csv_stage4, "high_recon_count_payments,%d\n", high_recon_count);
   fprintf(csv_stage4, "avg_payment_delay_ms,%.2f\n", 

@@ -86,12 +86,39 @@ timestamp=$(date "+%Y%m%d%H%M%S")
 # ---------------------------------------------------------------------------
 # Fixed parameters
 # ---------------------------------------------------------------------------
-N_PAYMENTS=(200 400 800 1600 3200 6400)
+N_PAYMENTS=(200 400 800 1600 3200 6400 12800)
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=1.0
 TOP_HUB_COUNT=10
 
 ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_time=3000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
+
+# ---------------------------------------------------------------------------
+# FWER対策 (攻撃者検知 precision の n 依存低下の緩和) を全 sim で有効化。
+#   CLOTH_NULL_DEGREE_SIGMA : degree-σ null。高次数ノードの仮説検定 null を
+#                             広げて誤報告(FP源)を走行中に抑える (Axis-3)。
+#   CLOTH_RATE_GATE_TAU     : report-rate gate。低レポートレートの flag を実行末に
+#                             取り消す測定専用フィルタ (経路・評判には不干渉)。
+# 検証値: k=0.04 + τ=1e-3 で FP 6->0 / precision 100% / recall 無損失。
+# export なので各 sim (run-simulation.sh -> CLoTH_Gossip) に継承される。
+# 外部で指定があればそれを優先 (空文字を export すれば無効化)。
+# ---------------------------------------------------------------------------
+export CLOTH_NULL_DEGREE_SIGMA="${CLOTH_NULL_DEGREE_SIGMA-0.04}"
+export CLOTH_RATE_GATE_TAU="${CLOTH_RATE_GATE_TAU-0.001}"
+echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA CLOTH_RATE_GATE_TAU=$CLOTH_RATE_GATE_TAU"
+
+# ---------------------------------------------------------------------------
+# 攻撃手法セレクタ (環境変数 ATTACK_MODE で指定; 既定 1)
+#   1 = fail 型のみ(従来)  2 = hold 型のみ(決済保持グリーフィング)  3 = 混在(fail+hold)
+#   混在(3)の hold 割合は GRIEF_HOLD_RATIO で指定(既定 0.5)。
+#   mode 2/3 では決済(grief)検知器を自動で ON にする(CLOTH_DETECT_GRIEF で上書き可)。
+# 使い方:  ATTACK_MODE=2 ./run_monitor_sweep.sh  /  ATTACK_MODE=3 GRIEF_HOLD_RATIO=0.5 ./run_monitor_sweep.sh
+# ---------------------------------------------------------------------------
+ATTACK_MODE="${ATTACK_MODE:-1}"
+export CLOTH_ATTACK_MODE="$ATTACK_MODE"
+[ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="${GRIEF_HOLD_RATIO:-0.5}"
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"
+echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 
 # ---------------------------------------------------------------------------
 # Sweep parameters
@@ -783,6 +810,34 @@ function calc_fee_stats() {
 } > "$csv_output"
 
 echo "Summary CSV: $csv_output"
+
+# === 後処理: no-monitor(no_defense) を基準にした手数料%変化列を追加 ===
+# 各行の avg_fee_msat を、同一 (payment_amount_sat, n_transactions) の no_defense/disable
+# 行の avg_fee_msat と比較し、末尾に avg_fee_change_vs_nomonitor_pct = (avg-base)/base*100 を追加。
+# 注意: 本 sweep は単一 seed。手数料平均は p99 テール支配で seed により符号が反転し得る
+# (中央値は条件ほぼ不変)。この%変化は「単一 seed の1点」として解釈すること。多 seed 平均推奨。
+fee_change_tmp="${csv_output}.feechg.tmp"
+if awk 'BEGIN{FS=OFS=","}
+  NR==FNR{
+    if(FNR==1){for(i=1;i<=NF;i++)col[$i]=i; next}
+    if($col["defense_strategy"]=="no_defense" || $col["monitor_method"]=="disable"){
+      k=$col["payment_amount_sat"] SUBSEP $col["n_transactions"]; base[k]=$col["avg_fee_msat"];
+    }
+    next
+  }
+  FNR==1{print $0,"avg_fee_change_vs_nomonitor_pct"; next}
+  {
+    k=$col["payment_amount_sat"] SUBSEP $col["n_transactions"];
+    b=base[k]; cur=$col["avg_fee_msat"]; pc="N/A";
+    if(b!="" && b!="N/A" && (b+0)!=0 && cur!="N/A" && cur!=""){ pc=sprintf("%.2f",(cur-b)/b*100); }
+    print $0,pc;
+  }' "$csv_output" "$csv_output" > "$fee_change_tmp"; then
+    mv "$fee_change_tmp" "$csv_output"
+    echo "Added avg_fee_change_vs_nomonitor_pct column (baseline=no_defense per payment_amount,n_transactions)"
+else
+    echo "[WARN] fee-change post-process failed; results_summary.csv left unchanged"
+    rm -f "$fee_change_tmp"
+fi
 
 # Transfer summary CSV to NAS
 if [[ -n "$remote_output_base" ]]; then

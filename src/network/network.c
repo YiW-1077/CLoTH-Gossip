@@ -51,6 +51,13 @@ struct node* new_node(long id) {
   node->hyp_test_count = 0;
   node->hyp_anomaly_count = 0;
   node->anom_q = 0.0;
+  /* === Grief-hold detection (settlement baseline) === */
+  node->settle_baseline_mean = 0.0;
+  node->settle_baseline_var = 0.0;
+  node->settle_suspicion = 0;
+  node->settle_learn_count = 0;
+  node->settle_test_count = 0;
+  node->settle_anomaly_count = 0;
   return node;
 }
 
@@ -918,6 +925,12 @@ void initialize_reputation_scores(struct network* network) {
             node->hyp_test_count = 0;
             node->hyp_anomaly_count = 0;
             node->anom_q = 0.0;
+            node->settle_baseline_mean = 0.0;
+            node->settle_baseline_var = 0.0;
+            node->settle_suspicion = 0;
+            node->settle_learn_count = 0;
+            node->settle_test_count = 0;
+            node->settle_anomaly_count = 0;
         }
     }
 }

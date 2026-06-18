@@ -4,6 +4,17 @@ set -e
 PROJECT_ROOT="/Users/oukihisashi/CLionProjects/CLoTH-Gossip"
 BASE_CONFIG="$PROJECT_ROOT/config/cloth_input.txt"
 BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
+
+# === 攻撃手法セレクタ (環境変数 ATTACK_MODE で指定; 既定 1) ===
+#   1 = fail 型のみ(従来)  2 = hold 型のみ(決済保持グリーフィング)  3 = 混在(fail+hold)
+#   混在(3)の hold 割合は GRIEF_HOLD_RATIO で指定(既定 0.5)。
+#   mode 2/3 では決済(grief)検知器を自動で ON にする(CLOTH_DETECT_GRIEF で上書き可)。
+# 使い方:  ATTACK_MODE=2 ./run_quick_test.sh   /   ATTACK_MODE=3 GRIEF_HOLD_RATIO=0.5 ./run_quick_test.sh
+ATTACK_MODE="${ATTACK_MODE:-1}"
+export CLOTH_ATTACK_MODE="$ATTACK_MODE"
+[ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="${GRIEF_HOLD_RATIO:-0.5}"
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"
+echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 BASE_TEMPLATE='generate_network_from_file=true
 nodes_filename=config/data/nodes_ln.csv
 channels_filename=config/data/channels_ln.csv

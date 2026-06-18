@@ -62,6 +62,16 @@ struct node {
   long hyp_test_count;              // post-warmup の検定総数
   long hyp_anomaly_count;           // そのうち p<α だった回数
   double anom_q;                    // per-node 経験的 (1-α)分位点 null 閾値 (CLOTH_NULL_QUANTILE)
+
+  /* === Grief-hold 検知: 決済(backward)経路の処理レイテンシ baseline (Phase 1) ===
+   * フォワードの baseline_* とは別系統。各ノードが success を上流へ release する
+   * までの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。 */
+  double settle_baseline_mean;      // log-normal μ of settlement-forward latency
+  double settle_baseline_var;       // σ² (squared-deviation EMA)
+  int    settle_suspicion;          // 異常ランダムウォーク (>=2 で報告)
+  long   settle_learn_count;        // baseline 学習に使ったサンプル数(per-node warmup用)
+  long   settle_test_count;         // 診断: post-warmup の決済検定総数
+  long   settle_anomaly_count;      // 診断: そのうち異常だった回数
 };
 
 /* a bidirectional payment channel of the payment-channel network open between two nodes */

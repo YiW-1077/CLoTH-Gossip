@@ -51,6 +51,8 @@ struct payment* new_payment(long id, long sender, long receiver, uint64_t amount
   p->hop_send_times = NULL;
   p->hop_send_times_capacity = 0;
   p->hop_send_times_initialized = 0;
+  /* === Grief-hold attack === */
+  p->grief_hold_node_id = -1;
   /* === Attack Report Tracking Initialization === */
   p->attack_reporters = NULL;
   p->num_attack_reporters = 0;

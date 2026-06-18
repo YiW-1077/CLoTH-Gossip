@@ -221,4 +221,18 @@ int on_payment_result_hypothesis_test(
     int is_fail
 );
 
+/**
+ * Grief-hold detection (Phase 1): 決済(backward)経路でノードが success を上流へ
+ * release するまでの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。
+ * フォワードの baseline_* とは別系統(settle_baseline_*)を用い、保持攻撃者本人を
+ * 直接特定する(下流帰属トリック不要 — 保持ノード自身が release を転送するため)。
+ * 戻り値: 1=報告すべき異常(保持), 0=正常 or warmup中。
+ */
+int on_settlement_result_hypothesis_test(
+    struct node* node,
+    double settle_latency_ms,
+    long payment_count_global,
+    double expected_settle_ms
+);
+
 #endif

@@ -103,6 +103,60 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
   return adjusted_delay;
 }
 
+/* === 攻撃手法セレクタ (CLOTH_ATTACK_MODE) ===
+ * 悪意ノードが行う攻撃の種別をスクリプトから選択する:
+ *   1 = fail 型のみ        (従来の HTLC 失敗攻撃; hold 割合 0.0)
+ *   2 = hold 型のみ        (決済 backward 経路での preimage 保持グリーフィング単独; 割合 1.0)
+ *   3 = 混在 (fail + hold) (hold 割合は CLOTH_GRIEF_HOLD_RATIO、既定 0.5)
+ * 未設定/範囲外のときは 0 を返し、get_grief_hold_ratio() は後方互換のため
+ * CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0 = 従来どおり全て fail 型)。 */
+static int get_attack_mode(void) {
+  char* e = getenv("CLOTH_ATTACK_MODE");
+  if (e == NULL || e[0] == '\0') return 0;
+  int m = atoi(e);
+  if (m < 1 || m > 3) return 0;
+  return m;
+}
+
+/* === Grief-hold 攻撃 (決済=backward 経路での preimage 保持遅延) ===
+ * 悪意ノードが行う攻撃のうち「保持(hold)型」にする割合 [0,1] を返す。
+ * CLOTH_ATTACK_MODE が設定されていればそれを優先 (1→0.0, 2→1.0, 3→混在割合)、
+ * 未設定なら後方互換のため env CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0)。
+ * hold 型に当たった攻撃は、フォワードで失敗させず通常転送し、backward 経路で
+ * そのノードが preimage の release を遅延させる(失敗なし=支払いは成功)。 */
+static double get_grief_hold_ratio(void) {
+  int mode = get_attack_mode();
+  if (mode == 1) return 0.0;   /* fail 型のみ */
+  if (mode == 2) return 1.0;   /* hold 型のみ */
+  if (mode == 3) {             /* 混在: 割合は CLOTH_GRIEF_HOLD_RATIO (既定 0.5) */
+    char* e = getenv("CLOTH_GRIEF_HOLD_RATIO");
+    double v = (e == NULL || e[0] == '\0') ? 0.5 : atof(e);
+    if (v < 0.0) v = 0.0;
+    if (v > 1.0) v = 1.0;
+    return v;
+  }
+  /* mode 未指定 (後方互換): 従来どおり CLOTH_GRIEF_HOLD_RATIO を直接参照 */
+  char* e = getenv("CLOTH_GRIEF_HOLD_RATIO");
+  if (e == NULL) return 0.0;
+  double v = atof(e);
+  if (v < 0.0) v = 0.0;
+  if (v > 1.0) v = 1.0;
+  return v;
+}
+
+/* シャドウ計測(報告はせず CSV 出力のみ)の有効化。CLOTH_GRIEF_SHADOW_LOG が
+ * 設定されているときだけ /tmp/cloth_grief_shadow.csv に決済転送レイテンシを記録。 */
+static int grief_shadow_log_enabled(void) {
+  return getenv("CLOTH_GRIEF_SHADOW_LOG") != NULL;
+}
+
+/* Grief-hold 検知器 (Phase 1) の有効化。CLOTH_DETECT_GRIEF が設定されているとき、
+ * forward_success() で各ノードの決済転送レイテンシを仮説検定し、保持攻撃者を
+ * 直接特定して report_attacked_node_to_monitors() に報告する。既定 OFF。 */
+static int get_detect_grief(void) {
+  return getenv("CLOTH_DETECT_GRIEF") != NULL;
+}
+
 /* check whether there is sufficient balance in an edge for forwarding the payment; check also that the policies in the edge are respected */
 unsigned int check_balance_and_policy(struct edge* edge, struct edge* prev_edge, struct route_hop* prev_hop, struct route_hop* next_hop) {
   uint64_t expected_fee;
@@ -742,41 +796,49 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
   if (next_node->is_malicious && !is_last_hop) {
     double attack_roll = gsl_rng_uniform(simulation->random_generator);
     if (attack_roll < next_node->attack_probability) {
-      uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
-      uint64_t forward_delay = apply_attack_delay_if_needed(
-        simulation, net_params, payment, base_delay, 1
-      );
-      uint64_t attack_event_time = simulation->current_time + forward_delay;
+      /* === 混在モード: 攻撃のうち一部を「保持(hold)型グリーフィング」にする ===
+       * env CLOTH_GRIEF_HOLD_RATIO の確率で hold 型 (失敗させず通常転送し、
+       * backward 経路でこのノードが preimage を保持して遅延)、残りは従来の fail 型。
+       * hold_ratio=0 のときは mode_roll を引かないので RNG ストリーム・挙動は不変。 */
+      double hold_ratio = get_grief_hold_ratio();
+      double mode_roll = (hold_ratio > 0.0)
+          ? gsl_rng_uniform(simulation->random_generator) : 1.0;
 
-      if (next_node->first_attack_time == 0) {
-        next_node->first_attack_time = attack_event_time;
+      if (mode_roll < hold_ratio) {
+        /* === HOLD 型: 失敗させない。決済経路での遅延注入を予約して通常転送 ===
+         * first_attack_time は実際に保持遅延を注入する forward_success() で設定する
+         * (途中で別要因により決済に到達しなかった場合はこのノードは「攻撃せず」)。
+         * fall through (return しない) して下の通常転送処理に進む。 */
+        payment->grief_hold_node_id = next_node->id;
+      } else {
+        /* === FAIL 型 (従来の攻撃挙動) === */
+        uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
+        uint64_t forward_delay = apply_attack_delay_if_needed(
+          simulation, net_params, payment, base_delay, 1
+        );
+        uint64_t attack_event_time = simulation->current_time + forward_delay;
+
+        if (next_node->first_attack_time == 0) {
+          next_node->first_attack_time = attack_event_time;
+        }
+
+        // HTLC fails due to malicious node attack
+        payment->error.type = OFFLINENODE;  // Simulate as node failure
+        payment->error.hop = next_route_hop;
+        payment->offline_node_count += 1;
+
+        /* NOTE: Detection must NOT use the ground-truth is_malicious label.
+         * Because the malicious node fails the HTLC instead of forwarding, its
+         * hop_send_times entry stays 0, so the path-walk attribution in
+         * receive_fail() (Phase 2) flags it as the first non-reporting node. */
+
+        prev_node_id = previous_route_hop->from_node_id;
+        event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
+        next_event_time = attack_event_time + OFFLINELATENCY;
+        next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
+        simulation->events = heap_insert(simulation->events, next_event, compare_event);
+        return;
       }
-
-
-
-      // HTLC fails due to malicious node attack
-      payment->error.type = OFFLINENODE;  // Simulate as node failure
-      payment->error.hop = next_route_hop;
-      payment->offline_node_count += 1;
-
-      /* NOTE: Detection must NOT use the ground-truth is_malicious label.
-       * Previously this branch called report_attacked_node_to_monitors() using
-       * next_node->id, i.e. it reported the attacker directly from the oracle.
-       * That short-circuited the real, observation-based detector and made the
-       * detection rate a function of traffic volume rather than algorithm
-       * quality (and made the monitor method / p-value irrelevant).
-       *
-       * The attacker is now identified solely from observed behaviour: because
-       * the malicious node fails the HTLC instead of forwarding, its
-       * hop_send_times entry stays 0, so the path-walk attribution in
-       * receive_fail() (Phase 2) flags it as the first non-reporting node. */
-
-      prev_node_id = previous_route_hop->from_node_id;
-      event_type = prev_node_id == payment->sender ? RECEIVEFAIL : FORWARDFAIL;
-      next_event_time = attack_event_time + OFFLINELATENCY;
-      next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
-      simulation->events = heap_insert(simulation->events, next_event, compare_event);
-      return;
     }
   }
 
@@ -920,7 +982,58 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
 
   prev_node_id = prev_hop->from_node_id;
   event_type = prev_node_id == payment->sender ? RECEIVESUCCESS : FORWARDSUCCESS;
-  next_event_time = simulation->current_time + net_params.average_payment_forward_interval + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));//prev_channel->latency;
+
+  /* === backward(決済)経路の保持時間 ===
+   * 通常はランダムな転送インターバル。このノードが grief-hold 攻撃者として
+   * 予約 (payment->grief_hold_node_id) されている場合は、フォワードの攻撃遅延
+   * モデル(×attack_delay_intensity)を流用して preimage の release を遅延させる。
+   * 失敗はさせない (= 支払いは成功する)。保持しない場合は従来と同一値。 */
+  uint64_t settle_base = net_params.average_payment_forward_interval +
+      (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));
+  uint64_t settle_delay = settle_base;
+  int grief_held = 0;
+  if (payment->grief_hold_node_id == node->id) {
+    settle_delay = apply_attack_delay_if_needed(simulation, net_params, payment, settle_base, 1);
+    grief_held = 1;
+    if (node->first_attack_time == 0) node->first_attack_time = simulation->current_time;
+  }
+  next_event_time = simulation->current_time + settle_delay;
+
+  /* === シャドウ計測 (Phase 0): 報告はしない。各ノードの決済転送レイテンシを記録し、
+   * 攻撃者(保持) vs 正常ノードの分離度(SNR) を実測する。CLOTH_GRIEF_SHADOW_LOG 時のみ。
+   * 列: pid,node_id,is_malicious,degree,settle_delay_ms,settle_base_ms,held === */
+  if (grief_shadow_log_enabled()) {
+    long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
+    FILE* fh = fopen("/tmp/cloth_grief_shadow.csv", "a");
+    if (fh) {
+      fprintf(fh, "%llu,%ld,%d,%ld,%llu,%llu,%d\n",
+              (unsigned long long)payment->id, node->id,
+              node->is_malicious ? 1 : 0, deg,
+              (unsigned long long)settle_delay, (unsigned long long)settle_base, grief_held);
+      fclose(fh);
+    }
+  }
+
+  /* === Grief-hold 検知 (Phase 1) ===
+   * 各ノードの決済転送レイテンシ settle_delay を per-node 仮説検定し、異常(=保持)を
+   * 出したノード本人を攻撃者として報告する。保持ノードは自分で release を転送するので
+   * 直接帰属でよい(下流帰属トリック不要)。報告者は上流ノード(prev_node_id)。
+   * 観測ゲート(method1/method2)はフォワード検知と共通。既定 OFF (CLOTH_DETECT_GRIEF)。 */
+  if (net_params.enable_reputation_system && get_detect_grief()) {
+    int should_report = on_settlement_result_hypothesis_test(
+        node, (double)settle_delay, (long)simulation->processed_payments,
+        (double)net_params.average_payment_forward_interval);
+    if (should_report && is_node_observed_by_monitors(network, node->id)) {
+      report_attacked_node_to_monitors(
+          network,
+          prev_node_id,   /* reporter = 決済を受け取る上流ノード(保持を観測) */
+          node->id,       /* attacker = 保持したノード本人(直接帰属) */
+          payment->id,
+          simulation->current_time,
+          net_params);
+    }
+  }
+
   next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
   simulation->events = heap_insert(simulation->events, next_event, compare_event);
 }

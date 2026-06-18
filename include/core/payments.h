@@ -55,6 +55,12 @@ struct payment {
   uint64_t* hop_send_times;         // array of HTLC send timestamps per hop (malloc'd size = route length)
   int hop_send_times_capacity;      // allocated size for hop_send_times
   int hop_send_times_initialized;   // flag: 1 if malloc'd, 0 if not
+
+  /* === Grief-hold attack (backward settlement delay, no fail) ===
+   * 混在モードで、ある悪意ノードが「フォワードで失敗させず、決済(backward)経路で
+   * preimage を保持して遅延させる」と決めた場合、そのノード id を記録する(-1=なし)。
+   * 1経路につき1ノード(最後に hold を選んだノード)を保持。計測フェーズには十分。 */
+  long grief_hold_node_id;
   
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments
