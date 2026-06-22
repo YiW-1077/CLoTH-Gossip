@@ -112,6 +112,21 @@ static int get_detect_k() {      /* k: 窓内の異常回数しきい値 */
     if (v < 1) return 3;
     return v;
 }
+/* === lever②: 報告 strike を「報告者(上流)」から「攻撃者(帰属先)」へ移す ===
+ * fail 検知の既定を per-hop 1-strike にする。従来は報告者ノードの suspicion_score>=2
+ * を要求していた(報告者ごとの2-strike)が、低 n では1攻撃者あたりの異常が希少かつ
+ * 別ルート=別上流に断片化し、どの上流も2に届かず攻撃者が取り残されていた
+ * ([[recall_low_n_observation_gap]])。per-hop は各異常ホップで即時 1-strike 報告し、
+ * 多重証拠ガードを攻撃者側の報告累計(CLOTH_FLAG_MIN_REPORTS, cloth.c, 既定1)に委ねる
+ * (=settle検知器と同じ設計)。frozen-denominator 実測(method2/mix, seed42)で
+ * recall +3.5〜+11.4pp(低nほど大), precision 不変(FP増なし)を確認。
+ * **既定 ON**。CLOTH_ATTRIB_PER_HOP=0 (または false) で従来の報告者2-strikeに戻せる
+ * (過去 run との比較再現用)。 */
+static int get_attrib_per_hop() {
+    char *env = getenv("CLOTH_ATTRIB_PER_HOP");
+    if (env == NULL) return 1;   /* 既定 ON: per-hop 1-strike */
+    return (env[0] == '0' || strcmp(env, "false") == 0) ? 0 : 1;
+}
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
 int g_monitoring_enabled = 1;
@@ -984,7 +999,11 @@ int on_payment_result_hypothesis_test(
         /* === 従来: suspicion_score ランダムウォーク (+1異常/-1正常, +2で報告) === */
         if (anomalous) {
             forwarding_node->suspicion_score++;
-            if (is_fail && forwarding_node->suspicion_score >= 2)
+            /* lever②: per-hop 1-strike。報告者の2-strikeを待たず、この異常ホップで
+             * 即報告し、証拠累積を攻撃者側(malicious_reports>=CLOTH_FLAG_MIN_REPORTS)に
+             * 委ねる。suspicion_score の加算は診断用に残す。 */
+            int report_strike = get_attrib_per_hop() ? 1 : 2;
+            if (is_fail && forwarding_node->suspicion_score >= report_strike)
                 should_report = 1;
         } else {
             if (forwarding_node->suspicion_score > 0)
