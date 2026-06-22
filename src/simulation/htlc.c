@@ -665,7 +665,14 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
         );
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
-        if (first_hop_node->first_attack_time == 0) {
+        /* 分母正常化: 検知が報告可能になる post-warmup の攻撃のみ first_attack_time を
+         * 立てる。warmup 中(先頭 warmup しきい値分)の失敗攻撃は仮説検定が抑制され報告
+         * できないため、recall の分母 (observable_attacked = 観測×攻撃) に数えると検知器を
+         * 不当に減点する(=測定アーティファクト)。失敗自体は遅延設定と独立に発火するので、
+         * ゲートは warmup しきい値のみとする (is_attack_delay_active は遅延無効時に常に
+         * false になり fail 型では使えない)。攻撃挙動・RNG ストリームは不変。 */
+        if (first_hop_node->first_attack_time == 0 &&
+            simulation->processed_payments >= get_attack_warmup_threshold()) {
           first_hop_node->first_attack_time = attack_event_time;
         }
 
@@ -818,7 +825,10 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
         );
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
-        if (next_node->first_attack_time == 0) {
+        /* 分母正常化: post-warmup の攻撃のみ first_attack_time を計上
+         * (理由・ゲート選択は send_payment 側の同種コメント参照)。 */
+        if (next_node->first_attack_time == 0 &&
+            simulation->processed_payments >= get_attack_warmup_threshold()) {
           next_node->first_attack_time = attack_event_time;
         }
 
@@ -995,7 +1005,13 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
   if (payment->grief_hold_node_id == node->id) {
     settle_delay = apply_attack_delay_if_needed(simulation, net_params, payment, settle_base, 1);
     grief_held = 1;
-    if (node->first_attack_time == 0) node->first_attack_time = simulation->current_time;
+    /* 分母正常化: 実際に保持遅延が注入された (settle_delay>settle_base) ときのみ
+     * first_attack_time を立てる。warmup 中や遅延無効時は注入されず検知可能な信号が
+     * 出ない=「攻撃せず」なので recall の分母に数えない。これは行 808-810 の設計意図
+     * (「実際に保持遅延を注入する forward_success で設定」) を予約だけで立てていた
+     * 実装に対して厳密化したもの。 */
+    if (node->first_attack_time == 0 && settle_delay > settle_base)
+      node->first_attack_time = simulation->current_time;
   }
   next_event_time = simulation->current_time + settle_delay;
 
