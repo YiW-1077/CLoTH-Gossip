@@ -112,8 +112,8 @@ echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA 
 #   ATTACK_MODE=1 : fail 型のみ（従来の HTLC 失敗攻撃）
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
 #   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
-ATTACK_MODE=1
-GRIEF_HOLD_RATIO=0.5    # ATTACK_MODE=3 のときの hold 割合 [0,1]
+ATTACK_MODE=2
+GRIEF_HOLD_RATIO=1   # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ---------------------------------------------------------------------------
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
@@ -398,7 +398,7 @@ function display_progress() {
         printf "%s\n" "$progress_line"
         printf "%s" "$running_block"
         last_lines=$((1 + n_running_shown))
-        sleep 1
+        sleep 0.1
     done
     # 最後のブロックを消去してメイン進捗行のみ確定表示
     if [ "$last_lines" -gt 0 ]; then
