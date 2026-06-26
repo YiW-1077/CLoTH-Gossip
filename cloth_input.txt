@@ -50,4 +50,4 @@ enable_prt=true
 prt_threshold=30
 prt_abort_wait_time=1000
 enable_rbr=true
-rbr_reputation_weight=10.0
+rbr_reputation_weight=20.0
