@@ -68,3 +68,7 @@ tasks.json
 /Makefile
 /cmake_install.cmake
 /CLoTH_Gossip
+
+# ローカル作業用(追跡しない)
+/CLAUDE.md
+/repro_out_fig/
