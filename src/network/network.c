@@ -905,6 +905,24 @@ int cloth_debug_enabled(void) {
     return v;
 }
 
+/* 評判boost抑制(既定ON)。当該ノードに報告がある(malicious_reports>0)場合に true を返す。
+ * 呼び出し側(htlc.c 成功経路boost / routing.c good-behavior reward)で
+ * この返り値が真なら評判の加算をスキップし、報告済みハブの評判回復を止める。
+ * 無効化は CLOTH_SUPPRESS_BOOST_IF_REPORTED=0 (または false) を指定する
+ * (per-hop 1-strike と同じ既定ON流儀: monitoring.c)。 */
+int boost_suppressed_for(struct node* node) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("CLOTH_SUPPRESS_BOOST_IF_REPORTED");
+        if (env == NULL) {
+            enabled = 1;                                  /* 既定 ON */
+        } else {
+            enabled = (env[0] == '0' || strcmp(env, "false") == 0) ? 0 : 1;
+        }
+    }
+    return enabled && node != NULL && node->malicious_reports > 0;
+}
+
 
 /* === Stage ③ Initialize Reputation Scores ===
  * Set all nodes to full reputation (1.0) at start

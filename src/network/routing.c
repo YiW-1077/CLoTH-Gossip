@@ -1021,7 +1021,8 @@ struct array* find_reputation_based_route(
                 break;  // Break from node loop, restart path search
             } else if (N->reputation_score >= blacklist_threshold) {
                 // Line 28: Increase reputation for good behavior (honest node)
-                if (net_params.enable_reputation_system) {
+                /* boost抑制(env-gated): 報告のあるノードは good-behavior reward を与えない */
+                if (net_params.enable_reputation_system && !boost_suppressed_for(N)) {
                     N->reputation_score += reputation_reward;
                     if (N->reputation_score > 1.0) {
                         N->reputation_score = 1.0;

@@ -1134,7 +1134,8 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
       struct route_hop* hop = (struct route_hop*)array_get(payment->route->route_hops, i);
       if (hop != NULL) {
         struct node* hop_node = (struct node*)array_get(network->nodes, hop->from_node_id);
-        if (hop_node != NULL && hop_node->reputation_score < 1.0) {
+        /* boost抑制(env-gated): 報告のあるノードは成功転送boostで評判回復させない */
+        if (hop_node != NULL && hop_node->reputation_score < 1.0 && !boost_suppressed_for(hop_node)) {
           hop_node->reputation_score += reputation_boost;
           if (hop_node->reputation_score > 1.0) {
             hop_node->reputation_score = 1.0;

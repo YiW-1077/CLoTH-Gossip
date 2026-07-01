@@ -780,6 +780,15 @@ void report_attacked_node_to_monitors(
     /* Increment the report counter (represents independent reports received) */
     attacked_node->malicious_reports++;
 
+    /* ② latency計測の起点を初回報告時刻に揃える。検出フラグ(recall集計)は
+     * malicious_reports>=1 で立つ(cloth.c:471)が、従来 first_detection_time は
+     * 2件目のpenalty batch(update_node_reputation_on_detection)でしか記録されず、
+     * 単発検出ノード(reports=1)が detection_latency 統計から脱落していた。
+     * フラグと同じ起点で記録し、latencyを recall 集合と整合させる(挙動・rep値は不変)。 */
+    if (attacked_node->first_detection_time == 0 && timestamp > 0) {
+        attacked_node->first_detection_time = timestamp;
+    }
+
     /* Apply penalty only when enough reports accumulated; apply per-batch: every REPORTS_REQUIRED reports */
     if (attacked_node->malicious_reports % REPORTS_REQUIRED == 0) {
         /* Hub protection: scale penalty down for high-degree (hub) nodes to avoid over-penalizing central nodes */

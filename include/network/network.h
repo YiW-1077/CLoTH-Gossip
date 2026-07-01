@@ -258,6 +258,13 @@ int is_node_observed_by_monitors(struct network* network, long node_id);
  * that otherwise floods stdout/stderr and cripples large sweeps. */
 int cloth_debug_enabled(void);
 
+/* 評判boost抑制スイッチ(既定ON): 既に報告のある(malicious_reports>0)ノードへの
+ * 「成功転送による評判回復boost」を停止する。無効化は CLOTH_SUPPRESS_BOOST_IF_REPORTED=0
+ * (または false)を指定する。悪意ハブが大量の正常転送boostで評判を1.0へ回復し、まばらな
+ * ペナルティを上回って回避を逃れる問題(detection_speed_not_bottleneck)への対策レバー。
+ * 検出/フラグ(recall・precision)は不変で、変えるのは mitigation の定着。 */
+int boost_suppressed_for(struct node* node);
+
 /* === Stage ③ Reputation System Functions === */
 void initialize_reputation_scores(struct network* network);
 void update_node_reputation_on_detection(struct node* node, double penalty, uint64_t detection_time);
