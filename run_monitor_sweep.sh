@@ -7,10 +7,35 @@
 # Example: ./run_monitor_sweep.sh 42 /output/dir monitoring_strategy=method1
 
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <seed> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]"
+    echo "Usage: $0 <seed[,seed...]> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]"
     echo "Example: $0 42 /output/dir monitoring_strategy=method1"
+    echo "Example(複数シード): $0 42,123 /output/dir <remote> ...   # 42→123 の順に実行"
     exit 1
 fi
+
+# --- 複数シード対応 ---------------------------------------------------------
+# $1 にカンマ/空白区切りで複数シードを指定すると、各シードで本スクリプトを
+# 順番に自己再実行する(各シードは独立した timestamp 出力dir + results_summary.csv)。
+# 単一シードのときは何もせず通常処理へフォールスルー。
+IFS=', ' read -r -a _seeds <<< "$1"
+if [ "${#_seeds[@]}" -gt 1 ]; then
+    echo "[Config] 複数シード検出: ${_seeds[*]} → 順番に実行します"
+    _multi_rc=0
+    for _s in "${_seeds[@]}"; do
+        [ -z "$_s" ] && continue
+        echo ""
+        echo "########################################################"
+        echo "### シード $_s 実行開始 ($(date '+%Y-%m-%d %H:%M:%S'))"
+        echo "########################################################"
+        "$0" "$_s" "${@:2}" || _multi_rc=$?
+    done
+    echo ""
+    echo "########################################################"
+    echo "### 全シード完了: ${_seeds[*]} (rc=$_multi_rc)"
+    echo "########################################################"
+    exit $_multi_rc
+fi
+# ---------------------------------------------------------------------------
 
 seed_base="$1"
 output_base_arg="$2"
@@ -112,8 +137,8 @@ echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA 
 #   ATTACK_MODE=1 : fail 型のみ（従来の HTLC 失敗攻撃）
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
 #   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
-ATTACK_MODE=2
-GRIEF_HOLD_RATIO=1   # ATTACK_MODE=3 のときの hold 割合 [0,1]
+ATTACK_MODE=3
+GRIEF_HOLD_RATIO=0.5   # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ---------------------------------------------------------------------------
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
@@ -127,7 +152,7 @@ NODE_SCALES=6000
 PAYMENT_AMOUNTS=(100 500 1000)
 
 # 監視ノード数の絶対数リスト
-MONITOR_NODE_COUNTS=(10 20 30)
+MONITOR_NODE_COUNTS=(10)
 MONITORING_METHODS=(monitor_disable monitor_method1 monitor_method2)
 
 # Defense modes: no_defense uses monitoring disabled, defense uses monitoring enabled
@@ -305,6 +330,32 @@ function move_completed_to_remote() {
 
 
 # ---------------------------------------------------------------------------
+# NAS転送を進捗表示から分離する独立ドレイナ。完了 sim を定期的にNASへ転送し、
+# done==total で自己終了する (main の `wait` が回収する)。
+# これにより表示ループは転送I/Oでブロックされず、一定間隔で再描画できる。
+# ---------------------------------------------------------------------------
+function nas_drainer() {
+    if [[ -z "$remote_output_base" ]] || [ "$total_simulations" -eq 0 ]; then
+        return 0
+    fi
+    local n_done=0 f v
+    while [ "$n_done" -lt "$total_simulations" ]; do
+        move_completed_to_remote
+        n_done=0
+        while IFS= read -r f; do
+            [ -r "$f" ] || continue
+            v=$(<"$f")
+            if [ "$v" = "1" ] || [ "$v" = "failed" ]; then
+                n_done=$((n_done + 1))
+            fi
+        done < <(find "$output_base" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
+        sleep 2
+    done
+    move_completed_to_remote   # 最終ドレイン (ループ終了直前に完了した分を確実に送る)
+}
+
+
+# ---------------------------------------------------------------------------
 function enqueue_simulation() {
     queue+=("$@")
     ((total_simulations++))
@@ -328,67 +379,73 @@ function display_progress() {
         return 0
     fi
 
-    done_simulations=0
-    failed_simulations=0
+    local n_done=0
+    local n_failed=0
     last_lines=0   # 多行インプレース描画で前回出力した行数(カーソル巻き戻し用)
 
-    while [ "$done_simulations" -lt "$total_simulations" ]; do
-        move_completed_to_remote
+    # NAS転送は nas_drainer に分離済み。ここは「読むだけ」の軽量ループで 0.5s ごとに
+    # その瞬間の状態を再描画する。python3/bc/ファイル毎 cat を排し bash 組み込み(+整数演算)に
+    # 置換したので、CPU飽和下でもほぼ 0.5s 刻みで更新が回る。
+    while [ "$n_done" -lt "$total_simulations" ]; do
         mapfile -t simulation_progress_files < <(find "$output_base" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
 
-        done_simulations=0
-        failed_simulations=0
+        n_done=0
+        n_failed=0
         running_entries=()   # 実行中シミュレーション "progress|rel_path" を収集
+        local file progress sim_dir rel_path
         for file in "${simulation_progress_files[@]}"; do
-            progress=$(cat "$file" 2>/dev/null || echo "0")
+            [ -r "$file" ] || continue          # nas_drainer の rm/mkdir と競合した瞬間はスキップ
+            progress=$(<"$file")                # fork無し読み取り
             if [ "$progress" = "1" ]; then
-                done_simulations=$((done_simulations + 1))
+                n_done=$((n_done + 1))
             elif [ "$progress" = "failed" ]; then
-                done_simulations=$((done_simulations + 1))
-                failed_simulations=$((failed_simulations + 1))
+                n_done=$((n_done + 1))
+                n_failed=$((n_failed + 1))
             elif [[ "$progress" =~ ^[0-9]*\.?[0-9]+$ ]]; then
                 # 実行中 (0<=progress<1): 進捗と出力先(相対パス)を保持
-                sim_dir="$(dirname "$file")"
+                sim_dir="${file%/progress.tmp}"
                 rel_path="${sim_dir#$output_base/}"
                 running_entries+=("$progress|$rel_path")
             fi
         done
 
-        if [ "$total_simulations" -eq 0 ]; then
-            fraction=0
-        else
-            fraction=$(echo "scale=4; $done_simulations / $total_simulations" | bc)
+        # NASカウンタ (fork無しで読む)
+        local nas_ok=0 nas_ng=0
+        [ -r "$nas_counter_transferred" ] && nas_ok=$(<"$nas_counter_transferred")
+        [ -r "$nas_counter_failed" ]      && nas_ng=$(<"$nas_counter_failed")
+
+        # 進捗％・バー・ETA を整数演算で算出 (python3/bc 不使用)
+        local permille pct_int pct_dec filled bar progress_line
+        permille=$(( n_done * 1000 / total_simulations ))
+        pct_int=$(( permille / 10 ))
+        pct_dec=$(( permille % 10 ))
+        filled=$(( permille * 50 / 1000 ))
+        bar=""
+        if [ "$filled" -gt 0 ]; then
+            printf -v bar '%*s' "$filled" ''
+            bar="${bar// /#}"
         fi
 
-        filled=$(printf "%.0f" "$(echo "$fraction * 50" | bc)")
-        progress_bar=$(printf "%0.s#" $(seq 1 "$filled"))
-
-        # NASカウンタをファイルから読み出してから進捗行に埋め込む
-        nas_ok=$(cat "$nas_counter_transferred" 2>/dev/null || echo 0)
-        nas_ng=$(cat "$nas_counter_failed"      2>/dev/null || echo 0)
-
-        if [ "$(python3 -c "print(float('$fraction')==0.0)" 2>/dev/null)" = "True" ]; then
-            progress_line=$(printf "Progress: [%-50s] 0%%\t%d/%d\t Failed %d\t Time remaining --:--:--\t NAS: %d transferred / %d failed" "" "$done_simulations" "$total_simulations" "$failed_simulations" "$nas_ok" "$nas_ng")
+        if [ "$n_done" -eq 0 ]; then
+            printf -v progress_line "Progress: [%-50s] 0%%\t%d/%d\t Failed %d\t Time remaining --:--:--\t NAS: %s transferred / %s failed" "" "$n_done" "$total_simulations" "$n_failed" "$nas_ok" "$nas_ng"
         else
-            elapsed_time=$(( $(date +%s) - start_time ))
-            remaining_time_sec=$(python3 -c "f=float('$fraction'); elapsed=$elapsed_time; est=int(elapsed / f - elapsed); print(max(0, est))" 2>/dev/null || echo "0")
-            remaining_hours=$(( remaining_time_sec / 3600 ))
-            remaining_minutes=$(( (remaining_time_sec % 3600) / 60 ))
-            remaining_seconds=$(( remaining_time_sec % 60 ))
-            percent=$(echo "scale=1; $fraction * 100" | bc)
-            progress_line=$(printf "Progress: [%-50s] %s%%\t%d/%d\t Failed %d\t Time remaining %02d:%02d:%02d\t NAS: %d transferred / %d failed" "$progress_bar" "$percent" "$done_simulations" "$total_simulations" "$failed_simulations" "$remaining_hours" "$remaining_minutes" "$remaining_seconds" "$nas_ok" "$nas_ng")
+            local now elapsed remaining_time_sec r_h r_m r_s
+            now=$(date +%s)
+            elapsed=$(( now - start_time ))
+            remaining_time_sec=$(( elapsed * (total_simulations - n_done) / n_done ))
+            [ "$remaining_time_sec" -lt 0 ] && remaining_time_sec=0
+            r_h=$(( remaining_time_sec / 3600 ))
+            r_m=$(( (remaining_time_sec % 3600) / 60 ))
+            r_s=$(( remaining_time_sec % 60 ))
+            printf -v progress_line "Progress: [%-50s] %d.%d%%\t%d/%d\t Failed %d\t Time remaining %02d:%02d:%02d\t NAS: %s transferred / %s failed" "$bar" "$pct_int" "$pct_dec" "$n_done" "$total_simulations" "$n_failed" "$r_h" "$r_m" "$r_s" "$nas_ok" "$nas_ng"
         fi
 
-        # --- 実行中シミュレーションの進捗行を構築 (進捗降順, 最大12行) ---
-        running_block=""
-        n_running_shown=0
+        # --- 実行中シミュレーションの進捗行 (進捗降順, 最大12行) ---
+        local running_block="" n_running_shown=0
         if [ "${#running_entries[@]}" -gt 0 ]; then
-            while IFS='|' read -r _prog _rel; do
-                [ -z "$_prog" ] && continue
-                _pct=$(awk "BEGIN{printf \"%.1f\", ${_prog}*100}" 2>/dev/null || echo "0.0")
-                running_block+="$(printf "    [%6s%%] %s" "$_pct" "$_rel")"$'\n'
-                n_running_shown=$((n_running_shown + 1))
-            done < <(printf '%s\n' "${running_entries[@]}" | sort -t'|' -k1 -rn | head -12)
+            n_running_shown=$(( ${#running_entries[@]} > 12 ? 12 : ${#running_entries[@]} ))
+            running_block=$(printf '%s\n' "${running_entries[@]}" | sort -t'|' -k1 -rn | head -12 | awk -F'|' '{ printf "    [%6.1f%%] %s\n", $1*100, $2 }')
+            running_block+=$'\n'   # command-sub が剥がした最終改行を補填し旧描画と行数を一致させる
         fi
 
         # --- 多行インプレース描画: 前回ブロックをカーソル巻き戻し+消去して再描画 ---
@@ -398,21 +455,13 @@ function display_progress() {
         printf "%s\n" "$progress_line"
         printf "%s" "$running_block"
         last_lines=$((1 + n_running_shown))
-        sleep 0.1
+        sleep 0.5
     done
     # 最後のブロックを消去してメイン進捗行のみ確定表示
     if [ "$last_lines" -gt 0 ]; then
         printf "\033[%dA\r\033[J" "$last_lines"
     fi
     printf "%s\n" "$progress_line"
-    # 進捗表示中に蓄積されたNASエラーがあればまとめて表示
-    if [[ -s "$nas_error_log" ]]; then
-        echo ""
-        echo "=== NAS転送エラー詳細 ==="
-        cat "$nas_error_log"
-        echo "========================="
-    fi
-    rm -f "$nas_error_log" "$nas_counter_transferred" "$nas_counter_failed"
 }
 
 # ---------------------------------------------------------------------------
@@ -502,10 +551,12 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                     avoid_low_rep_val="false"
                     enable_rep_system_val="$enable_rep_val"
                     enable_rbr_val="false"
+                    enable_prt_val="false"   # 対照(no_defense)は素のタイムアウト挙動=PRT-off
                 else
                     avoid_low_rep_val="true"
                     enable_rep_system_val="true"
                     enable_rbr_val="true"
+                    enable_prt_val="true"    # 防御は早期打ち切り(PRT)を含む
                 fi
 
                 for monitor_count in "${monitor_counts_iter[@]}"; do
@@ -526,7 +577,7 @@ base_cmd_args="n_additional_nodes=$NODE_SCALES \
                         enable_reputation_system=$enable_rep_system_val \
                         avoid_low_reputation=$avoid_low_rep_val \
                         enable_monitor_movement=false movement_credit_limit=0 \
-                        enable_pra=false enable_prt=false enable_rbr=$enable_rbr_val \
+                        enable_pra=false enable_prt=$enable_prt_val enable_rbr=$enable_rbr_val \
                         average_payment_amount=$avg_pmt variance_payment_amount=$var_pmt \
                         $ATTACK_DELAY_PARAMS_ON"
 
@@ -565,6 +616,7 @@ running_processes=0
 start_time=$(date +%s)
 
 display_progress &
+nas_drainer &
 while [ "${#queue[@]}" -gt 0 ] || [ "$running_processes" -gt 0 ]; do
     process_queue
     sleep 1
@@ -572,6 +624,17 @@ done
 wait
 printf "\n"
 move_completed_to_remote
+
+# 進捗表示中に蓄積されたNAS転送エラーをまとめて表示し、カウンタ一時ファイルを掃除する。
+# (旧 display_progress 末尾から移設: 表示と転送を分離したので、両 background が `wait` で
+#  終了しきった後=ここが正しい後始末位置。display_progress 走行中にカウンタを消さない)
+if [[ -s "$nas_error_log" ]]; then
+    echo ""
+    echo "=== NAS転送エラー詳細 ==="
+    cat "$nas_error_log"
+    echo "========================="
+fi
+rm -f "$nas_error_log" "$nas_counter_transferred" "$nas_counter_failed"
 
 echo ""
 echo "=========================================="

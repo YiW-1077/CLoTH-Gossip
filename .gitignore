@@ -61,3 +61,10 @@ dijkstra_cache/*
 .DS_Store
 tasks.json
 .vscode
+
+# In-source CMake build artifacts
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+/CLoTH_Gossip

@@ -60,10 +60,10 @@ reputation_recovery_rate=0.02
 enable_monitor_movement=false
 movement_credit_limit=5
 enable_pra=false
-enable_prt=false
+enable_prt=true
 prt_threshold=30
 prt_abort_wait_time=1000
-rbr_reputation_weight=10.0'
+rbr_reputation_weight=20.0'
 
 test_scenario() {
   local name=$1 malicious=$2 attack_success=$3 rbr=$4 rep=$5 monitoring=$6
