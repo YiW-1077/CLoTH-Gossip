@@ -31,6 +31,7 @@ struct node* new_node(long id) {
   node->explored = 0;
   /* === Stage ① Initialize Malicious Fields === */
   node->is_malicious = 0;
+  node->is_substitute = 0;
   node->attack_probability = 0.0;
   /* === Stage ② Initialize Monitor Fields === */
   node->is_monitor = 0;
@@ -59,6 +60,20 @@ struct node* new_node(long id) {
   node->settle_test_count = 0;
   node->settle_anomaly_count = 0;
   return node;
+}
+
+/* 全ノードの results (ノードID索引の結果キャッシュ) を現ノード数で確保する。
+ * initialize_network から外し、代役ハブ注入(add_substitute_hubs)の後に呼ぶことで
+ * 増えたノードにも正しいサイズで確保する。既存 results があれば解放してから確保。 */
+void allocate_node_results(struct network* network) {
+  long rn = array_len(network->nodes);
+  for (long i = 0; i < rn; i++) {
+    struct node* node = array_get(network->nodes, i);
+    if (node == NULL) continue;
+    if (node->results != NULL) free(node->results);
+    node->results = (struct element**) malloc(rn * sizeof(struct element*));
+    for (long j = 0; j < rn; j++) node->results[j] = NULL;
+  }
 }
 
 
@@ -485,6 +500,85 @@ void initialize_malicious_nodes(struct network* network,
 
     printf("[Malicious Nodes] Deployment complete: %ld malicious nodes, failure_prob=%.2f\n",
            n_malicious, failure_prob);
+}
+
+
+/* 代役ハブ注入(トポロジ what-if)。宣言・意図は network.h を参照。
+ * 悪意ハブ(is_malicious && degree>=min_degree)ごとに count 個の正直な代役ノードを追加し、
+ * そのハブの近傍(最大 max_links 本)へ容量/ポリシーをコピーしたチャネルを張る。
+ * 新規 gsl 乱数は引かない。inert!=0 は残高0(=ルーティング不能)で作成(baseline再現の対照)。
+ * open_edges は &(edge->id)(=edge先頭フィールドaliasでedgeポインタと同一)を格納する既存規約に従う。 */
+void add_substitute_hubs(struct network* network, long min_degree, int count, int max_links, int inert) {
+    if (count <= 0) return;
+    long orig_n_nodes = array_len(network->nodes);
+
+    /* 対象ID(悪意ハブ)を先に収集(以後の配列 realloc に備えてポインタでなくIDで保持)。 */
+    long* target_ids = malloc(sizeof(long) * (orig_n_nodes > 0 ? orig_n_nodes : 1));
+    int n_targets = 0;
+    for (long i = 0; i < orig_n_nodes; i++) {
+        struct node* nd = array_get(network->nodes, i);
+        if (nd == NULL) continue;
+        long deg = (nd->open_edges != NULL) ? array_len(nd->open_edges) : 0L;
+        if (nd->is_malicious && deg >= min_degree) target_ids[n_targets++] = i;
+    }
+
+    long total_subs = 0, total_links = 0;
+    for (int t = 0; t < n_targets; t++) {
+        long H_id = target_ids[t];
+        for (int c = 0; c < count; c++) {
+            struct node* H = array_get(network->nodes, H_id);      /* 追加毎に再取得 */
+            long deg = array_len(H->open_edges);
+            long nlinks = (max_links > 0 && deg > (long)max_links) ? (long)max_links : deg;
+
+            /* 近傍情報を nodes 配列 realloc の前にスナップショット。 */
+            long*   nb_M   = malloc(sizeof(long)   * (nlinks > 0 ? nlinks : 1));
+            uint64_t* nb_cap = malloc(sizeof(uint64_t) * (nlinks > 0 ? nlinks : 1));
+            struct policy* nb_pol_SM = malloc(sizeof(struct policy) * (nlinks > 0 ? nlinks : 1));
+            struct policy* nb_pol_MS = malloc(sizeof(struct policy) * (nlinks > 0 ? nlinks : 1));
+            for (long k = 0; k < nlinks; k++) {
+                struct edge* e  = array_get(H->open_edges, k);     /* H->M のエッジ */
+                struct channel* ch = array_get(network->channels, e->channel_id);
+                struct edge* ce = array_get(network->edges, e->counter_edge_id); /* M->H */
+                nb_M[k]      = e->to_node_id;
+                nb_cap[k]    = ch->capacity;
+                nb_pol_SM[k] = e->policy;
+                nb_pol_MS[k] = ce->policy;
+            }
+
+            /* 代役ノード生成(honest)。 */
+            long S_id = array_len(network->nodes);
+            struct node* S = new_node(S_id);
+            S->is_substitute = 1;
+            network->nodes = array_insert(network->nodes, S);      /* nodes 配列 realloc 可 */
+
+            /* スナップショットからチャネル(双方向2エッジ)を張る。 */
+            for (long k = 0; k < nlinks; k++) {
+                long cid = array_len(network->channels);
+                long e1  = array_len(network->edges);
+                long e2  = e1 + 1;
+                /* inert=完全不可視(容量・残高・htlc_maximum すべて0 → dijkstra が一切選ばない)。
+                 * balance だけ0にしても htlc_maximum が非0だと経路候補にされ失敗リトライを誘発するため。 */
+                uint64_t cap = inert ? 0 : nb_cap[k];
+                uint64_t bal = inert ? 0 : (nb_cap[k] / 2);
+                struct channel* nch = new_channel(cid, e1, e2, S_id, nb_M[k], cap);
+                struct edge* eSM = new_edge(e1, cid, e2, S_id, nb_M[k], bal, nb_pol_SM[k], cap);
+                struct edge* eMS = new_edge(e2, cid, e1, nb_M[k], S_id, bal, nb_pol_MS[k], cap);
+                network->channels = array_insert(network->channels, nch);
+                network->edges = array_insert(network->edges, eSM);
+                network->edges = array_insert(network->edges, eMS);
+                struct node* Sp = array_get(network->nodes, S_id);
+                Sp->open_edges = array_insert(Sp->open_edges, &(eSM->id));
+                struct node* Mp = array_get(network->nodes, nb_M[k]);
+                Mp->open_edges = array_insert(Mp->open_edges, &(eMS->id));
+                total_links++;
+            }
+            free(nb_M); free(nb_cap); free(nb_pol_SM); free(nb_pol_MS);
+            total_subs++;
+        }
+    }
+    free(target_ids);
+    printf("[Substitute Hubs] added %ld substitute nodes for %d malicious hubs (deg>=%ld), %ld links%s\n",
+           total_subs, n_targets, min_degree, total_links, inert ? " [INERT/unroutable]" : "");
 }
 
 
@@ -985,10 +1079,16 @@ void update_node_reputation_on_detection(struct node* node, double penalty, uint
 }
 
 
-/* === Stage ③ Apply Reputation Decay to All Nodes ===
- * Decays reputation scores over time
- * This models "forgetting" older incidents
- */
+/* === Stage ③ Apply Reputation Decay (時間経過による評判回復) ===
+ * 全ノードの評判を decay_rate だけ 1.0 へ向けて回復させる ("忘却" モデル)。
+ * 地上真値 (is_malicious) は参照しない = 配備可能な機構。攻撃を続けるノードは
+ * 継続的に再報告・再罰を受けるため回復してもすぐ下がり、誤報告を踏んだ正直
+ * ノードだけが実質的に回復する。旧実装は !is_malicious のみ回復させる
+ * オラクル参照だった上に一度も呼ばれておらず、boost 抑制 (malicious_reports>0
+ * で成功boost停止) + 報告カウンタの生涯累積と合わさって「一度誤報告された
+ * 正直ノードに回復経路が一切ない = 永久FP」という構造問題を残していた。
+ * 呼び出しは cloth.c のイベントループ (env CLOTH_REPUTATION_DECAY_RATE で
+ * 有効化, 既定0=OFF)。 */
 void apply_reputation_decay_all_nodes(struct network* network, double decay_rate) {
     if (network == NULL || network->nodes == NULL) {
         return;
@@ -996,8 +1096,7 @@ void apply_reputation_decay_all_nodes(struct network* network, double decay_rate
 
     for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
-        if (node != NULL && !node->is_malicious) {
-            // Honest nodes recover reputation over time (decay is negative penalty)
+        if (node != NULL) {
             node->reputation_score += decay_rate;
 
             // Clamp to [0.0, 1.0]
@@ -1117,13 +1216,10 @@ struct network* initialize_network(struct network_params net_params, gsl_rng* ra
   faulty_prob[1] = net_params.faulty_node_prob;
   network->faulty_node_prob = gsl_ran_discrete_preproc(2, faulty_prob);
 
-  n_nodes = array_len(network->nodes);
-  for(i=0; i<n_nodes; i++){
-    node = array_get(network->nodes, i);
-    node->results = (struct element**) malloc(n_nodes*sizeof(struct element*));
-    for(j=0; j<n_nodes; j++)
-      node->results[j] = NULL;
-  }
+  /* node->results (ノードID索引の O(n^2) 結果キャッシュ) の確保は、代役ハブ注入
+   * (add_substitute_hubs) の後に allocate_node_results() で行う。ここで確保すると
+   * 注入で増えたノードに対応できず範囲外になるため遅延させる。results は
+   * シミュレーション時にのみ参照され、初期化段(malicious/monitor)では触れない。 */
 
   network->groups = array_initialize(1000);
   network->cumulative_monitor_assignments = 0;

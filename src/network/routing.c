@@ -911,13 +911,15 @@ void add_node_to_avoided_list(long** avoided_nodes, int* num_avoided, int* capac
  * ハード除外(avoided_list 追加・経路からの強制排除)を行わず、ソフト罰
  * (評判コスト乗数, base dijkstra 内 555/620 行) のみに留める。これにより
  * 「代替路があれば避ける／無ければ仕方なく通す」挙動になり NOPATH を抑える。
- * 既定ON: deg>=100 のハブをソフト罰のみとする(rbr_reputation_weight=20 と併用で
- * 3n(3200/6400/12800)・seed42 で頭打ち解消・成功率最良を確認)。
- * env で閾値を上書き可。CLOTH_HUB_SOFT_ONLY_MIN_DEGREE=0 で無効化(従来の全ハブ
- * ハード除外に戻す, 過去run再現用)。 */
+ * 既定=1(全ノードsoft罰のみ・ハード除外を一切しない): rbr_reputation_weight=20 と併用で
+ * 高n成功率の下降を解消(NOPATHがnによらず~0.5-0.7%に張り付く)。deg>=100 のみ保護する
+ * 旧既定(100)と比べ、中次数(deg10-99)の悪意ノードもソフト化することで残存NOPATHを消し、
+ * 攻撃再露出は+0.3pp程度と極小・遅延+2.5-3.2%・検知不変で成功+1.4-1.6pp(2-seed実測)。
+ * env で閾値を上書き可(例=100 で旧既定=deg>=100のみ保護)。
+ * CLOTH_HUB_SOFT_ONLY_MIN_DEGREE=0 で無効化(従来の全ノードハード除外に戻す, 過去run再現用)。 */
 static long get_hub_soft_only_min_degree(void) {
     char *e = getenv("CLOTH_HUB_SOFT_ONLY_MIN_DEGREE");
-    if (e == NULL || e[0] == '\0') return 100;   /* 既定 ON: deg>=100 はソフト罰のみ */
+    if (e == NULL || e[0] == '\0') return 1;     /* 既定: 全ノードsoft罰のみ(ハード除外なし) */
     long v = atol(e);
     return (v > 0) ? v : LONG_MAX;               /* 0/負で無効化(従来のハード除外) */
 }
@@ -996,7 +998,9 @@ struct array* find_reputation_based_route(
             double blacklist_threshold = 0.3 / (1.0 + (double)node_degree / 200.0);
             if (blacklist_threshold < 0.05) blacklist_threshold = 0.05;
 
-            /* ハブ保護(env-gated, 既定ON deg>=100): ハブはハード除外せずソフト罰のみに留める */
+            /* soft罰のみ判定(env-gated)。既定 min_degree=1 = 全ノード soft罰のみで
+             * ハード除外は一切発動しない (get_hub_soft_only_min_degree のコメント参照)。
+             * CLOTH_HUB_SOFT_ONLY_MIN_DEGREE=0 指定時のみ旧来のハード除外が復活する。 */
             int hub_soft_only = (node_degree >= get_hub_soft_only_min_degree());
 
             if (N->reputation_score < blacklist_threshold && !hub_soft_only && !is_node_in_avoided_list(avoided_nodes, num_avoided, N->id)) {

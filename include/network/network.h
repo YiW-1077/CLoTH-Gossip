@@ -38,6 +38,7 @@ struct node {
   unsigned int explored;
   /* === Stage ① Research: Malicious Node Fields === */
   unsigned int is_malicious;        // 1 if this node is a malicious DoS attacker
+  unsigned int is_substitute;       // 1 if this node is an injected honest substitute hub (topology what-if)
   double attack_probability;        // probability of HTLC failure when forwarding
   /* === Stage ② Research: Monitor Node Fields === */
   unsigned int is_monitor;          // 1 if this node hosts a monitoring agent
@@ -233,10 +234,22 @@ void open_channel(struct network* network, gsl_rng* random_generator, struct net
 struct network* initialize_network(struct network_params net_params, gsl_rng* random_generator);
 
 /* === Stage ① Malicious Node Initialization === */
-void initialize_malicious_nodes(struct network* network, 
-                                 double malicious_ratio, 
+void initialize_malicious_nodes(struct network* network,
+                                 double malicious_ratio,
                                  double failure_prob,
                                  gsl_rng* rng);
+
+/* 代役ハブ注入(トポロジ what-if): 悪意ハブ(is_malicious && degree>=min_degree)ごとに
+ * count 個の正直な代役ノードを追加し、そのハブの近傍(最大 max_links 本)へ容量/ポリシーを
+ * コピーしたチャネルを張る。回避で消える悪意ハブの連結性を正直ノードで補い NOPATH を抑える。
+ * 新規 gsl 乱数は引かない(baseline の RNG ストリームを乱さない)。
+ * inert!=0 のとき残高0=ルーティング不能で作成(=baseline完全再現の対照)。
+ * 監視配置の後・results確保の前に呼ぶこと(node->results は呼び出し後に全ノード分確保する)。 */
+void add_substitute_hubs(struct network* network, long min_degree, int count, int max_links, int inert);
+
+/* 全ノードの results (ノードID索引の結果キャッシュ) を現ノード数で確保する。
+ * add_substitute_hubs の後に呼ぶ(注入で増えたノード分も含めて確保)。 */
+void allocate_node_results(struct network* network);
 
 /* === Stage ② Monitor Placement Functions === */
 void initialize_hub_info(struct network* network, int hub_threshold);

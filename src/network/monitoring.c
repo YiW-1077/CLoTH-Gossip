@@ -699,8 +699,10 @@ void share_monitor_information_and_update_reputation(
          * 従来は 1.0 基準で再計算した値をそのまま代入しており、realtime 検知
          * (report_attacked_node_to_monitors) が積み上げたペナルティを毎スイープ
          * 帳消しにして高次数攻撃者 (node2 等) の評判を 1.0 に戻していた。
-         * 下げる方向のみ反映する。正常ハブの誤報による低下は apply_reputation_
-         * decay_all_nodes (!is_malicious のみ回復) で戻る。 */
+         * 下げる方向のみ反映する。正常ハブの誤報による低下の回復経路は
+         * 評判減衰レバー (cloth.c, env CLOTH_REPUTATION_DECAY_RATE, 既定0=OFF)
+         * のみ。既定では成功boostも抑制される (malicious_reports>0) ため、
+         * 一度誤報告された正直ノードは run 終了まで低評判のまま = 永久FP。 */
         if (reputation < old_rep) {
             node->reputation_score = reputation;
         }
@@ -770,7 +772,9 @@ void report_attacked_node_to_monitors(
     /* Require multiple independent reports before applying reputation penalty.
      * env CLOTH_REPORTS_REQUIRED で調整可。複数の独立報告を要求することは
      * 「単一支払い内のホップ集約」ではなく「支払いをまたぐ集約」であり、
-     * FP(正常ハブの単発誤報告, 報告中央=1)を落とし precision を上げる主レバー。 */
+     * FP(正常ハブの単発誤報告, 報告中央=1)を落とし precision を上げる主レバー。
+     * ⚠️ 検知フラグ閾値 (cloth.c CLOTH_FLAG_MIN_REPORTS=1) とは意図的に乖離:
+     * 報告1件で「検知」には数えるが罰は2件目から。詳細は cloth.c 側コメント参照。 */
     int REPORTS_REQUIRED = 2;
     {
         const char* env = getenv("CLOTH_REPORTS_REQUIRED");

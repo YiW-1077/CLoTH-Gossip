@@ -49,28 +49,33 @@ static uint64_t sample_base_forward_delay(struct simulation* simulation, struct 
                      gsl_ran_ugaussian(simulation->random_generator)));
 }
 
-/* CLOTH_WARMUP_PAYMENTS と連動して baseline 学習期間を保護するためのしきい値。
- * monitoring.c::get_warmup_payments と同じ既定値・同じ環境変数を用いる。 */
-static long get_attack_warmup_threshold(void) {
-  char *env = getenv("CLOTH_WARMUP_PAYMENTS");
-  if (env == NULL) return 500;
-  long v = atol(env);
-  if (v <= 0) return 500;
-  return v;
-}
+/* 攻撃側の warmup 判定は payment->is_warmup(cloth.c で先頭500件固定) に一本化した。
+ * 旧 get_attack_warmup_threshold(完了数 processed_payments と比較) は開始index基準の
+ * is_warmup と乖離し小 n で不整合を起こしたため撤去。検知器側の warmup 保護は
+ * monitoring.c::get_warmup_payments (CLOTH_WARMUP_PAYMENTS) が別途担う。 */
 
-/* 攻撃遅延の発動判定。
- * 従来は時刻窓 [attack_delay_start_time, +attack_delay_duration] のみで発動して
- * いたが、既定の窓 (3000-33000ms) は warmup 期間にほぼ収まり、攻撃遅延が検定
- * 対象にほとんど乗らなかった。これを改め、baseline 学習中
- * (processed_payments < warmup しきい値) は発動せず、warmup 終了後は全期間で
- * 発動するようにする。時刻窓パラメータ (start_time/duration) は使用しない。 */
-static unsigned int is_attack_delay_active(struct simulation* simulation, struct network_params net_params) {
+/* 攻撃遅延の発動判定 (config チェックのみ; warmup 判定は呼び出し側で per-payment)。
+ * 時刻窓 [start_time,+duration] は既定窓が warmup にほぼ収まり信号が乗らなかったため廃止。
+ * ⚠️ 旧実装は processed_payments(=完了数) >= warmup しきい値(500) でゲートしていたが、
+ * warmup は「開始順の先頭 N 件」(payment->is_warmup, cloth.c) で定義されるのに完了数は
+ * 決済の in-flight 重なりで大きく遅延するため、小 n では計測窓の決済が settle する時点
+ * でも完了数がしきい値に届かず攻撃遅延が一切注入されない不整合があった (n=200 総700件で
+ * 完了数が最大432止まり→no_defense の grief=0 の根因)。そこで warmup ゲートを完了数でなく
+ * payment->is_warmup(=開始index基準=warmup定義そのもの) に揃える (呼び出し側 apply_
+ * attack_delay_if_needed で判定)。小 n を正し、大 n は境界僅少差のみ。 */
+static unsigned int is_attack_delay_active(struct network_params net_params) {
   if (!net_params.enable_network_attack_delay) return 0;
   if (net_params.attack_delay_intensity <= 1.0 && net_params.attack_delay_jitter <= 0.0) return 0;
-  return simulation->processed_payments >= get_attack_warmup_threshold();
+  return 1;
 }
 
+/* ⚠️ 出力列 is_timeout の意味論: この列は
+ *   (a) 真のタイムアウト (elapsed > payment_timeout, 行343)
+ *   (b) 経路なし NOPATH (空経路, 行466/482/502/524)
+ *   (c) 残高不足 NOBALANCE (この関数経由, 呼び出し元 608/911)
+ * の3種が合流する。解析側で分離するには no_balance_count>0 → NOBALANCE を
+ * 先に判定してから is_timeout を見ること (offline>0 は攻撃/オフライン)。
+ * 列のスキーマは既存の解析スクリプト群が index 依存で読むため変更しない。 */
 static void mark_no_response_failure(struct payment* payment, struct route_hop* hop) {
   payment->error.type = NORESPONSE;
   payment->error.hop = hop;
@@ -82,7 +87,8 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
                                              struct payment* payment,
                                              uint64_t base_delay,
                                              unsigned int attacked_path) {
-  if (!attacked_path || !is_attack_delay_active(simulation, net_params)) {
+  if (!attacked_path || payment == NULL || payment->is_warmup ||
+      !is_attack_delay_active(net_params)) {
     return base_delay;
   }
 
@@ -647,18 +653,31 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
 
   /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
    * 送信者の最初のホップ先が悪意ノードの場合も、中継 (forward_payment) と同様に
-   * HTLC を失敗させる。send_payment にこの判定が無かったため、送信者に隣接する
+   * 攻撃を注入する。send_payment にこの判定が無かったため、送信者に隣接する
    * 攻撃ハブ(特に高次数ノード)は攻撃せず転送成功し、成功時の評判ブースト
    * (htlc.c の Success Path) で reputation が回復して RBR 回避を免れていた。
    * 受信者が悪意の場合は攻撃しない (forward_payment の !is_last_hop と対称)。
    * hop_send_times[0] 設定後に置くことで、receive_fail() の案D attribution が
-   * 攻撃者(hop[0].to_node)を正しく特定できる。 */
+   * 攻撃者(hop[0].to_node)を正しく特定できる。
+   * fail/hold の分岐は forward_payment (Stage ①) と同一: hold_ratio>0 のときだけ
+   * mode_roll を引き、hold 型なら失敗させず grief_hold_node_id を予約して通常転送
+   * (遅延注入と first_attack_time は forward_success 側)。従来はここが fail 型固定で、
+   * mode 2/3 でも送信者隣接の悪意ハブだけ fail する非対称があった。 */
   {
     struct node* first_hop_node = array_get(network->nodes, first_route_hop->to_node_id);
     if (first_hop_node != NULL && first_hop_node->is_malicious &&
         first_route_hop->to_node_id != payment->receiver) {
       double attack_roll = gsl_rng_uniform(simulation->random_generator);
       if (attack_roll < first_hop_node->attack_probability) {
+        double hold_ratio = get_grief_hold_ratio();
+        double mode_roll = (hold_ratio > 0.0)
+            ? gsl_rng_uniform(simulation->random_generator) : 1.0;
+        if (mode_roll < hold_ratio) {
+          /* === HOLD 型: 失敗させない。決済経路での遅延注入を予約して通常転送 ===
+           * 残高減算(上の 617-620)はそのまま = HTLC は実際に転送される。
+           * fall through して下の通常送信処理 (success sending) に進む。 */
+          payment->grief_hold_node_id = first_hop_node->id;
+        } else {
         uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
         uint64_t forward_delay = apply_attack_delay_if_needed(
           simulation, net_params, payment, base_delay, 1
@@ -666,13 +685,12 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
         /* 分母正常化: 検知が報告可能になる post-warmup の攻撃のみ first_attack_time を
-         * 立てる。warmup 中(先頭 warmup しきい値分)の失敗攻撃は仮説検定が抑制され報告
-         * できないため、recall の分母 (observable_attacked = 観測×攻撃) に数えると検知器を
-         * 不当に減点する(=測定アーティファクト)。失敗自体は遅延設定と独立に発火するので、
-         * ゲートは warmup しきい値のみとする (is_attack_delay_active は遅延無効時に常に
-         * false になり fail 型では使えない)。攻撃挙動・RNG ストリームは不変。 */
-        if (first_hop_node->first_attack_time == 0 &&
-            simulation->processed_payments >= get_attack_warmup_threshold()) {
+         * 立てる。warmup 中の失敗攻撃は仮説検定が抑制され報告できないため、recall の分母
+         * (observable_attacked = 観測×攻撃) に数えると検知器を不当に減点する(=測定
+         * アーティファクト)。ゲートは payment->is_warmup で判定する: 旧実装の完了数
+         * processed_payments>=しきい値 は決済 in-flight 重なりで開始index(=warmup 定義)と
+         * 乖離し、小 n で分母が過小/0 になる不整合があった (injection ゲートと同じ根因)。 */
+        if (first_hop_node->first_attack_time == 0 && !payment->is_warmup) {
           first_hop_node->first_attack_time = attack_event_time;
         }
 
@@ -692,6 +710,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
         next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
         simulation->events = heap_insert(simulation->events, next_event, compare_event);
         return;
+        }
       }
     }
   }
@@ -826,9 +845,8 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
         /* 分母正常化: post-warmup の攻撃のみ first_attack_time を計上
-         * (理由・ゲート選択は send_payment 側の同種コメント参照)。 */
-        if (next_node->first_attack_time == 0 &&
-            simulation->processed_payments >= get_attack_warmup_threshold()) {
+         * (理由・ゲート選択は send_payment 側の同種コメント参照; payment->is_warmup で判定)。 */
+        if (next_node->first_attack_time == 0 && !payment->is_warmup) {
           next_node->first_attack_time = attack_event_time;
         }
 
@@ -1100,29 +1118,21 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           }
           if (t_end <= t_start) continue;
 
-          int should_report = on_payment_result_hypothesis_test(
+          /* 成功経路の検定はベースライン更新と Axis-2 用カウンタ
+           * (hyp_test_count/hyp_anomaly_count) の蓄積のみが目的。
+           * on_payment_result_hypothesis_test は is_fail=1 のときしか
+           * should_report を立てない (monitoring.c の k-of-m / 1-strike 両分岐)
+           * ため、ここでの報告は構造的に発生しない。以前ここにあった報告ブロックは
+           * 到達不能なデッドコードだったので除去した。フォワード方向の報告は
+           * receive_fail 側、hold 型の報告は forward_success の settle 検定
+           * (CLOTH_DETECT_GRIEF) が担う。 */
+          (void) on_payment_result_hypothesis_test(
               hop_node,
               t_start,
               t_end,
               simulation->processed_payments,
               0           /* is_fail = 0 */
           );
-
-          /* Only flag a node a monitor can actually observe (method1 vs method2). */
-          if (should_report && is_node_observed_by_monitors(network, hop_node->id)) {
-              report_attacked_node_to_monitors(
-                  network,
-                  (hop_idx > 0)
-                      ? ((struct route_hop*)array_get(
-                             payment->route->route_hops,
-                             hop_idx - 1))->from_node_id
-                      : payment->sender,
-                  hop_node->id,
-                  payment->id,
-                  simulation->current_time,
-                  net_params
-              );
-          }
       }
   }
 

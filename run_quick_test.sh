@@ -10,7 +10,8 @@ BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
 #   ATTACK_MODE=1 : fail 型のみ（従来の HTLC 失敗攻撃）
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
 #   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
-ATTACK_MODE=1
+# (sweep 側 run_monitor_sweep.sh と同期: hold(2)。変える場合は両方揃えること)
+ATTACK_MODE=2
 GRIEF_HOLD_RATIO=0.5    # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ============================================================
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"

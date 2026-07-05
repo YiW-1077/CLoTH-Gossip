@@ -365,7 +365,12 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
 
       /* 検知フラグの最小独立報告数。env CLOTH_FLAG_MIN_REPORTS (default 1)。
        * 1 を超える値にすると、単発の誤報告(正常ハブに多い)を「検知」とみなさず
-       * precision を上げる。FP の報告回数中央=1, TP(悪性)中央=6 という差を利用。 */
+       * precision を上げる。FP の報告回数中央=1, TP(悪性)中央=6 という差を利用。
+       * ⚠️ 既定では評判罰の発動閾値 (monitoring.c CLOTH_REPORTS_REQUIRED=2) と
+       * 乖離する: 報告1件のノードは recall/precision 上「検知済み」に数えられるが
+       * 評判罰ゼロ = RBR に回避されない。これは意図的な設計 (検知メトリクスは
+       * 仮説検定の性能、緩和は複数報告の合意を要求) だが、検知数と回避効果を
+       * 直結して解釈しないこと。揃えたい場合は両 env を同値にする。 */
       int flag_min_reports = 1;
       {
         const char* env = getenv("CLOTH_FLAG_MIN_REPORTS");
@@ -1548,11 +1553,10 @@ int main(int argc, char *argv[]) {
       printf("[Config] Override monitoring_strategy from env: %d\n", net_params.monitoring_strategy);
     }
 
-    /* --- レピュテーション / 防御フラグ --- */
-    if ((env_val = getenv("CLOTH_ENABLE_REPUTATION_SYSTEM")) != NULL) {
-      net_params.enable_reputation_system = (strcmp(env_val, "true") == 0) ? 1 : 0;
-      printf("[Config] Override enable_reputation_system from env: %d\n", net_params.enable_reputation_system);
-    }
+    /* --- レピュテーション / 防御フラグ ---
+     * NOTE: CLOTH_ENABLE_REPUTATION_SYSTEM の env オーバーライドは削除した。
+     * enable_reputation_system は下の正規化で monitoring_strategy から一意に
+     * 決まるため、config 値も env 値も必ず上書きされる (死んだノブだった)。 */
     if ((env_val = getenv("CLOTH_ENABLE_MONITOR_MOVEMENT")) != NULL) {
       net_params.enable_monitor_movement = (strcmp(env_val, "true") == 0) ? 1 : 0;
       printf("[Config] Override enable_monitor_movement from env: %d\n", net_params.enable_monitor_movement);
@@ -1560,6 +1564,22 @@ int main(int argc, char *argv[]) {
     if ((env_val = getenv("CLOTH_ENABLE_RBR")) != NULL) {
       net_params.enable_rbr = (strcmp(env_val, "true") == 0) ? 1 : 0;
       printf("[Config] Override enable_rbr from env: %d\n", net_params.enable_rbr);
+    }
+    /* PRT: 従来は config の sed 書き換えのみで env 経路がなく、run-simulation.sh の
+     * post-cmake 再適用が生命線だった。設定優先順位 (CLOTH_* env > config) を
+     * 他パラメータと揃え、sed 経路が壊れても env で確実に制御できるようにする。
+     * run-simulation.sh は key=value 引数を CLOTH_KEY=value として自動 export
+     * するため、enable_prt=true を渡すだけでこの経路も有効になる。 */
+    if ((env_val = getenv("CLOTH_ENABLE_PRT")) != NULL) {
+      net_params.enable_prt = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_prt from env: %d\n", net_params.enable_prt);
+    }
+    if ((env_val = getenv("CLOTH_PRT_THRESHOLD")) != NULL) {
+      long v = strtol(env_val, NULL, 10);
+      if (v > 0) {
+        net_params.prt_threshold = v;
+        printf("[Config] Override prt_threshold from env: %ld\n", v);
+      }
     }
 
     /* --- 攻撃遅延パラメータ --- */
@@ -1648,6 +1668,29 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  /* === 代役ハブ注入(トポロジ what-if, env-gated, 既定OFF) ===
+   * 監視配置の後・payments/dijkstra 初期化の前に注入する。悪意ハブの回避で失われる
+   * 連結性を正直な代役ノードで補い NOPATH を抑えられるかを試す実験レバー。
+   *   CLOTH_SUBSTITUTE_COUNT     : 悪意ハブ1個あたりの代役ノード数(>0で有効, 既定0=OFF)
+   *   CLOTH_SUBSTITUTE_MIN_DEGREE: 対象とする悪意ハブの最小次数(既定100)
+   *   CLOTH_SUBSTITUTE_MAX_LINKS : 代役1個が張る近傍リンク数の上限(既定400)
+   *   CLOTH_SUBSTITUTE_INERT=1   : 残高0=ルーティング不能で作成(baseline再現の対照) */
+  {
+    const char* sc = getenv("CLOTH_SUBSTITUTE_COUNT");
+    int sub_count = (sc != NULL && sc[0] != '\0') ? atoi(sc) : 0;
+    if (sub_count > 0) {
+      const char* smd = getenv("CLOTH_SUBSTITUTE_MIN_DEGREE");
+      long sub_min_deg = (smd != NULL && smd[0] != '\0') ? atol(smd) : 100;
+      const char* sml = getenv("CLOTH_SUBSTITUTE_MAX_LINKS");
+      int sub_max_links = (sml != NULL && sml[0] != '\0') ? atoi(sml) : 400;
+      const char* si = getenv("CLOTH_SUBSTITUTE_INERT");
+      int sub_inert = (si != NULL && (si[0] == '1' || strcmp(si, "true") == 0)) ? 1 : 0;
+      add_substitute_hubs(network, sub_min_deg, sub_count, sub_max_links, sub_inert);
+    }
+  }
+  /* node->results はトポロジ確定後(代役注入後)に全ノード数で確保する(network.c から遅延)。 */
+  allocate_node_results(network);
+
   /* === Stage ③ Initialize Reputation System === */
   if (net_params.enable_reputation_system) {
     initialize_reputation_scores(network);
@@ -1656,8 +1699,9 @@ int main(int argc, char *argv[]) {
      * 環境変数 CLOTH_ORACLE_REPUTATION=true のとき、地上真値で悪性ノードの
      * 評判を 0.0 に固定する。これにより RBR が全悪性ノードを回避するので、
      * 「検知が完璧なら RBR が出せる効果の上限」を統制ハーネス上で測れる。
-     * apply_reputation_decay_all_nodes は !is_malicious のみ回復させるため、
-     * 悪性ノードの評判は 0.0 のまま維持される。 */
+     * 評判減衰レバー (CLOTH_REPUTATION_DECAY_RATE) は oracle モード時スキップ
+     * されるため (イベントループ側で判定)、悪性ノードの評判は 0.0 のまま維持
+     * される。成功boostも boost_suppressed_for(報告>0)で抑制される。 */
     const char* oracle_env = getenv("CLOTH_ORACLE_REPUTATION");
     if (oracle_env != NULL && strcmp(oracle_env, "true") == 0) {
       long n_pinned = 0;
@@ -1733,7 +1777,9 @@ int main(int argc, char *argv[]) {
 
   printf("EVENTS INITIALIZATION\n");
   simulation->events = initialize_events(payments);
-  initialize_dijkstra(n_nodes, n_edges, payments);
+  /* 距離配列(=array_len(nodes))・ヒープ(=array_len(edges))は代役注入後の全数で確保する。
+   * payments の端点は上の initialize_payments が元 n_nodes を使うので代役は端点にならない。 */
+  initialize_dijkstra(array_len(network->nodes), array_len(network->edges), payments);
 
   // === Stage ④: Initialize Global RBR Parameters ===
   extern struct network_params* global_net_params;
@@ -1754,6 +1800,29 @@ int main(int argc, char *argv[]) {
   simulation->current_time = 1;
   long completed_payments = 0;
   int simple_mode_is_tty = isatty(fileno(stdout));
+  /* === 評判減衰(時間経過による回復)レバー: env CLOTH_REPUTATION_DECAY_RATE ===
+   * 既定 0 = OFF (従来挙動・検証済み結果と同一)。>0 を指定すると、決済
+   * CLOTH_REPUTATION_DECAY_INTERVAL 件(既定100)ごとに全ノードの評判を rate だけ
+   * 1.0 へ回復させる (network.c apply_reputation_decay_all_nodes, 非オラクル)。
+   * 誤報告を踏んだ正直ノードの永久FP (boost抑制+報告カウンタ無減衰で回復経路
+   * なし) を解消するレバー。攻撃者は再報告・再罰で低評判に戻る。
+   * CLOTH_ORACLE_REPUTATION=true (悪性ノードの評判を0固定する上限測定) の
+   * ときは固定が侵食されるため減衰をスキップする。 */
+  double reputation_decay_rate = 0.0;
+  long reputation_decay_interval = 100;
+  int oracle_reputation_pinned = 0;
+  {
+    const char* e = getenv("CLOTH_REPUTATION_DECAY_RATE");
+    if (e != NULL) { double v = atof(e); if (v > 0.0) reputation_decay_rate = v; }
+    e = getenv("CLOTH_REPUTATION_DECAY_INTERVAL");
+    if (e != NULL) { long v = atol(e); if (v >= 1) reputation_decay_interval = v; }
+    e = getenv("CLOTH_ORACLE_REPUTATION");
+    oracle_reputation_pinned = (e != NULL && strcmp(e, "true") == 0);
+    if (reputation_decay_rate > 0.0)
+      printf("[Config] Reputation decay: rate=%.4f interval=%ld payments%s\n",
+             reputation_decay_rate, reputation_decay_interval,
+             oracle_reputation_pinned ? " (SKIPPED: oracle pinning active)" : "");
+  }
   while(heap_len(simulation->events) != 0) {
     event = heap_pop(simulation->events, compare_event);
 
@@ -1825,6 +1894,20 @@ int main(int argc, char *argv[]) {
     case OPENCHANNEL:
       open_channel(network, simulation->random_generator, net_params);
       break;
+    /* ⚠️ 既知の疑わしいフォールスルー (break 欠落・意図的に保持): 最古コミット
+     * (969a9e8) から存在する上流 CLoTH-Gossip 由来の構造。CHANNELUPDATEFAIL は
+     *   channel_update_fail (process_fail_result: prefix成功+error hop失敗を記録)
+     *   → channel_update_success (process_success_result: 経路全体を成功で記録)
+     *   → request_group_update
+     * を連続実行する。process_fail_result は LN mission-control の
+     * 「prefix成功+失敗hop」パターンを既に完結して return する(htlc.c:284-309)のに、
+     * 続く process_success_result が失敗hopを含む全経路を success で上書きするため、
+     * node_pair_result 学習(dijkstra確率推定)を汚染する疑いが強い。
+     * ただし (a) CLOTH_ORIGINAL 含む全ルーティングモードの経路学習に影響し、
+     * (b) 本プロジェクトの過去の全実験がこの挙動下で測定されているため、break を
+     * 入れると過去結果との比較可能性が失われる。研究拡張の設計ではなく上流
+     * プラミングの問題なので、修正はユーザの明示判断に委ね、ここでは既存挙動を
+     * 保持する(2026-07-05 設計レビュー。break を入れる修正は一旦見送り)。 */
     case CHANNELUPDATEFAIL:
       channel_update_fail(event, simulation, network);
     case CHANNELUPDATESUCCESS:
@@ -1851,6 +1934,13 @@ int main(int argc, char *argv[]) {
             continue;
         }
         completed_payments++;
+
+        /* 評判減衰(回復): 決済 interval 件ごとに全ノードへ適用 (既定OFF, 上コメント参照) */
+        if (net_params.enable_reputation_system &&
+            reputation_decay_rate > 0.0 && !oracle_reputation_pinned &&
+            completed_payments % reputation_decay_interval == 0) {
+            apply_reputation_decay_all_nodes(network, reputation_decay_rate);
+        }
 
         if (net_params.enable_monitor_movement &&
             network->num_monitors > 0 &&

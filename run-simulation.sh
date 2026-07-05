@@ -46,8 +46,9 @@ prepare_environment() {
         new_val=$(grep "^$key=" "$environment_dir/config/cloth_input.txt" || echo "NOT_FOUND")
         echo "[PARAM] After sed: $new_val" >> "$result_dir/log/setup.log" 2>&1
     done
-
-    cp "$environment_dir/config/cloth_input.txt" "$result_dir"
+    # NOTE: 実効 config のアーカイブは run_once の post-cmake 再適用後に行う。
+    # ここで cp すると、cmake が root cloth_input.txt で config を上書きする前の
+    # 版が記録され、root と config/ が乖離した場合に run 記録が実効値と食い違う。
 }
 
 run_once() {
@@ -70,7 +71,10 @@ run_once() {
             new_val=$(grep "^$key=" "$environment_dir/config/cloth_input.txt" || echo "NOT_FOUND")
             echo "[POST-CMAKE] After sed: $new_val" >> "$result_dir/log/setup.log" 2>&1
         done
-        
+
+        # 実効 config (cmake 上書き + 再適用後) を結果 dir にアーカイブする (provenance)
+        cp "$environment_dir/config/cloth_input.txt" "$result_dir"
+
         # Build environment variable exports for parameter overrides
         # These will take precedence over values in cloth_input.txt
         env_exports=""
