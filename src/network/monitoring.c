@@ -36,17 +36,36 @@ static double get_null_degree_sigma() {
     return v;
 }
 
-/* === Axis-3 試作: per-node 経験的 heavy-tail null (オンライン分位点) ===
+/* === Axis-3(forward検知の実験レバー, 既定OFF, CLOTH_NULL_QUANTILE=true): per-node 経験的 heavy-tail null ===
  * 各ノードが自分の log-latency の (1-α) 分位点 anom_q を Robbins-Monro で学習し、
  * anomalous = (log_lat > anom_q) と判定する。これにより per-node の異常率が α に
  * 収束 → 多忙ハブも自分の本物の裾に合わせた高い閾値を学び FP が消える(degree不使用)。
- * 静かなノードは低い閾値のまま感度を保つ。CLOTH_NULL_QUANTILE=true で有効。 */
+ * 静かなノードは低い閾値のまま感度を保つ。採用済みの決済(hold)版は下記 settle 版を参照。 */
 static int get_null_quantile_mode() {
     char *env = getenv("CLOTH_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
 }
 static double get_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
     char *env = getenv("CLOTH_NULL_Q_STEP");
+    if (env == NULL) return 0.05;
+    double v = atof(env);
+    if (v <= 0.0) return 0.05;
+    return v;
+}
+
+/* === 決済(hold)検知器の per-node heavy-tail null (CLOTH_SETTLE_NULL_QUANTILE=true) ===
+ * 各ノードが warmup 中(=攻撃非アクティブ=クリーン)に自分の log-settle-latency の
+ * (1-α)分位点 settle_anom_q を Robbins-Monro で学習し、post-warmup は凍結してその
+ * per-node 閾値で判定する。多忙な正直ハブは自分の重い裾を学習するので過剰発火せず
+ * (hub-bottom-drag の FP を抑制)、保持(≈2x)はどのノードの裾も超えるので検出は残る。
+ * 汚染回避のため学習は warmup 限定(post-warmup の保持サンプルは裾に混ぜない)。
+ * step は絶対値(σで割らない)=低トラフィックノード固着(旧試作の不安定②)を回避。 */
+static int get_settle_null_quantile_mode() {
+    char *env = getenv("CLOTH_SETTLE_NULL_QUANTILE");
+    return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
+}
+static double get_settle_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
+    char *env = getenv("CLOTH_SETTLE_Q_STEP");
     if (env == NULL) return 0.05;
     double v = atof(env);
     if (v <= 0.0) return 0.05;
@@ -543,20 +562,11 @@ struct array* generate_balance_adjustment_payments(
     return balance_payments;
 }
 
-/**
- * ==================================================================================
- * Monitor Information Sharing & Dynamic Reputation System
- * ==================================================================================
- */
+/* === Monitor Information Sharing & Dynamic Reputation System === */
 
-/**
- * Share monitor observations across monitors and update global reputation scores
- * This function:
- * 1. Integrates observations from all monitors
- * 2. Identifies suspected malicious nodes from payment paths
- * 3. Updates global reputation scores for all nodes
- * 4. Makes reputation data available to routing algorithms
- */
+/* 全監視器の観測を統合し、グローバル評判スコアを更新する。
+ * 1. 全監視器の観測を統合  2. 決済経路から疑わしいノードを特定
+ * 3. 全ノードの評判スコアを更新  4. 評判データをルーティングから参照可能にする。 */
 void share_monitor_information_and_update_reputation(
     struct network* network,
     struct network_params net_params
@@ -814,6 +824,16 @@ void report_attacked_node_to_monitors(
             scaled_penalty,
             timestamp
         );
+
+        /* 検知トリガの代役配置(env CLOTH_SUBSTITUTE_ON_DETECTION): このノードが
+         * REPORTS_REQUIRED に達して「悪意と判断」された(=評判罰=回避開始)時点で、
+         * init時に inert で用意した代役ハブを有効化する。既定OFF時は no-op
+         * (add_substitute_hubs がオラクル配置=常時有効で作っているため代役は既に routable)。 */
+        {
+            const char* sod = getenv("CLOTH_SUBSTITUTE_ON_DETECTION");
+            if (sod != NULL && sod[0] != '\0' && strcmp(sod, "0") != 0)
+                activate_substitute_for_hub(network, attacked_node_id);
+        }
     }
 }
 
@@ -944,18 +964,14 @@ int on_payment_result_hypothesis_test(
 
     double latency_ms = (double)(result_time - htlc_send_time);
 
-    /* ============================================================
-     * ウォームアップ（最初の 500 支払い）: ベースライン学習のみ
-     * ============================================================ */
+    /* === ウォームアップ(最初の500支払い): ベースライン学習のみ === */
     if (payment_count_global < get_warmup_payments()) {
         update_baseline_lognormal(forwarding_node, latency_ms);
         return 0;
     }
 
-    /* ============================================================
-     * 検定本体: 1 ホップ分のレイテンシを対数正規分布で検定。
-     * baseline_std は二乗偏差 EMA から得た正しい標準偏差 σ。
-     * ============================================================ */
+    /* === 検定本体: 1ホップ分のレイテンシを対数正規分布で検定 ===
+     * baseline_std は二乗偏差 EMA から得た正しい標準偏差 σ。 */
     double p_threshold = get_pvalue_threshold();
     int anomalous;
     double p_value = -1.0; /* 診断ログ用 (quantileモードでは未使用→-1) */
@@ -1098,18 +1114,41 @@ int on_settlement_result_hypothesis_test(
         node->settle_baseline_var = var_init;
     }
 
-    /* グローバル warmup 中は報告しない(攻撃遅延も非アクティブ)。baseline は refine のみ。 */
+    double p_threshold = get_pvalue_threshold();
+    int settle_qmode = get_settle_null_quantile_mode();
+
+    /* グローバル warmup 中は報告しない(攻撃遅延も非アクティブ)。baseline は refine のみ。
+     * quantile モードでは warmup のクリーン(攻撃非アクティブ)サンプルで per-node の
+     * (1-α)分位点 settle_anom_q も RM 学習する(post-warmup は凍結=保持サンプルで汚染しない)。 */
     if (payment_count_global < get_warmup_payments()) {
         update_settle_baseline_lognormal(node, settle_latency_ms);
+        if (settle_qmode) {
+            double log_lat = log(settle_latency_ms + 1.0);
+            double sdw = sqrt(node->settle_baseline_var); if (sdw < 1e-6) sdw = 0.1;
+            double gauss = node->settle_baseline_mean + 2.326 * sdw; /* Gaussian ~99%点(下限) */
+            if (node->settle_anom_q < gauss) node->settle_anom_q = gauss;
+            int a = (log_lat > node->settle_anom_q) ? 1 : 0;
+            node->settle_anom_q += get_settle_q_step() * ((double)a - p_threshold); /* 絶対ステップ(②安定化) */
+            if (node->settle_anom_q < gauss) node->settle_anom_q = gauss;
+        }
         return 0;
     }
 
-    double p_threshold = get_pvalue_threshold();
     double sd = sqrt(node->settle_baseline_var);
     if (sd < 1e-6) sd = 0.1; /* フォールバック */
-    double p_value = calculate_p_value_log_normal(
-        settle_latency_ms, node->settle_baseline_mean, sd);
-    int anomalous = (p_value < p_threshold);
+    int anomalous;
+    if (settle_qmode) {
+        /* per-node 学習済み分位点 null: log_lat が settle_anom_q(Gaussian下限でクランプ)超で異常。
+         * 多忙ハブは warmup で学んだ重い裾で守られ FP を出さず、保持(≈2x)はその裾も超え検出継続。 */
+        double log_lat = log(settle_latency_ms + 1.0);
+        double gauss = node->settle_baseline_mean + 2.326 * sd;
+        double q = (node->settle_anom_q > gauss) ? node->settle_anom_q : gauss;
+        anomalous = (log_lat > q);
+    } else {
+        double p_value = calculate_p_value_log_normal(
+            settle_latency_ms, node->settle_baseline_mean, sd);
+        anomalous = (p_value < p_threshold);
+    }
 
     node->settle_test_count++;
     if (anomalous) node->settle_anomaly_count++;

@@ -617,7 +617,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     
     FILE* csv_reputation = fopen(output_filename, "w");
     if (csv_reputation != NULL) {
-      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count\n");
+      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count,settle_anom_q,settle_baseline_mean\n");
       
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
@@ -628,7 +628,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
               node->first_detection_time >= node->first_attack_time) {
             detection_latency = (long)(node->first_detection_time - node->first_attack_time);
           }
-          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld,%ld,%ld\n",
+          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld,%ld,%ld,%.4f,%.4f\n",
                   node->id,
                   node->is_malicious,
                   node->is_monitor,
@@ -641,7 +641,9 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
                   node->hyp_test_count,
                   node->hyp_anomaly_count,
                   node->settle_test_count,
-                  node->settle_anomaly_count);
+                  node->settle_anomaly_count,
+                  node->settle_anom_q,
+                  node->settle_baseline_mean);
         }
       }
       fclose(csv_reputation);
@@ -1674,7 +1676,9 @@ int main(int argc, char *argv[]) {
    *   CLOTH_SUBSTITUTE_COUNT     : 悪意ハブ1個あたりの代役ノード数(>0で有効, 既定0=OFF)
    *   CLOTH_SUBSTITUTE_MIN_DEGREE: 対象とする悪意ハブの最小次数(既定100)
    *   CLOTH_SUBSTITUTE_MAX_LINKS : 代役1個が張る近傍リンク数の上限(既定400)
-   *   CLOTH_SUBSTITUTE_INERT=1   : 残高0=ルーティング不能で作成(baseline再現の対照) */
+   *   CLOTH_SUBSTITUTE_INERT=1   : 残高0=ルーティング不能で作成(baseline再現の対照)
+   * 配置モード CLOTH_SUBSTITUTE_ON_DETECTION(0=オラクル/1=検知トリガ)は add_substitute_hubs
+   * 内で参照する。 */
   {
     const char* sc = getenv("CLOTH_SUBSTITUTE_COUNT");
     int sub_count = (sc != NULL && sc[0] != '\0') ? atoi(sc) : 0;

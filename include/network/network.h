@@ -39,6 +39,8 @@ struct node {
   /* === Stage ① Research: Malicious Node Fields === */
   unsigned int is_malicious;        // 1 if this node is a malicious DoS attacker
   unsigned int is_substitute;       // 1 if this node is an injected honest substitute hub (topology what-if)
+  long substitute_target_hub;       // (代役ノード用) clone元の悪意ハブID。検知トリガ配置(CLOTH_SUBSTITUTE_ON_DETECTION)で使用。非代役/オラクル配置は -1
+  unsigned int substitute_activated;// (代役ノード用) 検知トリガで有効化済みなら1 (冪等ガード)
   double attack_probability;        // probability of HTLC failure when forwarding
   /* === Stage ② Research: Monitor Node Fields === */
   unsigned int is_monitor;          // 1 if this node hosts a monitoring agent
@@ -69,6 +71,7 @@ struct node {
    * までの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。 */
   double settle_baseline_mean;      // log-normal μ of settlement-forward latency
   double settle_baseline_var;       // σ² (squared-deviation EMA)
+  double settle_anom_q;             // per-node heavy-tail null: warmup で学習する log-settle-latency の(1-α)分位点。CLOTH_SETTLE_NULL_QUANTILE 時に使用(post-warmupは凍結)。0=未学習
   int    settle_suspicion;          // 異常ランダムウォーク (>=2 で報告)
   long   settle_learn_count;        // baseline 学習に使ったサンプル数(per-node warmup用)
   long   settle_test_count;         // 診断: post-warmup の決済検定総数
@@ -244,8 +247,15 @@ void initialize_malicious_nodes(struct network* network,
  * コピーしたチャネルを張る。回避で消える悪意ハブの連結性を正直ノードで補い NOPATH を抑える。
  * 新規 gsl 乱数は引かない(baseline の RNG ストリームを乱さない)。
  * inert!=0 のとき残高0=ルーティング不能で作成(=baseline完全再現の対照)。
- * 監視配置の後・results確保の前に呼ぶこと(node->results は呼び出し後に全ノード分確保する)。 */
+ * 監視配置の後・results確保の前に呼ぶこと(node->results は呼び出し後に全ノード分確保する)。
+ * env CLOTH_SUBSTITUTE_ON_DETECTION=1 のときは init 時は inert(不可視)で作り、対象ハブが
+ * 検知された時点で activate_substitute_for_hub() が容量/残高を注入して経路可能化する
+ * (反応的配置=オラクルでなく検知トリガ)。 */
 void add_substitute_hubs(struct network* network, long min_degree, int count, int max_links, int inert);
+
+/* 検知トリガの代役有効化: hub_id が「悪意と判断」された時点で呼び、init 時に inert で用意した
+ * その代役(substitute_target_hub==hub_id)を、clone元ハブの容量を注入して経路可能化する。冪等。 */
+void activate_substitute_for_hub(struct network* network, long hub_id);
 
 /* 全ノードの results (ノードID索引の結果キャッシュ) を現ノード数で確保する。
  * add_substitute_hubs の後に呼ぶ(注入で増えたノード分も含めて確保)。 */

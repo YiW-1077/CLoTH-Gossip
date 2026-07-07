@@ -32,6 +32,8 @@ struct node* new_node(long id) {
   /* === Stage ① Initialize Malicious Fields === */
   node->is_malicious = 0;
   node->is_substitute = 0;
+  node->substitute_target_hub = -1;   /* 非代役/オラクル配置。検知トリガ配置時のみ clone元ハブID を入れる */
+  node->substitute_activated = 0;
   node->attack_probability = 0.0;
   /* === Stage ② Initialize Monitor Fields === */
   node->is_monitor = 0;
@@ -55,6 +57,7 @@ struct node* new_node(long id) {
   /* === Grief-hold detection (settlement baseline) === */
   node->settle_baseline_mean = 0.0;
   node->settle_baseline_var = 0.0;
+  node->settle_anom_q = 0.0;
   node->settle_suspicion = 0;
   node->settle_learn_count = 0;
   node->settle_test_count = 0;
@@ -95,8 +98,6 @@ struct channel* new_channel(long id, long direction1, long direction2, long node
   return channel;
 }
 
-
-//struct edge* new_edge(long id, long channel_id, long counter_edge_id, long from_node_id, long to_node_id, uint64_t balance, struct policy policy, uint64_t channel_capacity){
 /* 新しいエッジ (片方向チャネル) を生成するヘルパー。
  *
  * - balance, policy, 対向 edge ID を設定
@@ -512,14 +513,29 @@ void add_substitute_hubs(struct network* network, long min_degree, int count, in
     if (count <= 0) return;
     long orig_n_nodes = array_len(network->nodes);
 
-    /* 対象ID(悪意ハブ)を先に収集(以後の配列 realloc に備えてポインタでなくIDで保持)。 */
+    /* 検知トリガ配置モード: init時はinert(不可視)で作り、対象ハブが検知された時点で
+     * activate_substitute_for_hub() が容量/残高を注入する(反応的配置)。 */
+    int on_detection = 0;
+    {
+        const char* e = getenv("CLOTH_SUBSTITUTE_ON_DETECTION");
+        on_detection = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0);
+    }
+
+    /* 対象IDを先に収集(以後の配列 realloc に備えてポインタでなくIDで保持)。
+     * オラクル配置(既定): is_malicious な高次数ハブのみ(地上真値使用)。
+     * 検知トリガ配置(on_detection): 完全非オラクル=全高次数ハブ(is_malicious を一切見ない,
+     *   監視ノードは自陣なので除外)に inert で用意し、検知されたものだけ後で有効化する。
+     *   誤検知された正直ハブにも代役が付く=真の反応的配置。 */
     long* target_ids = malloc(sizeof(long) * (orig_n_nodes > 0 ? orig_n_nodes : 1));
     int n_targets = 0;
     for (long i = 0; i < orig_n_nodes; i++) {
         struct node* nd = array_get(network->nodes, i);
         if (nd == NULL) continue;
         long deg = (nd->open_edges != NULL) ? array_len(nd->open_edges) : 0L;
-        if (nd->is_malicious && deg >= min_degree) target_ids[n_targets++] = i;
+        int is_target = on_detection
+            ? (deg >= min_degree && !nd->is_monitor)      /* 非オラクル: 全高次数ハブ */
+            : (nd->is_malicious && deg >= min_degree);    /* オラクル: 悪意ハブのみ */
+        if (is_target) target_ids[n_targets++] = i;
     }
 
     long total_subs = 0, total_links = 0;
@@ -549,6 +565,7 @@ void add_substitute_hubs(struct network* network, long min_degree, int count, in
             long S_id = array_len(network->nodes);
             struct node* S = new_node(S_id);
             S->is_substitute = 1;
+            if (on_detection) S->substitute_target_hub = H_id;     /* 検知時に activate する対象 */
             network->nodes = array_insert(network->nodes, S);      /* nodes 配列 realloc 可 */
 
             /* スナップショットからチャネル(双方向2エッジ)を張る。 */
@@ -557,9 +574,11 @@ void add_substitute_hubs(struct network* network, long min_degree, int count, in
                 long e1  = array_len(network->edges);
                 long e2  = e1 + 1;
                 /* inert=完全不可視(容量・残高・htlc_maximum すべて0 → dijkstra が一切選ばない)。
-                 * balance だけ0にしても htlc_maximum が非0だと経路候補にされ失敗リトライを誘発するため。 */
-                uint64_t cap = inert ? 0 : nb_cap[k];
-                uint64_t bal = inert ? 0 : (nb_cap[k] / 2);
+                 * balance だけ0にしても htlc_maximum が非0だと経路候補にされ失敗リトライを誘発するため。
+                 * on_detection も同様に init時はinert(dormant)で作り、検知時に有効化する。 */
+                int dormant = inert || on_detection;
+                uint64_t cap = dormant ? 0 : nb_cap[k];
+                uint64_t bal = dormant ? 0 : (nb_cap[k] / 2);
                 struct channel* nch = new_channel(cid, e1, e2, S_id, nb_M[k], cap);
                 struct edge* eSM = new_edge(e1, cid, e2, S_id, nb_M[k], bal, nb_pol_SM[k], cap);
                 struct edge* eMS = new_edge(e2, cid, e1, nb_M[k], S_id, bal, nb_pol_MS[k], cap);
@@ -577,8 +596,59 @@ void add_substitute_hubs(struct network* network, long min_degree, int count, in
         }
     }
     free(target_ids);
-    printf("[Substitute Hubs] added %ld substitute nodes for %d malicious hubs (deg>=%ld), %ld links%s\n",
-           total_subs, n_targets, min_degree, total_links, inert ? " [INERT/unroutable]" : "");
+    printf("[Substitute Hubs] added %ld substitute nodes for %d %s hubs (deg>=%ld), %ld links%s\n",
+           total_subs, n_targets, on_detection ? "candidate" : "malicious", min_degree, total_links,
+           inert ? " [INERT/unroutable]" : (on_detection ? " [ON_DETECTION/dormant-until-detected, non-oracle]" : ""));
+}
+
+/* 検知トリガの代役有効化。詳細は network.h の宣言コメント参照。
+ * hub_id を clone元とする代役(substitute_target_hub==hub_id, 未有効化)の各 S<->M チャネルに、
+ * clone元ハブ H の現容量を注入して経路可能化する。冪等(既有効化はスキップ)。 */
+void activate_substitute_for_hub(struct network* network, long hub_id) {
+    if (network == NULL || hub_id < 0 || hub_id >= array_len(network->nodes)) return;
+    struct node* H = array_get(network->nodes, hub_id);
+    if (H == NULL || H->open_edges == NULL) return;
+    long n_nodes = array_len(network->nodes);
+    for (long i = 0; i < n_nodes; i++) {
+        struct node* S = array_get(network->nodes, i);
+        if (S == NULL || !S->is_substitute || S->substitute_activated) continue;
+        if (S->substitute_target_hub != hub_id) continue;
+
+        long n_se = (S->open_edges != NULL) ? array_len(S->open_edges) : 0;
+        for (long k = 0; k < n_se; k++) {
+            long eSM_id = *(long*)array_get(S->open_edges, k);
+            struct edge* eSM = array_get(network->edges, eSM_id);
+            if (eSM == NULL) continue;
+            long M = eSM->to_node_id;
+
+            /* clone元ハブ H の H->M チャネル容量を探す(H の近傍集合は静的)。 */
+            uint64_t cap = 0;
+            long n_he = array_len(H->open_edges);
+            for (long j = 0; j < n_he; j++) {
+                long eHM_id = *(long*)array_get(H->open_edges, j);
+                struct edge* eHM = array_get(network->edges, eHM_id);
+                if (eHM != NULL && eHM->to_node_id == M) {
+                    struct channel* hch = array_get(network->channels, eHM->channel_id);
+                    if (hch != NULL) cap = hch->capacity;
+                    break;
+                }
+            }
+            if (cap == 0) continue;  /* 対応するハブ辺が無ければスキップ */
+
+            struct edge* eMS = array_get(network->edges, eSM->counter_edge_id);
+            struct channel* sch = array_get(network->channels, eSM->channel_id);
+            if (sch != NULL) sch->capacity = cap;   /* CLOTH_ORIGINAL の estimate_capacity 経路 */
+            eSM->balance = cap / 2;                  /* balance チェック(両方向) */
+            if (eMS != NULL) eMS->balance = cap / 2;
+            /* htlc_maximum_msat も戻す(CHANNEL_UPDATE ルーティング法での堅牢性; CLOTH_ORIGINAL では未使用)。 */
+            for (struct element* it = eSM->channel_updates; it != NULL; it = it->next)
+                ((struct channel_update*)it->data)->htlc_maximum_msat = cap;
+            if (eMS != NULL)
+                for (struct element* it = eMS->channel_updates; it != NULL; it = it->next)
+                    ((struct channel_update*)it->data)->htlc_maximum_msat = cap;
+        }
+        S->substitute_activated = 1;
+    }
 }
 
 

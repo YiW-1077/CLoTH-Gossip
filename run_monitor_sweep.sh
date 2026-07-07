@@ -95,7 +95,7 @@ timestamp=$(date "+%Y%m%d%H%M%S")
 # ---------------------------------------------------------------------------
 # Fixed parameters
 # ---------------------------------------------------------------------------
-N_PAYMENTS=(200 400 800 1600 3200 6400 12800)
+N_PAYMENTS=(200 400 800 1600 3200 6400 12800 25600 51200 102400)
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=1.0
 TOP_HUB_COUNT=10
@@ -122,7 +122,7 @@ echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA 
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
 #   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
 # (8ce7590 で hold(2) に設定後、cb27298 で意図せず 3 に戻っていたのを再修正)
-ATTACK_MODE=2
+ATTACK_MODE=3
 GRIEF_HOLD_RATIO=0.5   # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ---------------------------------------------------------------------------
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
@@ -138,14 +138,33 @@ echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETE
 # ⚠️注意: 代役は「現実網では作れない正直容量」の上限measurement。method1/2 の成績には配備不能な
 #   代役容量分が含まれる(hub-soft/boost抑制のような配備可能ポリシーとは別クラス)。結果解釈時に留意。
 # 既定ON(=1)。全モードrealisticにしたい場合は SUBSTITUTE_COUNT=0 を env で指定して無効化。
+# 配置モード SUBSTITUTE_ON_DETECTION: 0=オラクル配置(既定, init時から有効, what-if上限) /
+#   1=検知トリガ(非オラクル, 対象ハブが検知された時点で有効化, 配備現実寄り)。防御モードの
+#   env に明示的に固定するので、ユーザシェルにグローバル export があっても化けない(遮蔽)。
 # env をグローバル export せず、手法別に per-run コマンドへプレフィックスする(下の method ループ参照)。
 SUBSTITUTE_COUNT="${SUBSTITUTE_COUNT:-1}"
+SUBSTITUTE_ON_DETECTION="${SUBSTITUTE_ON_DETECTION:-0}"   # 0=オラクル(既定) / 1=検知トリガ(非オラクル)
 SUB_ENV_DEFENSE=""   # 防御モード(method1/2)にだけ付けるenv。disableには付けない。
 if [ "$SUBSTITUTE_COUNT" -gt 0 ] 2>/dev/null; then
-    SUB_ENV_DEFENSE="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=${SUBSTITUTE_MIN_DEGREE:-100} CLOTH_SUBSTITUTE_MAX_LINKS=${SUBSTITUTE_MAX_LINKS:-400}"
-    echo "[Config] 代役ハブ 既定ON(防御モードのみ・baselineは対照, what-if上限): $SUB_ENV_DEFENSE  ※配備可能策ではない"
+    SUB_ENV_DEFENSE="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=${SUBSTITUTE_MIN_DEGREE:-100} CLOTH_SUBSTITUTE_MAX_LINKS=${SUBSTITUTE_MAX_LINKS:-400} CLOTH_SUBSTITUTE_ON_DETECTION=$SUBSTITUTE_ON_DETECTION"
+    if [ "$SUBSTITUTE_ON_DETECTION" = "1" ]; then sub_mode_lbl="検知トリガ(非オラクル)"; else sub_mode_lbl="オラクル配置(init時から有効)"; fi
+    echo "[Config] 代役ハブ 既定ON(防御モードのみ・baselineは対照, what-if上限): $SUB_ENV_DEFENSE  配置=$sub_mode_lbl ※配備可能策ではない"
 else
     echo "[Config] 代役ハブ OFF (SUBSTITUTE_COUNT=0 指定・全モードrealistic baseline)。"
+fi
+
+# 決済(hold)検知の per-node heavy-tail null。既定ON。各ノードが warmup 中に自分の
+# (1-α)決済レイテンシ分位点 settle_anom_q を学習し post-warmup 凍結→多忙ハブの重い裾を
+# 自ノード baseline で吸収し、高nの誤検知(FP)を潰す(precision 87%→99.6% @ n=25600-102400,
+# seed7で確認)。代役ハブとは独立。防御モード(method1/2)のみに適用(no_defenseは検知OFFで
+# 無関係)。旧グローバル lognormal null に戻したい場合は env SETTLE_QUANTILE_NULL=0。
+SETTLE_QUANTILE_NULL="${SETTLE_QUANTILE_NULL:-1}"
+if [ "$SETTLE_QUANTILE_NULL" = "1" ]; then
+    DETECT_ENV_DEFENSE="CLOTH_SETTLE_NULL_QUANTILE=true"
+    echo "[Config] per-node heavy-tail null 既定ON(防御モードのみ): $DETECT_ENV_DEFENSE"
+else
+    DETECT_ENV_DEFENSE=""
+    echo "[Config] per-node heavy-tail null OFF (SETTLE_QUANTILE_NULL=0)。旧lognormal nullにフォールバック。"
 fi
 
 # ---------------------------------------------------------------------------
@@ -389,69 +408,7 @@ mkdir -p "$output_base" || {
 # ---------------------------------------------------------------------------
 remote_output_base=""
 if [[ -n "$remote_arg" ]]; then
-    if [[ "$remote_arg" == smb://172.20.86.110/public1/* ]]; then
-        mount_path="/Volumes/public1"
-
-        if ! mount | grep -q "on $mount_path"; then
-            echo "NAS not mounted. Attempting to mount..."
-            echo "[DEBUG] Mount path: $mount_path"
-            echo "[DEBUG] Current mounts:"
-            mount | grep -E "public1|smbfs" || echo "[DEBUG] No SMB mounts found"
-
-            mkdir -p "$mount_path" 2>/dev/null || {
-                echo "[ERROR] Cannot create mount directory: $mount_path"
-                remote_arg=""
-            }
-
-            if [[ -n "$remote_arg" ]]; then
-                echo "[DEBUG] Created/verified mount directory: $mount_path"
-                ls -ld "$mount_path" 2>/dev/null || true
-
-                echo "[DEBUG] Attempt 1: Mounting without credentials..."
-                if mount_smbfs "//morinolab@172.20.86.110/public1" "$mount_path" 2>/tmp/mount_debug.log; then
-                    echo "[DEBUG] Mount successful!"
-                else
-                    mount_error=$(cat /tmp/mount_debug.log 2>/dev/null || echo "Unknown error")
-                    echo "[DEBUG] Mount failed (attempt 1): $mount_error"
-
-                    echo "[DEBUG] Attempt 2: Mounting with credentials..."
-                    if [[ -n "$SMB_PASSWORD" ]]; then
-                        smbpass="$SMB_PASSWORD"
-                        echo "[DEBUG] Using SMB_PASSWORD environment variable"
-                    else
-                        read -sp "Enter SMB password for morinolab: " smbpass
-                        echo ""
-                    fi
-
-                    smbpass_escaped=$(echo "$smbpass" | sed 's/[&/\]/\\&/g')
-
-                    if mount_smbfs "//morinolab:${smbpass_escaped}@172.20.86.110/public1" "$mount_path" 2>/tmp/mount_debug2.log; then
-                        echo "[DEBUG] Mount successful with credentials!"
-                    else
-                        mount_error=$(cat /tmp/mount_debug2.log 2>/dev/null || echo "Unknown error")
-                        echo "[ERROR] Cannot mount NAS at $mount_path"
-                        echo "[DEBUG] Mount error: $mount_error"
-                        echo ""
-                        echo "[DEBUG] Network diagnostics:"
-                        ping -c 1 172.20.86.110 2>/dev/null && echo "  ✓ Host 172.20.86.110 is reachable" || echo "  ✗ Host 172.20.86.110 is NOT reachable"
-                        echo ""
-                        echo "      To mount manually, run:"
-                        echo "      mount_smbfs '//morinolab:PASSWORD@172.20.86.110/public1' '$mount_path'"
-                        echo ""
-                        echo "      Or set SMB_PASSWORD environment variable:"
-                        echo "      export SMB_PASSWORD='your_password'"
-                        echo "      ./run_monitor_sweep.sh <seed> <output_dir> <remote_path>"
-                        remote_arg=""
-                        rm -f /tmp/mount_debug.log /tmp/mount_debug2.log
-                    fi
-                fi
-            fi
-        fi
-
-        if [[ -n "$remote_arg" ]]; then
-            remote_arg="/Volumes/public1/${remote_arg#smb://172.20.86.110/public1/}"
-        fi
-    elif [[ "$remote_arg" == smb://* ]]; then
+    if [[ "$remote_arg" == smb://* ]]; then
         echo "WARN: unsupported SMB URI format: $remote_arg"
         echo "      mount SMB first and pass local mount path (e.g. /Volumes/public1/...)."
         remote_arg=""
@@ -742,13 +699,13 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                         strategy_val="method1"
                         monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
-                        sub_env="$SUB_ENV_DEFENSE"       # 防御モードに代役(有効時のみ非空)
+                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
                         ;;
                     monitor_method2)
                         strategy_val="method2"
                         monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
-                        sub_env="$SUB_ENV_DEFENSE"       # 防御モードに代役(有効時のみ非空)
+                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
                         ;;
                     *)
                         echo "ERROR: Unknown monitoring method: $method"

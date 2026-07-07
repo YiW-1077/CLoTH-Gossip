@@ -49,20 +49,16 @@ static uint64_t sample_base_forward_delay(struct simulation* simulation, struct 
                      gsl_ran_ugaussian(simulation->random_generator)));
 }
 
-/* 攻撃側の warmup 判定は payment->is_warmup(cloth.c で先頭500件固定) に一本化した。
- * 旧 get_attack_warmup_threshold(完了数 processed_payments と比較) は開始index基準の
- * is_warmup と乖離し小 n で不整合を起こしたため撤去。検知器側の warmup 保護は
- * monitoring.c::get_warmup_payments (CLOTH_WARMUP_PAYMENTS) が別途担う。 */
+/* 攻撃側の warmup 判定は payment->is_warmup(cloth.c で先頭500件を固定)に一本化。
+ * 旧 get_attack_warmup_threshold は完了数 processed_payments と比較していたが、完了数は
+ * 決済の in-flight 重なりで開始index基準の is_warmup から乖離し、小 n では計測窓の決済が
+ * settle する時点でも完了数がしきい値(500)に届かず攻撃遅延が一切注入されない不整合を
+ * 起こした(n=200 は総700件でも完了数が最大432止まり→no_defense の grief=0 の根因)。よって
+ * 撤去し、ゲートを is_warmup に揃えた(判定は呼び出し側 apply_attack_delay_if_needed)。
+ * 検知器側の warmup 保護は monitoring.c::get_warmup_payments が別途担う。 */
 
-/* 攻撃遅延の発動判定 (config チェックのみ; warmup 判定は呼び出し側で per-payment)。
- * 時刻窓 [start_time,+duration] は既定窓が warmup にほぼ収まり信号が乗らなかったため廃止。
- * ⚠️ 旧実装は processed_payments(=完了数) >= warmup しきい値(500) でゲートしていたが、
- * warmup は「開始順の先頭 N 件」(payment->is_warmup, cloth.c) で定義されるのに完了数は
- * 決済の in-flight 重なりで大きく遅延するため、小 n では計測窓の決済が settle する時点
- * でも完了数がしきい値に届かず攻撃遅延が一切注入されない不整合があった (n=200 総700件で
- * 完了数が最大432止まり→no_defense の grief=0 の根因)。そこで warmup ゲートを完了数でなく
- * payment->is_warmup(=開始index基準=warmup定義そのもの) に揃える (呼び出し側 apply_
- * attack_delay_if_needed で判定)。小 n を正し、大 n は境界僅少差のみ。 */
+/* 攻撃遅延の発動判定(config チェックのみ; warmup 判定は呼び出し側で per-payment)。
+ * 時刻窓 [start_time,+duration] は既定窓が warmup にほぼ収まり信号が乗らず廃止。 */
 static unsigned int is_attack_delay_active(struct network_params net_params) {
   if (!net_params.enable_network_attack_delay) return 0;
   if (net_params.attack_delay_intensity <= 1.0 && net_params.attack_delay_jitter <= 0.0) return 0;
@@ -684,12 +680,10 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
         );
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
-        /* 分母正常化: 検知が報告可能になる post-warmup の攻撃のみ first_attack_time を
-         * 立てる。warmup 中の失敗攻撃は仮説検定が抑制され報告できないため、recall の分母
-         * (observable_attacked = 観測×攻撃) に数えると検知器を不当に減点する(=測定
-         * アーティファクト)。ゲートは payment->is_warmup で判定する: 旧実装の完了数
-         * processed_payments>=しきい値 は決済 in-flight 重なりで開始index(=warmup 定義)と
-         * 乖離し、小 n で分母が過小/0 になる不整合があった (injection ゲートと同じ根因)。 */
+        /* 分母正常化: 検知が報告可能になる post-warmup の攻撃のみ first_attack_time を立てる。
+         * warmup 中の失敗攻撃は仮説検定が抑制され報告できないため、recall 分母
+         * (observable_attacked=観測×攻撃)に数えると検知器を不当に減点する(測定アーティファクト)。
+         * ゲートは is_warmup(injection ゲートと同根: 完了数基準は小 n で分母が過小/0 になる)。 */
         if (first_hop_node->first_attack_time == 0 && !payment->is_warmup) {
           first_hop_node->first_attack_time = attack_event_time;
         }
