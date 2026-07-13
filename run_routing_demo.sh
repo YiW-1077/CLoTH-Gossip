@@ -214,21 +214,41 @@ for m in "${SELECTED[@]}"; do
   run_method "$m"
 done
 
-# ── 完了メッセージ & 可視化の案内 ─────────────────────────────────────────
+# ── 完了メッセージ ───────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
-echo " すべて完了しました。"
+echo " シミュレーション完了。可視化アプリを起動します。"
 echo "============================================================"
-echo ""
-echo "▼ 可視化アプリで観察する手順:"
-echo "   1) ターミナルで可視化アプリを起動:"
-echo "        cd $PROJECT_ROOT/repro_out_fig"
-echo "        .venv/bin/streamlit run cloth_sim_viz_app.py"
-echo "   2) ブラウザ(http://localhost:8501)の左サイドバー「結果ディレクトリのパス」に"
-echo "      下記のいずれかを貼り付けて「読み込み＆構築」→「▶再生」:"
-for m in "${SELECTED[@]}"; do
-  echo "        $OUT_BASE/$m"
-done
-echo ""
 echo "   ※ 決済は「①送金(青・行き)」→「②決済確定(緑・帰り)」の往復で表示されます。"
 echo "     手法によって選ばれる経路(通るノード)が変わる様子を見比べてください。"
+if [ ${#SELECTED[@]} -gt 1 ]; then
+  echo "   ※ 複数手法を実行しました。他手法を見るときはサイドバーのパスを貼り替えてください："
+  for m in "${SELECTED[@]}"; do echo "        $OUT_BASE/$m"; done
+fi
+
+# ── 可視化アプリを起動（デモ出力を自動読み込み）─────────────────────────────
+VIZ_DIR="$PROJECT_ROOT/repro_out_fig"
+# 最初に実行した手法の出力をアプリの初期表示にする（環境変数で連携）
+export CLOTH_VIZ_DIR="$OUT_BASE/${SELECTED[0]}"
+
+# config を先に元へ戻す（この後アプリが長時間フォアグラウンドで動くため）
+restore_config
+trap - EXIT   # 復元済みなので EXIT トラップは解除
+
+# streamlit を探す（教育用ブランチには .venv が無い場合があるためフォールバック）
+if [ -x "$VIZ_DIR/.venv/bin/streamlit" ]; then
+  STREAMLIT="$VIZ_DIR/.venv/bin/streamlit"
+elif command -v streamlit >/dev/null 2>&1; then
+  STREAMLIT="streamlit"
+else
+  echo ""
+  echo "[注意] streamlit が見つかりません。次でインストール後、手動起動してください："
+  echo "        pip install streamlit"
+  echo "        cd $VIZ_DIR && streamlit run cloth_sim_viz_app.py"
+  exit 0
+fi
+
+echo ""
+echo "ブラウザで http://localhost:8501 が開きます（初期表示: ${SELECTED[0]}）。"
+echo "停止するにはこのターミナルで Ctrl-C を押してください。"
+cd "$VIZ_DIR" && "$STREAMLIT" run cloth_sim_viz_app.py

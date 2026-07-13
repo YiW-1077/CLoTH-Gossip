@@ -72,6 +72,9 @@ def load_data(results_dir: str, rep_override: str = "", _progress=None):
     def report(frac, text):
         if _progress: _progress(frac, text)
 
+    # 末尾スラッシュの有無で挙動が変わらないよう正規化（例: .../cloth_original/ → .../cloth_original）
+    results_dir = results_dir.rstrip("/").rstrip("\\")
+
     edg_path = f"{results_dir}/edges_output.csv"
     pay_path = f"{results_dir}/payments_output.csv"
     for p in (edg_path, pay_path):
@@ -647,6 +650,9 @@ resizeAll(); redraw();
 # ── サイドバー ────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### CLoTH-Gossip 可視化")
+    # run_routing_demo.sh から CLOTH_VIZ_DIR で渡された出力先を初期値にする
+    if "results_dir_input" not in st.session_state:
+        st.session_state["results_dir_input"] = os.environ.get("CLOTH_VIZ_DIR", "")
     results_dir = st.text_input("結果ディレクトリのパス",
         placeholder="/path/to/results/dir", key="results_dir_input")
     rep_override = st.text_input("評判ファイル（任意・攻撃者識別用）",
@@ -673,6 +679,12 @@ with st.sidebar:
 """, unsafe_allow_html=True)
 
 # ── メイン ────────────────────────────────────────────────────────
+# 環境変数 CLOTH_VIZ_DIR が指定されていれば初回に自動読み込み（デモ連携）
+_env_dir = os.environ.get("CLOTH_VIZ_DIR", "")
+if _env_dir and "loaded_dir" not in st.session_state:
+    st.session_state.loaded_dir = _env_dir
+    st.session_state.loaded_rep = ""
+
 if load_btn and results_dir:
     st.session_state.loaded_dir = results_dir
     st.session_state.loaded_rep = rep_override or ""
