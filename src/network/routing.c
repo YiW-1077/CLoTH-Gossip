@@ -48,6 +48,70 @@ struct element* jobs=NULL;
 /* === Stage ④: Global RBR Parameters === */
 struct network_params* global_net_params = NULL;
 
+/* === 教育用: 実際の経路探索(Dijkstra)の探索過程を記録して可視化に渡す ===
+ * env CLOTH_LOG_SEARCH=true のとき、各支払いを実際に routing した Dijkstra が
+ * ノードを確定した順序(=探索の波面)を payment 単位で記録する。出力(payments_output)
+ * には探索過程が残らない(最終経路のみ)ため、これが「実際の経路探索と全く同じ」波面を
+ * 再生する唯一の手段。既定OFF(未指定時はオーバーヘッド皆無)。後勝ちで保存するので、
+ * 最終的に採用された経路(初期一括計算 or find_path 再計算/リトライ)の探索が残る。 */
+static int   g_log_search = -1;               /* -1=未判定, 0=OFF, 1=ON */
+static long  g_search_pid[N_THREADS];         /* 各スレッドが今 routing 中の payment id */
+static long* g_search_buf[N_THREADS];         /* 各スレッドの確定ノード順バッファ(サイズ=n_nodes) */
+static long  g_search_len[N_THREADS];         /* 現在の確定数 */
+static long** g_search_orders = NULL;         /* payment 単位の最終確定ノード順 */
+static long*  g_search_order_lens = NULL;
+static long   g_search_n_payments = 0;
+static long   g_search_n_nodes = 0;
+
+int search_logging_enabled(void) {
+  if (g_log_search < 0) {
+    const char* e = getenv("CLOTH_LOG_SEARCH");
+    g_log_search = (e != NULL && strcmp(e, "true") == 0) ? 1 : 0;
+  }
+  return g_log_search;
+}
+
+void set_search_pid(int p, long payment_id) {
+  if (p >= 0 && p < N_THREADS) g_search_pid[p] = payment_id;
+}
+
+/* 1 回の Dijkstra が hops を返す直前に呼ぶ: 確定ノード順を payment 単位で保存(後勝ち)。 */
+static void store_search_order(int p) {
+  long pid, n;
+  if (p < 0 || p >= N_THREADS || g_search_orders == NULL) return;
+  pid = g_search_pid[p];
+  if (pid < 0 || pid >= g_search_n_payments) return;
+  n = g_search_len[p];
+  if (g_search_orders[pid] != NULL) free(g_search_orders[pid]);
+  g_search_orders[pid] = malloc(sizeof(long) * (n > 0 ? n : 1));
+  memcpy(g_search_orders[pid], g_search_buf[p], sizeof(long) * n);
+  g_search_order_lens[pid] = n;
+}
+
+/* シミュレーション終了後(write_output の後)に一度呼ぶ。search_log.csv を書く。 */
+void write_search_log(char output_dir_name[]) {
+  char fn[256];
+  FILE* f;
+  long i, j;
+  if (!search_logging_enabled() || g_search_orders == NULL) return;
+  strcpy(fn, output_dir_name);
+  strcat(fn, "search_log.csv");
+  f = fopen(fn, "w");
+  if (f == NULL) { printf("[search-log] open failed: %s\n", fn); return; }
+  fprintf(f, "payment_id,settled_order\n");
+  for (i = 0; i < g_search_n_payments; i++) {
+    if (g_search_orders[i] == NULL) continue;
+    fprintf(f, "%ld,", i);
+    for (j = 0; j < g_search_order_lens[i]; j++) {
+      if (j) fputc(' ', f);
+      fprintf(f, "%ld", g_search_orders[i][j]);
+    }
+    fputc('\n', f);
+  }
+  fclose(f);
+  printf("[search-log] wrote %s (%ld payments)\n", fn, g_search_n_payments);
+}
+
 
 /* intialize the data structures of dijkstra and the jobs to be executed by the dijkstra threads
  *
@@ -76,6 +140,21 @@ void initialize_dijkstra(long n_nodes, long n_edges, struct array* payments) {
     jobs = push(jobs, &(payment->id));
   }
 
+  /* 探索過程ログ用バッファ(env CLOTH_LOG_SEARCH=true のときだけ確保) */
+  if (search_logging_enabled()) {
+    int t;
+    g_search_n_nodes = n_nodes;
+    g_search_n_payments = array_len(payments);
+    g_search_orders = malloc(sizeof(long*) * g_search_n_payments);
+    g_search_order_lens = malloc(sizeof(long) * g_search_n_payments);
+    for (i = 0; i < g_search_n_payments; i++) { g_search_orders[i] = NULL; g_search_order_lens[i] = 0; }
+    for (t = 0; t < N_THREADS; t++) {
+      g_search_buf[t] = malloc(sizeof(long) * n_nodes);
+      g_search_len[t] = 0;
+      g_search_pid[t] = -1;
+    }
+    printf("[search-log] enabled: recording Dijkstra exploration for %ld payments\n", g_search_n_payments);
+  }
 }
 
 /* a dijkstra thread finds a path for a payment by calling dijkstra
@@ -102,6 +181,7 @@ void* dijkstra_thread(void*arg) {
     pthread_mutex_lock(&data_mutex);
     payment = array_get(thread_args->payments, payment_id);
     pthread_mutex_unlock(&data_mutex);
+    if (g_log_search == 1) set_search_pid(thread_args->data_index, payment->id);  /* この探索の payment を記録用に設定 */
     hops = dijkstra(payment->sender, payment->receiver, payment->amount, thread_args->network, thread_args->current_time, thread_args->data_index, &error, thread_args->routing_method, NULL, payment->max_fee_limit);
     paths[payment->id] = hops;
   }
@@ -488,10 +568,15 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
 
   distance_heap[p] =  heap_insert_or_update(distance_heap[p], &distance[p][target], compare_distance, is_key_equal);
 
+  if (g_log_search == 1 && p >= 0 && p < N_THREADS) g_search_len[p] = 0;  /* この探索の確定順を新規記録 */
+
   while(heap_len(distance_heap[p])!=0) {
 
     d = heap_pop(distance_heap[p], compare_distance);
     best_node_id = d->node;
+    /* 確定した順(探索の波面)を記録。source は最後の確定として含める。 */
+    if (g_log_search == 1 && p >= 0 && p < N_THREADS && g_search_len[p] < g_search_n_nodes)
+      g_search_buf[p][g_search_len[p]++] = best_node_id;
     if(best_node_id==source) break;
 
     to_node_dist = distance[p][best_node_id];
@@ -666,6 +751,8 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
     *error = NOPATH;
     return NULL;
   }
+
+  if (g_log_search == 1) store_search_order(p);  /* この探索(採用された経路)の確定順を保存 */
 
   return hops;
 }

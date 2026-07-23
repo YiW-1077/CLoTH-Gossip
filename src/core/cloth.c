@@ -1998,6 +1998,9 @@ int main(int argc, char *argv[]) {
 
   write_output(network, payments, output_dir_name);
 
+  /* 教育用: 実際の経路探索の探索過程(env CLOTH_LOG_SEARCH=true のとき) */
+  write_search_log(output_dir_name);
+
     list_free(group_add_queue);
     gsl_rng_free(rng_malicious);
     gsl_rng_free(rng_payment);

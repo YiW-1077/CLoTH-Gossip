@@ -338,6 +338,8 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
   
   payment = event->payment;
 
+  if (search_logging_enabled()) set_search_pid(0, payment->id);  /* この payment の探索を記録用に設定(p=0) */
+
   ++(payment->attempts);
 
   if(net_params.payment_timeout != -1 && simulation->current_time > payment->start_time + net_params.payment_timeout) {

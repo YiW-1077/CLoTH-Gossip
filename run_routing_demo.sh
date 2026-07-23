@@ -29,6 +29,11 @@ ROUTING_METHOD=all
 # ── 実験パラメータ（自由に編集してよい）──────────────────────────────────
 N_PAYMENTS=2000     # 決済数。多いほど時間がかかる（2000で約17秒/手法）
 SEED=42             # 乱数シード（同じ値なら毎回同じ結果になる = 再現性）
+# 末尾で起動する可視化アプリ:
+#   search  : 経路探索(Dijkstra)の可視化 … 探索がどう広がり最短経路が決まるかを見る
+#   flow    : 決済の流れの可視化           … ①送金→②決済確定の往復を時系列で見る
+#   compare : 4手法くらべ                  … 手法で経路が分かれた送金を1件ずつ比較(要 ROUTING_METHOD=all)
+VIZ_APP=compare
 # =========================================================================
 
 # ── パス設定（このスクリプトの場所を基準に自動決定）───────────────────────
@@ -44,6 +49,9 @@ OUT_BASE="$PROJECT_ROOT/repro_out_fig/routing_demo"
 #   開始時にバックアップし、終了時（正常/異常/Ctrl-C いずれでも）に必ず復元します。
 # ─────────────────────────────────────────────────────────────────────────
 CONFIG_BACKUP="/tmp/cloth_input_demo_backup.$$"
+# ビルドログは実行ごとに一意なパスへ（共有Macで他ユーザ所有の固定名ファイルと衝突し
+# Permission denied になるのを防ぐ）。$$=PID で各実行・各ユーザ固有。
+BUILD_LOG="${TMPDIR:-/tmp}/routing_demo_build.$$.log"
 if [ -f "$CONFIG" ]; then cp "$CONFIG" "$CONFIG_BACKUP"; fi
 restore_config() {
   if [ -f "$CONFIG_BACKUP" ]; then
@@ -102,7 +110,7 @@ group_broadcast_delay=0
 payments_filename=
 payment_rate=1
 n_payments=$N_PAYMENTS
-average_payment_amount=100
+average_payment_amount=2000
 variance_payment_amount=10
 average_max_fee_limit=-1
 variance_max_fee_limit=-1
@@ -159,9 +167,11 @@ run_method() {
   # PROJECT_ROOT をカレントにして実行する。
   #   CLoTH_Gossip はカレントの config/cloth_input.txt を読むため、必ずここで実行する。
   #   (build ディレクトリで実行すると CMake がコピーした別の設定が読まれてしまう)
+  #   CLOTH_LOG_SEARCH=true: 実際の経路探索(Dijkstra)の探索過程を search_log.csv に記録する。
+  #     → 可視化アプリが「実際の探索と全く同じ」波面を再生できる(再現ではなく本物)。
   local start end
   start=$(date +%s)
-  ( cd "$PROJECT_ROOT" && GSL_RNG_SEED=$SEED "$BINARY" "$outdir/" ) \
+  ( cd "$PROJECT_ROOT" && GSL_RNG_SEED=$SEED CLOTH_LOG_SEARCH=true "$BINARY" "$outdir/" ) \
       > "$outdir/run_stdout.log" 2>&1
   end=$(date +%s)
 
@@ -179,11 +189,11 @@ run_method() {
 # ── ビルド（バイナリが無い or ソースが新しければ）─────────────────────────
 build_if_needed() {
   echo "[ビルド] CLoTH_Gossip をビルドします..."
-  if cmake --build "$BUILD_DIR" > /tmp/routing_demo_build.log 2>&1; then
+  if cmake --build "$BUILD_DIR" > "$BUILD_LOG" 2>&1; then
     echo "[ビルド] 完了。"
   else
-    echo "[エラー] ビルドに失敗しました。ログ: /tmp/routing_demo_build.log"
-    tail -15 /tmp/routing_demo_build.log
+    echo "[エラー] ビルドに失敗しました。ログ: $BUILD_LOG"
+    tail -15 "$BUILD_LOG"
     exit 1
   fi
 }
@@ -214,14 +224,33 @@ for m in "${SELECTED[@]}"; do
   run_method "$m"
 done
 
+# ── 起動する可視化アプリを決定（VIZ_APP）──────────────────────────────────
+case "$VIZ_APP" in
+  search)  APP_FILE="dijkstra_viz_app.py";  APP_DESC="経路探索(Dijkstra)の可視化" ;;
+  flow)    APP_FILE="cloth_sim_viz_app.py"; APP_DESC="決済の流れの可視化" ;;
+  compare) APP_FILE="routing_compare_app.py"; APP_DESC="4手法くらべ(経路の違い)"
+           if [ ${#SELECTED[@]} -lt 4 ]; then
+             echo "[注意] VIZ_APP=compare は4手法の比較です。ROUTING_METHOD=all で全手法を実行してください。"
+             echo "        現在の実行対象: ${SELECTED[*]}"
+           fi ;;
+  *)       echo "[エラー] VIZ_APP は search / flow / compare のいずれかを指定してください（現在: '$VIZ_APP'）"; exit 1 ;;
+esac
+
 # ── 完了メッセージ ───────────────────────────────────────────────────────
 echo ""
 echo "============================================================"
-echo " シミュレーション完了。可視化アプリを起動します。"
+echo " シミュレーション完了。$APP_DESC を起動します。"
 echo "============================================================"
-echo "   ※ 決済は「①送金(青・行き)」→「②決済確定(緑・帰り)」の往復で表示されます。"
-echo "     手法によって選ばれる経路(通るノード)が変わる様子を見比べてください。"
-if [ ${#SELECTED[@]} -gt 1 ]; then
+if [ "$VIZ_APP" = "search" ]; then
+  echo "   ※ 受信者(中心)から探索が波状に広がり、送信者(外周)に到達→最短経路を強調表示。"
+  echo "     ▶再生で確定ノードが順に光ります。コスト基準を変えると選ばれる経路が変わります。"
+elif [ "$VIZ_APP" = "compare" ]; then
+  echo "   ※ 4手法の実経路を比べ、手法で経路が分かれた送金を1件ずつ表示します。"
+  echo "     ⏮前/次⏭で移動。手法差は estimate_capacity(容量の見積もり方)の違いだけです。"
+else
+  echo "   ※ 決済は「①送金(青・行き)」→「②決済確定(緑・帰り)」の往復で表示されます。"
+fi
+if [ "$VIZ_APP" != "compare" ] && [ ${#SELECTED[@]} -gt 1 ]; then
   echo "   ※ 複数手法を実行しました。他手法を見るときはサイドバーのパスを貼り替えてください："
   for m in "${SELECTED[@]}"; do echo "        $OUT_BASE/$m"; done
 fi
@@ -244,11 +273,11 @@ else
   echo ""
   echo "[注意] streamlit が見つかりません。次でインストール後、手動起動してください："
   echo "        pip install streamlit"
-  echo "        cd $VIZ_DIR && streamlit run cloth_sim_viz_app.py"
+  echo "        cd $VIZ_DIR && streamlit run $APP_FILE"
   exit 0
 fi
 
 echo ""
 echo "ブラウザで http://localhost:8501 が開きます（初期表示: ${SELECTED[0]}）。"
 echo "停止するにはこのターミナルで Ctrl-C を押してください。"
-cd "$VIZ_DIR" && "$STREAMLIT" run cloth_sim_viz_app.py
+cd "$VIZ_DIR" && "$STREAMLIT" run "$APP_FILE"

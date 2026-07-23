@@ -20,6 +20,11 @@ extern struct element* jobs;
 /* === Stage ④: Global RBR Parameters === */
 extern struct network_params* global_net_params;
 
+/* === 教育用: 実際の経路探索(Dijkstra)の探索過程を記録して可視化に渡す(env CLOTH_LOG_SEARCH=true) === */
+int  search_logging_enabled(void);
+void set_search_pid(int p, long payment_id);
+void write_search_log(char output_dir_name[]);
+
 struct thread_args{
   struct network* network;
   struct array* payments;
