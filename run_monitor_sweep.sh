@@ -95,7 +95,7 @@ timestamp=$(date "+%Y%m%d%H%M%S")
 # ---------------------------------------------------------------------------
 # Fixed parameters
 # ---------------------------------------------------------------------------
-N_PAYMENTS=(200 400 800 1600 3200 6400 12800 25600 51200 102400)
+N_PAYMENTS=(50 100 200 400 800 1600 3200 6400 12800)
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=1.0
 TOP_HUB_COUNT=10
@@ -122,7 +122,7 @@ echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA 
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
 #   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
 # (8ce7590 で hold(2) に設定後、cb27298 で意図せず 3 に戻っていたのを再修正)
-ATTACK_MODE=3
+ATTACK_MODE=2
 GRIEF_HOLD_RATIO=0.5   # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ---------------------------------------------------------------------------
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
