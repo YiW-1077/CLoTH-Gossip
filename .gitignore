@@ -72,3 +72,5 @@ tasks.json
 # ローカル作業用(追跡しない)
 /CLAUDE.md
 /repro_out_fig/
+/.agents/
+/.claude/
