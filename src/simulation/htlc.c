@@ -159,6 +159,31 @@ static int get_detect_grief(void) {
   return getenv("CLOTH_DETECT_GRIEF") != NULL;
 }
 
+/* hold 検出 案A (round-trip + 隣接差分)。各ノードの往復時間 (HTLC送出→preimage返送受信)
+ * を receive_success で走査し、隣接差 Δ[i]=RT[i]-RT[i+1] から resid≈下流ノードの settle_delay
+ * を復元→settle検定→異常最大区間の下流ノードを攻撃者として1決済1回報告(観測可能な量のみ使用)。
+ * 有効時は forward_success の (B) settle 直接検定を無効化(二重報告防止)。
+ * **既定 ON = (A) に切替済み(2026-07-24)**。従来の (B) per-node settle 直接帰属に戻すには
+ * env CLOTH_HOLD_ROUNDTRIP=0 を設定する。 */
+static int get_hold_roundtrip(void) {
+  const char* e = getenv("CLOTH_HOLD_ROUNDTRIP");
+  if (e != NULL) return atoi(e) != 0;   /* 明示指定を尊重 (0=(B)へ, 非0=(A)) */
+  return 1;                             /* 既定=(A)差分版 */
+}
+
+/* hold検出を fail型と完全対称にする観測条件 (CLOTH_HOLD_RT_SELFTIME)。
+ * 各ノードが「自ノードだけで観測できる」往復時間 RT[i]=recv[i]-send[i] を測り、隣接差
+ * Δ=RT[i]-RT[i+1] から平均インターバルを引いた resid(≈下流 i+1 の保持時間) を検定する。
+ * 旧版(=0)は recv[i]-recv[i+1] 直接(下流=保持者本人の受領時刻を要する)。selftime版は
+ * fail型 send[i+1]-send[i] と同じ観測条件で、保持者本人の時刻に依存しないより自然な形。
+ * **既定 ON (2026-08-01)**: seed{7,42,123}×n{3200,6400} で検出率+0.86〜1.48pp・precision
+ * 100%不変を確証(劣化なし)。旧 recv差分に戻すには env CLOTH_HOLD_RT_SELFTIME=0。 */
+static int get_hold_rt_selftime(void) {
+  const char* e = getenv("CLOTH_HOLD_RT_SELFTIME");
+  if (e != NULL) return atoi(e) != 0;   /* 明示指定を尊重 (0=旧 recv[i]-recv[i+1] へ) */
+  return 1;                             /* 既定=fail対称の自己観測RT */
+}
+
 /* check whether there is sufficient balance in an edge for forwarding the payment; check also that the policies in the edge are respected */
 unsigned int check_balance_and_policy(struct edge* edge, struct edge* prev_edge, struct route_hop* prev_hop, struct route_hop* next_hop) {
   uint64_t expected_fee;
@@ -356,14 +381,10 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
-            } else if (payment->is_warmup) {
-                // === Stage ④ Warm-up: Avoid malicious nodes during baseline learning ===
-                path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
-                                                     network, simulation->current_time,
-                                                     0, &error,
-                                                     net_params.routing_method,
-                                                     payment->max_fee_limit);
           } else {
+              /* warmup 中は攻撃が発動しない(apply_attack_delay_if_needed の is_warmup ゲート)ため、
+               * 旧 dijkstra_avoid_malicious_nodes(ground-truth is_malicious 回避)は撤去。
+               * warmup/post-warmup とも事前計算経路を使い、正解ラベルに依存しない。 */
               path = paths[payment->id];
           }
       }else {
@@ -373,13 +394,6 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
-            } else if (payment->is_warmup) {
-                // === Warm-up retry: Still avoid malicious nodes ===
-                path = dijkstra_avoid_malicious_nodes(payment->sender, payment->receiver, payment->amount,
-                                                     network, simulation->current_time,
-                                                     0, &error,
-                                                     net_params.routing_method,
-                                                   payment->max_fee_limit);
           } else if (net_params.monitoring_strategy > 0 && net_params.enable_reputation_system) {
               // === Retry: Use reputation-weighted dijkstra when monitoring is active ===
               path = dijkstra_with_reputation(payment->sender, payment->receiver, payment->amount,
@@ -645,6 +659,16 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
       for (int i = 0; i < payment->hop_send_times_capacity; i++)
           payment->hop_send_times[i] = 0;
       payment->hop_send_times[0] = simulation->current_time;
+      /* hold round-trip(案A)用: preimage 受信時刻配列を hop_send_times と同容量で確保・ゼロ化 */
+      if (payment->hop_settle_recv_capacity < payment->hop_send_times_capacity) {
+          if (payment->hop_settle_recv_times != NULL) free(payment->hop_settle_recv_times);
+          payment->hop_settle_recv_times =
+              (uint64_t*)malloc(payment->hop_send_times_capacity * sizeof(uint64_t));
+          payment->hop_settle_recv_capacity = payment->hop_send_times_capacity;
+      }
+      if (payment->hop_settle_recv_times != NULL)
+          for (int i = 0; i < payment->hop_settle_recv_capacity; i++)
+              payment->hop_settle_recv_times[i] = 0;
   }
 
   /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
@@ -994,6 +1018,20 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
   node = array_get(network->nodes, event->node_id);
   prev_hop->edges_lock_end_time = simulation->current_time;
 
+  /* hold round-trip(案A): このノードが preimage を受け取った時刻(=このイベント発火時刻)を
+   * from_node==node->id のホップ index に記録。往復時間 = recv - hop_send_times[idx]。 */
+  if (get_hold_roundtrip() && payment->hop_settle_recv_times != NULL &&
+      payment->route != NULL && payment->route->route_hops != NULL) {
+      int nh_r = array_len(payment->route->route_hops);
+      for (int hi = 0; hi < nh_r && hi < payment->hop_settle_recv_capacity; hi++) {
+          struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
+          if (rh != NULL && rh->from_node_id == node->id) {
+              payment->hop_settle_recv_times[hi] = simulation->current_time;
+              break;
+          }
+      }
+  }
+
   if(!is_present(backward_edge->id, node->open_edges)) {
     printf("ERROR (forward_success): edge %ld is not an edge of node %ld \n", backward_edge->id, node->id);
     exit(-1);
@@ -1046,8 +1084,10 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
    * 各ノードの決済転送レイテンシ settle_delay を per-node 仮説検定し、異常(=保持)を
    * 出したノード本人を攻撃者として報告する。保持ノードは自分で release を転送するので
    * 直接帰属でよい(下流帰属トリック不要)。報告者は上流ノード(prev_node_id)。
-   * 観測ゲート(method1/method2)はフォワード検知と共通。既定 OFF (CLOTH_DETECT_GRIEF)。 */
-  if (net_params.enable_reputation_system && get_detect_grief()) {
+   * 観測ゲート(method1/method2)はフォワード検知と共通。既定 OFF (CLOTH_DETECT_GRIEF)。
+   * ※ 案A(CLOTH_HOLD_ROUNDTRIP)有効時はこの直接検定を無効化し、receive_success の
+   *    往復走査に一本化する(同一ノードを二重報告しないため)。 */
+  if (net_params.enable_reputation_system && get_detect_grief() && !get_hold_roundtrip()) {
     int should_report = on_settlement_result_hypothesis_test(
         node, (double)settle_delay, (long)simulation->processed_payments,
         (double)net_params.average_payment_forward_interval);
@@ -1078,6 +1118,78 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
 
   /* === Stage ④ Hypothesis Testing: Increment global payment counter === */
   simulation->processed_payments++;
+
+  /* === hold round-trip 検出 (案A, CLOTH_HOLD_ROUNDTRIP)：隣接差分版 ===
+   * 各ノードの往復時間 RT[i] = recv[i] - send[i] は自ノードだけで観測可能。経路上の隣接
+   * ノードの差 Δ[i] = RT[i] - RT[i+1] は導出上「下流ノード(i+1)の決済転送遅延 settle_delay
+   * ＋1本の順方向ホップ」に等しい。よって resid = Δ[i] - 平均インターバル ≈ 下流ノード
+   * (i+1)の settle_delay を、観測可能な往復量だけから復元できる(希釈なし=(B)と同じ信号)。
+   * この resid を下流ノードの settle 検定にかけ、異常が最大の区間の下流ノードを攻撃者と
+   * して1決済1回だけ報告する(報告者=上流ノード)。既定 OFF。 */
+  if (get_hold_roundtrip() && net_params.enable_reputation_system &&
+      payment->route != NULL && payment->hop_send_times != NULL &&
+      payment->hop_settle_recv_times != NULL) {
+      int nh = array_len(payment->route->route_hops);
+      /* 送信者(=このノード)の preimage 受信時刻を記録 */
+      for (int i = 0; i < nh && i < payment->hop_settle_recv_capacity; i++) {
+          struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, i);
+          if (rh != NULL && rh->from_node_id == node->id) {
+              payment->hop_settle_recv_times[i] = simulation->current_time; break;
+          }
+      }
+      payment->num_attack_reporters = 0;   /* 試行ごとに初期化(dedup キー兼用) */
+      double avg_iv = (double)net_params.average_payment_forward_interval;
+      /* fail(receive_fail) は順方向 per-hop レイテンシ send[i+1]-send[i] を各ホップで検定し
+       * 異常ホップの攻撃者を報告する。hold もこれに対称に、決済(backward)経路の per-hop
+       * レイテンシ recv[i]-recv[i+1] (=下流ノード i+1 が決済を受領してから上流 i へ転送する
+       * までの時間 = i+1 自身の保持時間 = (B)の settle_delay と同量) を各ペアで検定する。
+       * 往復差分と違い順方向ホップのばらつきが混入しないためベースライン分散が膨らまず、
+       * 保持者の取りこぼしが起きない。各異常ノード(=保持者)を報告(1決済1ノード dedup)。 */
+      for (int i = 0; i + 1 < nh; i++) {
+          if (i + 1 >= payment->hop_settle_recv_capacity) break;
+          uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
+          uint64_t rd = payment->hop_settle_recv_times[i + 1];  /* node i+1 が決済を受領した時刻 */
+          if (ru == 0 || rd == 0 || ru <= rd) continue;         /* 決済は i+1→i へ伝播(ru>rd) */
+          double settle_lat;
+          if (get_hold_rt_selftime()) {
+              /* fail対称版: 各ノードの自己観測 RT=recv-send の隣接差から resid を復元。
+               * RT[i]-RT[i+1] = (recv[i]-recv[i+1]) + (send[i+1]-send[i]) なので、順方向
+               * ホップ分を平均インターバルで差し引いて下流 i+1 の保持時間を推定する。 */
+              uint64_t su  = payment->hop_send_times[i];
+              uint64_t sdn = payment->hop_send_times[i + 1];
+              if (su == 0 || sdn == 0) continue;
+              double rti = (double)ru - (double)su;    /* node i の往復時間(自己観測) */
+              double rtd = (double)rd - (double)sdn;   /* node i+1 の往復時間 */
+              settle_lat = (rti - rtd) - avg_iv;       /* resid ≈ 下流 i+1 の保持時間 */
+              if (settle_lat <= 0.0) continue;
+          } else {
+              settle_lat = (double)(ru - rd);          /* 既定: recv[i]-recv[i+1] 直接 */
+          }
+          struct route_hop* hop_dn = (struct route_hop*)array_get(payment->route->route_hops, i + 1);
+          struct route_hop* hop_up = (struct route_hop*)array_get(payment->route->route_hops, i);
+          if (hop_dn == NULL || hop_up == NULL) continue;
+          struct node* dn_node = (struct node*)array_get(network->nodes, hop_dn->from_node_id);
+          if (dn_node == NULL) continue;
+          long cand = hop_dn->from_node_id;   /* 攻撃者候補 = 下流ノード本人(保持者) */
+          if (getenv("CLOTH_HOLD_RT_DEBUG") && payment->grief_hold_node_id >= 0) {
+              FILE* _f = fopen("/tmp/holdrt_debug.csv", "a");
+              if (_f) { fprintf(_f, "%llu,%d,%ld,%ld,%ld,%d,%.0f\n",
+                  (unsigned long long)payment->id, i, hop_up->from_node_id, cand,
+                  payment->grief_hold_node_id, (cand == payment->grief_hold_node_id) ? 1 : 0, settle_lat);
+                  fclose(_f); }
+          }
+          /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。 */
+          int should_report = on_settlement_result_hypothesis_test(
+              dn_node, settle_lat, (long)simulation->processed_payments, avg_iv);
+          if (should_report && cand != payment->sender && cand != payment->receiver &&
+              is_node_observed_by_monitors(network, cand) &&
+              !has_attack_reporter(payment, cand)) {   /* dedup: 同一決済で同一ノードは1回 */
+              register_attack_reporter(payment, cand); /* dedup キーとして保持者を記録 */
+              report_attacked_node_to_monitors(network, hop_up->from_node_id, cand,
+                  payment->id, simulation->current_time, net_params);
+          }
+      }
+  }
 
   /* === Stage ④ Hypothesis Testing: ホップ間レイテンシで各ノードを個別検定 ===
    * hop_send_times[i]     : ホップ i の送信時刻

@@ -55,6 +55,12 @@ struct payment {
   uint64_t* hop_send_times;         // array of HTLC send timestamps per hop (malloc'd size = route length)
   int hop_send_times_capacity;      // allocated size for hop_send_times
   int hop_send_times_initialized;   // flag: 1 if malloc'd, 0 if not
+  /* === hold round-trip 検出(案A, env CLOTH_HOLD_ROUNDTRIP) ===
+   * hop_settle_recv_times[i] = hop[i].from_node が preimage(鍵) を受け取った時刻。
+   * 往復時間 = hop_settle_recv_times[i] - hop_send_times[i]。forward_success /
+   * receive_success の冒頭で current_time を記録する。0 = 未記録。 */
+  uint64_t* hop_settle_recv_times;  // array of preimage-return receive timestamps per hop
+  int hop_settle_recv_capacity;     // allocated size (= hop_send_times_capacity)
 
   /* === Grief-hold attack (backward settlement delay, no fail) ===
    * 混在モードで、ある悪意ノードが「フォワードで失敗させず、決済(backward)経路で
