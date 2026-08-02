@@ -64,6 +64,21 @@ static int get_settle_null_quantile_mode() {
     char *env = getenv("CLOTH_SETTLE_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
 }
+
+/* === settle(hold) z検定用の次数σ膨張 (CLOTH_SETTLE_DEGREE_SIGMA=k, 既定0.20) ===
+ * hold検知は既定で対数正規z検定(分位点null OFF)。forward検知器と同じ次数σ膨張
+ * σ_eff = σ·(1+k·ln(1+deg)) を settle 側にも適用する。settle レイテンシ自体は次数非依存
+ * だが、高次数=高トラフィック=多重検定の露出が大きい(FWER膨張でFPを踏みやすい)ため、
+ * 次数を露出の代理として閾値を広げ、busy な正直ハブの誤検知を抑える。0 で無効(生σ)。
+ * 既定 k=0.20: settleは次数非依存ゆえ forward の k=0.04 より大きい k が必要で、n=12800 で
+ * k≈0.12-0.20 のとき per-node 分位点null と precision/recall が一致することを確認(2026-08-02)。 */
+static double get_settle_degree_sigma() {
+    char *env = getenv("CLOTH_SETTLE_DEGREE_SIGMA");
+    if (env == NULL) return 0.20;
+    double v = atof(env);
+    if (v < 0.0) return 0.0;
+    return v;
+}
 static double get_settle_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
     char *env = getenv("CLOTH_SETTLE_Q_STEP");
     if (env == NULL) return 0.05;
@@ -1145,8 +1160,16 @@ int on_settlement_result_hypothesis_test(
         double q = (node->settle_anom_q > gauss) ? node->settle_anom_q : gauss;
         anomalous = (log_lat > q);
     } else {
+        /* z検定(分位点null OFF)。forward検知器と対称に次数σ膨張を適用し、
+         * 高次数=高トラフィックの busy ハブの FWER 膨張による FP を抑える。 */
+        double sigma_eff = sd;
+        double k_deg = get_settle_degree_sigma();
+        if (k_deg > 0.0) {
+            long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
+            sigma_eff *= (1.0 + k_deg * log(1.0 + (double)deg));
+        }
         double p_value = calculate_p_value_log_normal(
-            settle_latency_ms, node->settle_baseline_mean, sd);
+            settle_latency_ms, node->settle_baseline_mean, sigma_eff);
         anomalous = (p_value < p_threshold);
     }
 

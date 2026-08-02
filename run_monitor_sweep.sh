@@ -153,18 +153,18 @@ else
     echo "[Config] 代役ハブ OFF (SUBSTITUTE_COUNT=0 指定・全モードrealistic baseline)。"
 fi
 
-# 決済(hold)検知の per-node heavy-tail null。既定ON。各ノードが warmup 中に自分の
-# (1-α)決済レイテンシ分位点 settle_anom_q を学習し post-warmup 凍結→多忙ハブの重い裾を
-# 自ノード baseline で吸収し、高nの誤検知(FP)を潰す(precision 87%→99.6% @ n=25600-102400,
-# seed7で確認)。代役ハブとは独立。防御モード(method1/2)のみに適用(no_defenseは検知OFFで
-# 無関係)。旧グローバル lognormal null に戻したい場合は env SETTLE_QUANTILE_NULL=0。
-SETTLE_QUANTILE_NULL="${SETTLE_QUANTILE_NULL:-1}"
+# 決済(hold)検知の null 模型。既定は hold も対数正規 z検定＋次数σ膨張(k=0.20)で fail検知と
+# 統一(FWER対策=次数σ膨張でbusyハブのFPを抑制)。settleは次数非依存なので fail の k=0.04 より
+# 大きい k が必要で、n=12800 で k≈0.12-0.20 のとき per-node 分位点null と precision/recall が
+# 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2)のみに適用。
+# 旧 per-node 分位点null に戻したい場合は env SETTLE_QUANTILE_NULL=1。
+SETTLE_QUANTILE_NULL="${SETTLE_QUANTILE_NULL:-0}"
 if [ "$SETTLE_QUANTILE_NULL" = "1" ]; then
     DETECT_ENV_DEFENSE="CLOTH_SETTLE_NULL_QUANTILE=true"
-    echo "[Config] per-node heavy-tail null 既定ON(防御モードのみ): $DETECT_ENV_DEFENSE"
+    echo "[Config] hold検知=per-node 分位点null (防御モードのみ): $DETECT_ENV_DEFENSE"
 else
-    DETECT_ENV_DEFENSE=""
-    echo "[Config] per-node heavy-tail null OFF (SETTLE_QUANTILE_NULL=0)。旧lognormal nullにフォールバック。"
+    DETECT_ENV_DEFENSE="CLOTH_SETTLE_DEGREE_SIGMA=${CLOTH_SETTLE_DEGREE_SIGMA:-0.20}"
+    echo "[Config] hold検知=対数正規z検定+次数σ膨張 (防御モードのみ): $DETECT_ENV_DEFENSE"
 fi
 
 # ---------------------------------------------------------------------------
