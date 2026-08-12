@@ -84,10 +84,10 @@ void write_simple_view_static_graph(struct network* network, char output_dir_nam
     return;
   }
 
-  fprintf(nodes_file, "id,is_malicious,is_monitor\n");
+  fprintf(nodes_file, "id,is_malicious,is_judge\n");
   for (long i = 0; i < array_len(network->nodes); i++) {
     struct node* node = array_get(network->nodes, i);
-    fprintf(nodes_file, "%ld,%d,%d\n", node->id, node->is_malicious, node->is_monitor);
+    fprintf(nodes_file, "%ld,%d,%d\n", node->id, node->is_malicious, node->is_judge);
   }
 
   fprintf(edges_file, "node1,node2\n");
@@ -267,9 +267,9 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
 }
 
 
-/* === Stage ② Write Monitor Placement CSV ===
+/* === Stage ② Write Judge Placement CSV ===
  *
- * Records deployment location and configuration of each monitor
+ * Records deployment location and configuration of each judge
  */
 /* === Axis-2 helpers: ノード別比率検定 p値 + 比較関数 (Benjamini-Hochberg 用) ===
  * H0: ノードの異常率 = 名目 α。対立: 異常率 > α。post-warmup の (異常数/検定数) を
@@ -299,33 +299,33 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     return;
   }
 
-  /* === Write Monitor Placement CSV === */
-  if (network->num_monitors > 0) {
+  /* === Write Judge Placement CSV === */
+  if (network->num_judges > 0) {
     char output_filename[512];
     strcpy(output_filename, output_dir_name);
-    strcat(output_filename, "monitor_placement.csv");
+    strcat(output_filename, "judge_placement.csv");
     
-    FILE* csv_monitors = fopen(output_filename, "w");
-    if (csv_monitors != NULL) {
-      fprintf(csv_monitors, "monitor_id,node_id,deployment_method,watching_hub_id,direct_hubs_count,direct_hubs_list\n");
+    FILE* csv_judges = fopen(output_filename, "w");
+    if (csv_judges != NULL) {
+      fprintf(csv_judges, "judge_id,node_id,deployment_method,watching_hub_id,direct_hubs_count,direct_hubs_list\n");
       
-      for (int i = 0; i < network->num_monitors; i++) {
-        MonitorAgent* m = &network->monitors[i];
-        fprintf(csv_monitors, "%d,%d,%d,%d,%d,",
-                m->monitor_id,
+      for (int i = 0; i < network->num_judges; i++) {
+        JudgeAgent* m = &network->judges[i];
+        fprintf(csv_judges, "%d,%d,%d,%d,%d,",
+                m->judge_id,
                 m->node_id,
                 m->deployed_at_stage,
                 m->watching_hub_id,
                 m->num_direct_hubs);
         
         for (int h = 0; h < m->num_direct_hubs; h++) {
-          if (h > 0) fprintf(csv_monitors, "|");
-          fprintf(csv_monitors, "%d", m->direct_hub_connections[h]);
+          if (h > 0) fprintf(csv_judges, "|");
+          fprintf(csv_judges, "%d", m->direct_hub_connections[h]);
         }
-        fprintf(csv_monitors, "\n");
+        fprintf(csv_judges, "\n");
       }
-      fclose(csv_monitors);
-      printf("[Output] Wrote monitor placement to %s\n", output_filename);
+      fclose(csv_judges);
+      printf("[Output] Wrote judge placement to %s\n", output_filename);
     }
   }
 
@@ -337,14 +337,14 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     
     FILE* csv_metrics = fopen(output_filename, "w");
     if (csv_metrics != NULL) {
-      /* Calculate monitoring metrics */
+      /* Calculate judging metrics */
       long total_htlcs_observed = 0;
       long total_payments_captured = 0;
       
-      if (network->num_monitors > 0) {
-        for (int i = 0; i < network->num_monitors; i++) {
-          total_htlcs_observed += network->monitors[i].total_htlcs_observed;
-          total_payments_captured += network->monitors[i].payments_captured;
+      if (network->num_judges > 0) {
+        for (int i = 0; i < network->num_judges; i++) {
+          total_htlcs_observed += network->judges[i].total_htlcs_observed;
+          total_payments_captured += network->judges[i].payments_captured;
         }
       }
       
@@ -356,8 +356,8 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       int total_malicious_nodes = 0;
       int detected_malicious_nodes = 0;
       int false_positive_nodes = 0;
-      int observable_malicious_nodes = 0; /* malicious nodes any monitor can even see */
-      /* observable AND actually attacked (first_attack_time>0): 監視で観測可能、かつ
+      int observable_malicious_nodes = 0; /* malicious nodes any judge can even see */
+      /* observable AND actually attacked (first_attack_time>0): 判定ノードで観測可能、かつ
        * 実際に攻撃を発動した(=経路に乗り遅延注入した)悪性ノード。これが「検知可能で
        * 意味のある攻撃者」の母集団。休眠悪性(経路に乗らず無害)や観測不能ノードを
        * 分母から除く、検知率の正しい分母。 */
@@ -483,7 +483,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         }
         if (node->is_malicious) {
           total_malicious_nodes++;
-          int observed = is_node_observed_by_monitors(network, node->id);
+          int observed = is_node_observed_by_judges(network, node->id);
           int attacked = (node->first_attack_time > 0);
           if (observed) observable_malicious_nodes++;
           if (observed && attacked) observable_attacked_malicious_nodes++;
@@ -499,8 +499,8 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       /* detection_rate = recall vs ALL malicious nodes (capped by observability) */
       double detection_rate = (total_malicious_nodes > 0) ?
         ((double)detected_malicious_nodes / (double)total_malicious_nodes * 100.0) : 0.0;
-      /* detection_rate_observable = recall vs only the malicious nodes a monitor
-       * could actually observe; isolates detector quality from monitor coverage */
+      /* detection_rate_observable = recall vs only the malicious nodes a judge
+       * could actually observe; isolates detector quality from judge coverage */
       double detection_rate_observable = (observable_malicious_nodes > 0) ?
         ((double)detected_malicious_nodes / (double)observable_malicious_nodes * 100.0) : 0.0;
       /* detection_rate_observable_attacked = recall vs 観測可能かつ攻撃発動した悪性
@@ -534,19 +534,19 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         }
       }
       
-      /* Calculate coverage rate: count monitored payments using is_observed flag */
-      long unique_monitored_payments = 0;
+      /* Calculate coverage rate: count judged payments using is_observed flag */
+      long unique_judged_payments = 0;
       
       for (int i = 0; i < array_len(payments); i++) {
         struct payment* p = (struct payment*)array_get(payments, i);
         if (p != NULL && !p->is_warmup && p->is_observed) {
-          unique_monitored_payments++;
+          unique_judged_payments++;
         }
       }
       
-      /* Calculate coverage rate based on unique monitored payments */
+      /* Calculate coverage rate based on unique judged payments */
       double coverage_rate = (total_payments > 0) ? 
-        ((double)unique_monitored_payments / (double)total_payments * 100.0) : 0.0;
+        ((double)unique_judged_payments / (double)total_payments * 100.0) : 0.0;
       
       /* 成功率の分母 = 全 payment - 悪意送信者の即失敗 (htlc.c:547 でリトライなし即失敗。
        * 正常な送金試行ではないため除外)。悪意送信者は常に is_success=0 なので分子は不変。
@@ -562,13 +562,13 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
       /* Write header and data as key=value pairs */
       fprintf(csv_metrics, "metric,value\n");
       
-      /* Monitoring System */
-      fprintf(csv_metrics, "num_monitors,%d\n", network->num_monitors);
-      fprintf(csv_metrics, "monitoring_strategy,%d\n", net_params.monitoring_strategy);
-      fprintf(csv_metrics, "total_payments_captured,%ld\n", unique_monitored_payments);
-      fprintf(csv_metrics, "monitoring_coverage_rate_percent,%.2f\n", coverage_rate);
-      fprintf(csv_metrics, "avg_htlcs_observed_per_monitor,%.2f\n",
-              (network->num_monitors > 0) ? ((double)total_htlcs_observed / network->num_monitors) : 0.0);
+      /* Judging System */
+      fprintf(csv_metrics, "num_judges,%d\n", network->num_judges);
+      fprintf(csv_metrics, "judging_strategy,%d\n", net_params.judging_strategy);
+      fprintf(csv_metrics, "total_payments_captured,%ld\n", unique_judged_payments);
+      fprintf(csv_metrics, "judging_coverage_rate_percent,%.2f\n", coverage_rate);
+      fprintf(csv_metrics, "avg_htlcs_observed_per_judge,%.2f\n",
+              (network->num_judges > 0) ? ((double)total_htlcs_observed / network->num_judges) : 0.0);
       
       /* Attack Detection Results */
       fprintf(csv_metrics, "total_malicious_nodes,%d\n", total_malicious_nodes);
@@ -605,7 +605,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
              detection_rate, detection_precision, false_positive_nodes);
       printf("  - Success: %.2f%% (%ld/%ld payments)\n", 
              success_rate, successful_payments, total_payments);
-      printf("  - Monitoring: %.2f%% coverage\n", coverage_rate);
+      printf("  - Judging: %.2f%% coverage\n", coverage_rate);
     }
   }
 
@@ -617,7 +617,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     
     FILE* csv_reputation = fopen(output_filename, "w");
     if (csv_reputation != NULL) {
-      fprintf(csv_reputation, "node_id,is_malicious,is_monitor,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count,settle_anom_q,settle_baseline_mean\n");
+      fprintf(csv_reputation, "node_id,is_malicious,is_judge,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count,settle_anom_q,settle_baseline_mean\n");
       
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
@@ -631,7 +631,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
           fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld,%ld,%ld,%.4f,%.4f\n",
                   node->id,
                   node->is_malicious,
-                  node->is_monitor,
+                  node->is_judge,
                   node->reputation_score,
                   node->malicious_reports,
                   degree,
@@ -683,12 +683,12 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     }
   }
 
-  /* === Write Payment Estimation CSV (from monitoring) === */
-  if (net_params.monitoring_strategy > 0) {
-    if (cloth_debug_enabled()) printf("[Monitoring] Starting payment information integration...\n");
+  /* === Write Payment Estimation CSV (from judging) === */
+  if (net_params.judging_strategy > 0) {
+    if (cloth_debug_enabled()) printf("[Judging] Starting payment information integration...\n");
     fflush(stdout);
-    struct array* estimated_payments = integrate_observations_from_monitors(network, payments);
-    printf("[Monitoring] Integration complete: %ld estimated payments\n", array_len(estimated_payments));
+    struct array* estimated_payments = integrate_observations_from_judges(network, payments);
+    printf("[Judging] Integration complete: %ld estimated payments\n", array_len(estimated_payments));
     fflush(stdout);
     
     if (estimated_payments != NULL && array_len(estimated_payments) > 0) {
@@ -1068,9 +1068,9 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
   net_params->attack_delay_duration = 30000;
   net_params->attack_delay_intensity = 1.0;
   net_params->attack_delay_jitter = 0.0;
-  /* === Stage ② Monitor Placement Parameters === */
+  /* === Stage ② Judge Placement Parameters === */
   net_params->hub_degree_threshold = 50;
-  net_params->monitoring_strategy = 0;  // 0=disabled, 1=method1, 2=method2
+  net_params->judging_strategy = 0;  // 0=disabled, 1=method1, 2=method2
   net_params->top_hub_count = 30;
   net_params->enable_simple_progress_mode = 0;
   net_params->enable_simple_progress_window = 0;
@@ -1079,7 +1079,7 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
   net_params->reputation_decay_rate = 0.01;      // 1% decay per event
   net_params->reputation_penalty_on_detection = 0.3;  // 30% penalty
   net_params->reputation_recovery_rate = 0.02;   // 2% recovery per honest period
-  net_params->enable_monitor_movement = 0;
+  net_params->enable_judge_movement = 0;
   net_params->movement_credit_limit = 5;
   /* === Stage ④ DoS Mitigation Defaults === */
   net_params->enable_pra = 0;                    // PRA disabled by default
@@ -1207,30 +1207,30 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
     else if(strcmp(parameter, "attack_delay_jitter")==0){
       net_params->attack_delay_jitter = strtod(value, NULL);
     }
-    /* === Stage ② Monitor Placement Parameters === */
+    /* === Stage ② Judge Placement Parameters === */
     else if(strcmp(parameter, "hub_degree_threshold")==0){
       net_params->hub_degree_threshold = strtol(value, NULL, 10);
     }
-    else if(strcmp(parameter, "monitoring_strategy")==0){
+    else if(strcmp(parameter, "judging_strategy")==0){
       if(strcmp(value, "method1")==0)
-        net_params->monitoring_strategy = 1;
+        net_params->judging_strategy = 1;
       else if(strcmp(value, "method2")==0)
-        net_params->monitoring_strategy = 2;
+        net_params->judging_strategy = 2;
       else
-        net_params->monitoring_strategy = 0;
+        net_params->judging_strategy = 0;
     }
     else if(strcmp(parameter, "top_hub_count")==0){
       net_params->top_hub_count = strtol(value, NULL, 10);
     }
-    else if(strcmp(parameter, "monitor_node_limit")==0){
-      extern int MONITOR_NODE_LIMIT;
+    else if(strcmp(parameter, "judge_node_limit")==0){
+      extern int JUDGE_NODE_LIMIT;
       int limit = strtol(value, NULL, 10);
-      printf("[Config] Read monitor_node_limit: value='%s' parsed as %d\n", value, limit);
+      printf("[Config] Read judge_node_limit: value='%s' parsed as %d\n", value, limit);
       fflush(stdout);
       if (limit > 0) {
-        printf("[Config] Setting MONITOR_NODE_LIMIT: %d → %d\n", MONITOR_NODE_LIMIT, limit);
+        printf("[Config] Setting JUDGE_NODE_LIMIT: %d → %d\n", JUDGE_NODE_LIMIT, limit);
         fflush(stdout);
-        MONITOR_NODE_LIMIT = limit;
+        JUDGE_NODE_LIMIT = limit;
       }
     }
     else if(strcmp(parameter, "enable_simple_progress_mode")==0){
@@ -1252,8 +1252,8 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
     else if(strcmp(parameter, "reputation_recovery_rate")==0){
       net_params->reputation_recovery_rate = strtod(value, NULL);
     }
-    else if(strcmp(parameter, "enable_monitor_movement")==0){
-      net_params->enable_monitor_movement = (strcmp(value, "true")==0) ? 1 : 0;
+    else if(strcmp(parameter, "enable_judge_movement")==0){
+      net_params->enable_judge_movement = (strcmp(value, "true")==0) ? 1 : 0;
     }
     else if(strcmp(parameter, "movement_credit_limit")==0){
       net_params->movement_credit_limit = strtol(value, NULL, 10);
@@ -1512,7 +1512,7 @@ int main(int argc, char *argv[]) {
    * ここで正しい値に上書きされる。
    * 新しいパラメータを追加した場合はこのブロックにも追記すること。 */
   {
-    extern int MONITOR_NODE_LIMIT;
+    extern int JUDGE_NODE_LIMIT;
     const char* env_val;
 
     /* --- ネットワーク規模 --- */
@@ -1538,30 +1538,30 @@ int main(int argc, char *argv[]) {
       net_params.malicious_failure_probability = v;
     }
 
-    /* --- 監視ノード数上限 --- */
-    if ((env_val = getenv("CLOTH_MONITOR_NODE_LIMIT")) != NULL) {
+    /* --- 判定ノード数上限 --- */
+    if ((env_val = getenv("CLOTH_JUDGE_NODE_LIMIT")) != NULL) {
       int limit = atoi(env_val);
       if (limit > 0) {
-        printf("[Config] Override MONITOR_NODE_LIMIT from env: %d → %d\n", MONITOR_NODE_LIMIT, limit);
-        MONITOR_NODE_LIMIT = limit;
+        printf("[Config] Override JUDGE_NODE_LIMIT from env: %d → %d\n", JUDGE_NODE_LIMIT, limit);
+        JUDGE_NODE_LIMIT = limit;
       }
     }
 
-    /* --- 監視戦略 --- */
-    if ((env_val = getenv("CLOTH_MONITORING_STRATEGY")) != NULL) {
-      if      (strcmp(env_val, "method1") == 0) net_params.monitoring_strategy = 1;
-      else if (strcmp(env_val, "method2") == 0) net_params.monitoring_strategy = 2;
-      else                                       net_params.monitoring_strategy = 0;
-      printf("[Config] Override monitoring_strategy from env: %d\n", net_params.monitoring_strategy);
+    /* --- 判定戦略 --- */
+    if ((env_val = getenv("CLOTH_JUDGING_STRATEGY")) != NULL) {
+      if      (strcmp(env_val, "method1") == 0) net_params.judging_strategy = 1;
+      else if (strcmp(env_val, "method2") == 0) net_params.judging_strategy = 2;
+      else                                       net_params.judging_strategy = 0;
+      printf("[Config] Override judging_strategy from env: %d\n", net_params.judging_strategy);
     }
 
     /* --- レピュテーション / 防御フラグ ---
      * NOTE: CLOTH_ENABLE_REPUTATION_SYSTEM の env オーバーライドは削除した。
-     * enable_reputation_system は下の正規化で monitoring_strategy から一意に
+     * enable_reputation_system は下の正規化で judging_strategy から一意に
      * 決まるため、config 値も env 値も必ず上書きされる (死んだノブだった)。 */
-    if ((env_val = getenv("CLOTH_ENABLE_MONITOR_MOVEMENT")) != NULL) {
-      net_params.enable_monitor_movement = (strcmp(env_val, "true") == 0) ? 1 : 0;
-      printf("[Config] Override enable_monitor_movement from env: %d\n", net_params.enable_monitor_movement);
+    if ((env_val = getenv("CLOTH_ENABLE_JUDGE_MOVEMENT")) != NULL) {
+      net_params.enable_judge_movement = (strcmp(env_val, "true") == 0) ? 1 : 0;
+      printf("[Config] Override enable_judge_movement from env: %d\n", net_params.enable_judge_movement);
     }
     if ((env_val = getenv("CLOTH_ENABLE_RBR")) != NULL) {
       net_params.enable_rbr = (strcmp(env_val, "true") == 0) ? 1 : 0;
@@ -1612,12 +1612,12 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    /* Keep monitoring and defense in sync:
-     * - monitoring enabled  -> reputation updates enabled
-     * - monitoring disabled -> no detection / no reputation updates
+    /* Keep judging and defense in sync:
+     * - judging enabled  -> reputation updates enabled
+     * - judging disabled -> no detection / no reputation updates
      */
-    net_params.enable_reputation_system = (net_params.monitoring_strategy > 0) ? 1 : 0;
-    printf("[Config] Normalized enable_reputation_system from monitoring_strategy: %d\n",
+    net_params.enable_reputation_system = (net_params.judging_strategy > 0) ? 1 : 0;
+    printf("[Config] Normalized enable_reputation_system from judging_strategy: %d\n",
            net_params.enable_reputation_system);
 
     fflush(stdout);
@@ -1629,12 +1629,12 @@ int main(int argc, char *argv[]) {
   simulation->random_generator = initialize_random_generator();
 
   /* === RNG ストリーム分離 ===
-   * 防御設定(監視ノード数)を変えても、悪性ノード集合と支払い列が固定される
+   * 防御設定(判定ノード数)を変えても、悪性ノード集合と支払い列が固定される
    * ようにするための独立乱数源。従来は単一ストリームを
-   *   network生成 → 監視配置 → 悪性選定 → 支払い生成 → 実行時イベント
-   * の順で共有しており、(1)悪性候補プールが監視ノードを除外するため候補配列が
-   * 監視数で変わり、(2)悪性選定の Fisher-Yates が消費する乱数数が候補数に依存して
-   * 後続の支払い生成の乱数状態をずらす、という2経路で「監視数→悪性集合/支払い列」
+   *   network生成 → 判定ノード配置 → 悪性選定 → 支払い生成 → 実行時イベント
+   * の順で共有しており、(1)悪性候補プールが判定ノードを除外するため候補配列が
+   * 判定ノード数で変わり、(2)悪性選定の Fisher-Yates が消費する乱数数が候補数に依存して
+   * 後続の支払い生成の乱数状態をずらす、という2経路で「判定ノード数→悪性集合/支払い列」
    * の交絡を生んでいた。
    * ここでは悪性選定用と支払い生成用に、ベースシード(GSL_RNG_SEED)から決定的に
    * 派生した専用ストリームを与え、他ストリームの消費量に影響されないようにする。
@@ -1650,11 +1650,11 @@ int main(int argc, char *argv[]) {
   n_nodes = array_len(network->nodes);
   n_edges = array_len(network->edges);
 
-  /* === Stage ① 悪性ノードを先に選定(監視非依存) → 監視配置は悪性を避ける ===
-   * 悪性選定を監視配置より前に、かつ専用ストリームで行う。この時点では
-   * is_monitor は全ノード 0 なので候補プールは「degree>=3」だけで決まり、
-   * 監視数に依存しない固定集合になる。監視配置側で悪性ノードをスキップする
-   * ことで、両者の排他性(監視∩悪性=∅)を維持する。 */
+  /* === Stage ① 悪性ノードを先に選定(判定ノード非依存) → 判定ノード配置は悪性を避ける ===
+   * 悪性選定を判定ノード配置より前に、かつ専用ストリームで行う。この時点では
+   * is_judge は全ノード 0 なので候補プールは「degree>=3」だけで決まり、
+   * 判定ノード数に依存しない固定集合になる。判定ノード配置側で悪性ノードをスキップする
+   * ことで、両者の排他性(判定ノード∩悪性=∅)を維持する。 */
   if (net_params.malicious_node_ratio > 0.0) {
     initialize_malicious_nodes(network,
                                net_params.malicious_node_ratio,
@@ -1662,16 +1662,16 @@ int main(int argc, char *argv[]) {
                                rng_malicious);
   }
 
-  if (net_params.monitoring_strategy > 0) {
-    if (net_params.monitoring_strategy == 1) {
-      deploy_monitors_method1(network, net_params.hub_degree_threshold, 5);  // leaf_threshold=5
-    } else if (net_params.monitoring_strategy == 2) {
-      deploy_monitors_method2_enhanced(network, net_params.hub_degree_threshold, 5, net_params.top_hub_count);
+  if (net_params.judging_strategy > 0) {
+    if (net_params.judging_strategy == 1) {
+      deploy_judges_method1(network, net_params.hub_degree_threshold, 5);  // leaf_threshold=5
+    } else if (net_params.judging_strategy == 2) {
+      deploy_judges_method2_enhanced(network, net_params.hub_degree_threshold, 5, net_params.top_hub_count);
     }
   }
 
   /* === 代役ハブ注入(トポロジ what-if, env-gated, 既定OFF) ===
-   * 監視配置の後・payments/dijkstra 初期化の前に注入する。悪意ハブの回避で失われる
+   * 判定ノード配置の後・payments/dijkstra 初期化の前に注入する。悪意ハブの回避で失われる
    * 連結性を正直な代役ノードで補い NOPATH を抑えられるかを試す実験レバー。
    *   CLOTH_SUBSTITUTE_COUNT     : 悪意ハブ1個あたりの代役ノード数(>0で有効, 既定0=OFF)
    *   CLOTH_SUBSTITUTE_MIN_DEGREE: 対象とする悪意ハブの最小次数(既定100)
@@ -1748,12 +1748,12 @@ int main(int argc, char *argv[]) {
   simulation->total_payments = array_len(payments);
   simulation->processed_payments = 0;
 
-  /* === Stage ② Monitoring: Initialize Trust Scores and Balance Adjustment Payments === */
-  if (net_params.monitoring_strategy > 0) {
-    printf("[Monitoring] Initializing trust scores for %d monitors\n", network->num_monitors);
-    initialize_monitor_trust_scores(network);
+  /* === Stage ② Judging: Initialize Trust Scores and Balance Adjustment Payments === */
+  if (net_params.judging_strategy > 0) {
+    printf("[Judging] Initializing trust scores for %d judges\n", network->num_judges);
+    initialize_judge_trust_scores(network);
 
-    printf("[Monitoring] Generating balance adjustment payments\n");
+    printf("[Judging] Generating balance adjustment payments\n");
     struct array* balance_adjustment_payments = generate_balance_adjustment_payments(
         network,
         1000,  // start_time = 1000ms
@@ -1761,7 +1761,7 @@ int main(int argc, char *argv[]) {
     );
 
     if (array_len(balance_adjustment_payments) > 0) {
-      printf("[Monitoring] Generated %ld balance adjustment payments\n", array_len(balance_adjustment_payments));
+      printf("[Judging] Generated %ld balance adjustment payments\n", array_len(balance_adjustment_payments));
       // TODO: Integrate balance adjustment payments into main payments array
       // For now, just keep them for future event scheduling
     }
@@ -1845,7 +1845,7 @@ int main(int argc, char *argv[]) {
       }
       if (node != NULL) {
         if (node->is_malicious) color = ANSI_RED;
-        else if (node->is_monitor) color = ANSI_BLUE;
+        else if (node->is_judge) color = ANSI_BLUE;
       }
       double ratio = (total_payments > 0) ? ((double)completed_payments / (double)total_payments) * 100.0 : 0.0;
       if (net_params.enable_simple_progress_window) {
@@ -1862,12 +1862,12 @@ int main(int argc, char *argv[]) {
       usleep(200000);
     }
 
-    // === Dynamic Reputation Update from Monitoring ===
-    // Periodically integrate monitor observations and update global reputation scores
-    if (net_params.monitoring_strategy > 0 &&
+    // === Dynamic Reputation Update from Judging ===
+    // Periodically integrate judge observations and update global reputation scores
+    if (net_params.judging_strategy > 0 &&
         completed_payments > 0 &&
         completed_payments % 500 == 0) {
-      share_monitor_information_and_update_reputation(network, net_params);
+      share_judge_information_and_update_reputation(network, net_params);
     }
 
     switch(event->type){
@@ -1946,10 +1946,10 @@ int main(int argc, char *argv[]) {
             apply_reputation_decay_all_nodes(network, reputation_decay_rate);
         }
 
-        if (net_params.enable_monitor_movement &&
-            network->num_monitors > 0 &&
-            completed_payments % MONITOR_SWITCH_INTERVAL_PAYMENTS == 0) {
-            suggest_monitor_movement(network, net_params, simulation->current_time);
+        if (net_params.enable_judge_movement &&
+            network->num_judges > 0 &&
+            completed_payments % JUDGE_SWITCH_INTERVAL_PAYMENTS == 0) {
+            suggest_judge_movement(network, net_params, simulation->current_time);
         }
 
         char progress_filename[512];
@@ -1988,7 +1988,7 @@ int main(int argc, char *argv[]) {
   /* === Stage ① Write Baseline Metrics === */
   write_baseline_metrics(network, payments, net_params, output_dir_name);
 
-  /* === Write All Summary Outputs (Monitoring, Reputation, PRT, Payment Estimation) === */
+  /* === Write All Summary Outputs (Judging, Reputation, PRT, Payment Estimation) === */
   write_all_summary_outputs(network, payments, net_params, output_dir_name);
 
   /* === Stage ④ Write Comparison Metrics === */

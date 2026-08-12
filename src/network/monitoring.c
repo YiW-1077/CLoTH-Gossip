@@ -139,15 +139,15 @@ static int get_detect_k() {      /* k: 窓内の異常回数しきい値 */
     if (v < 1) return 3;
     return v;
 }
-/* === lever②: 報告 strike を「報告者(上流)」から「攻撃者(帰属先)」へ移す ===
- * fail 検知器の既定を per-hop 1-strike にする。従来は報告者ノードの suspicion_score>=2
- * を要求していた(報告者ごとの2-strike)が、低 n では1攻撃者あたりの異常が希少かつ
+/* === lever②: 報告 strike を「計測・報告者(上流)」から「攻撃者(帰属先)」へ移す ===
+ * fail 検知器の既定を per-hop 1-strike にする。従来は計測・報告者ノードの suspicion_score>=2
+ * を要求していた(計測・報告者ごとの2-strike)が、低 n では1攻撃者あたりの異常が希少かつ
  * 別ルート=別上流に断片化し、どの上流も2に届かず攻撃者が取り残されていた
  * ([[recall_low_n_observation_gap]])。per-hop は各異常ホップで即時 1-strike 報告し、
  * 多重証拠ガードを攻撃者側の報告累計(CLOTH_FLAG_MIN_REPORTS, cloth.c, 既定1)に委ねる
  * (=hold 検知器と同じ設計)。frozen-denominator 実測(method2/mix, seed42)で
  * recall +3.5〜+11.4pp(低nほど大), precision 不変(FP増なし)を確認。
- * **既定 ON**。CLOTH_ATTRIB_PER_HOP=0 (または false) で従来の報告者2-strikeに戻せる
+ * **既定 ON**。CLOTH_ATTRIB_PER_HOP=0 (または false) で従来の計測・報告者2-strikeに戻せる
  * (過去 run との比較再現用)。 */
 static int get_attrib_per_hop() {
     char *env = getenv("CLOTH_ATTRIB_PER_HOP");
@@ -156,13 +156,13 @@ static int get_attrib_per_hop() {
 }
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
-int g_monitoring_enabled = 1;
+int g_judging_enabled = 1;
 
 
 
-/* === Global monitor trust scores === */
-static struct monitor_trust_score* g_monitor_trust_scores = NULL;
-static int g_num_monitors_with_scores = 0;
+/* === Global judge trust scores === */
+static struct judge_trust_score* g_judge_trust_scores = NULL;
+static int g_num_judges_with_scores = 0;
 
 /* === Helper function to compare observation pointers by timestamp === */
 static int obs_compare_by_timestamp(const void* a, const void* b) {
@@ -191,12 +191,12 @@ void record_htlc_observation(
     uint64_t timestamp,
     uint32_t timelock,
     long current_node_id,
-    long monitor_id,
+    long judge_id,
     double channel_balance_before,
     double channel_balance_after,
     int is_balance_adjustment
 ) {
-    if (!g_monitoring_enabled) {
+    if (!g_judging_enabled) {
         return;
     }
 
@@ -216,7 +216,7 @@ void record_htlc_observation(
     obs->amount = amount;
     obs->timestamp = timestamp;
     obs->timelock = timelock;
-    obs->monitor_id = monitor_id;
+    obs->judge_id = judge_id;
     obs->current_node_id = current_node_id;
     obs->channel_balance_before = channel_balance_before;
     obs->channel_balance_after = channel_balance_after;
@@ -294,21 +294,21 @@ long* reconstruct_payment_path_from_chain(
 }
 
 /* === Integrate observations to estimate payment paths === */
-struct array* integrate_observations_from_monitors(struct network* network, struct array* payments) {
+struct array* integrate_observations_from_judges(struct network* network, struct array* payments) {
     struct array* estimated_payments = array_initialize(100);
 
     if (g_htlc_observations == NULL || array_len(g_htlc_observations) == 0) {
-        if (cloth_debug_enabled()) printf("[Monitoring] No observations recorded\n");
+        if (cloth_debug_enabled()) printf("[Judging] No observations recorded\n");
         return estimated_payments;
     }
 
     // Ensure trust scores are initialized
-    if (g_num_monitors_with_scores == 0) {
-        initialize_monitor_trust_scores(network);
+    if (g_num_judges_with_scores == 0) {
+        initialize_judge_trust_scores(network);
     }
 
     int num_obs = array_len(g_htlc_observations);
-    if (cloth_debug_enabled()) printf("[Monitoring] Processing %d observations\n", num_obs);
+    if (cloth_debug_enabled()) printf("[Judging] Processing %d observations\n", num_obs);
 
     // Group observations by payment_id
     struct array** observation_groups = (struct array**)malloc(num_obs * sizeof(struct array*));
@@ -336,7 +336,7 @@ struct array* integrate_observations_from_monitors(struct network* network, stru
         observation_groups[target_group] = array_insert(observation_groups[target_group], obs_i);
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Formed %d observation groups\n", num_groups);
+    if (cloth_debug_enabled()) printf("[Judging] Formed %d observation groups\n", num_groups);
 
     // Convert groups to estimated payments
     // Use route-consistent chaining within each payment_id group.
@@ -466,32 +466,32 @@ void free_all_observations() {
     g_htlc_observations = NULL;
 }
 
-/* === Initialize monitor trust scores === */
-void initialize_monitor_trust_scores(struct network* network) {
-    if (network == NULL || network->num_monitors == 0) {
+/* === Initialize judge trust scores === */
+void initialize_judge_trust_scores(struct network* network) {
+    if (network == NULL || network->num_judges == 0) {
         return;
     }
 
-    g_monitor_trust_scores = (struct monitor_trust_score*)malloc(
-        network->num_monitors * sizeof(struct monitor_trust_score));
+    g_judge_trust_scores = (struct judge_trust_score*)malloc(
+        network->num_judges * sizeof(struct judge_trust_score));
 
-    for (int i = 0; i < network->num_monitors; i++) {
-        g_monitor_trust_scores[i].monitor_id = i;
-        g_monitor_trust_scores[i].trust_score = 0.8;  // Initial trust
-        g_monitor_trust_scores[i].correct_observations = 0;
-        g_monitor_trust_scores[i].contradicted_observations = 0;
+    for (int i = 0; i < network->num_judges; i++) {
+        g_judge_trust_scores[i].judge_id = i;
+        g_judge_trust_scores[i].trust_score = 0.8;  // Initial trust
+        g_judge_trust_scores[i].correct_observations = 0;
+        g_judge_trust_scores[i].contradicted_observations = 0;
     }
 
-    g_num_monitors_with_scores = network->num_monitors;
+    g_num_judges_with_scores = network->num_judges;
 }
 
-/* === Update monitor trust score === */
-void update_monitor_trust_score(long monitor_id, int is_correct) {
-    if (monitor_id < 0 || monitor_id >= g_num_monitors_with_scores) {
+/* === Update judge trust score === */
+void update_judge_trust_score(long judge_id, int is_correct) {
+    if (judge_id < 0 || judge_id >= g_num_judges_with_scores) {
         return;
     }
 
-    struct monitor_trust_score* score = &g_monitor_trust_scores[monitor_id];
+    struct judge_trust_score* score = &g_judge_trust_scores[judge_id];
 
     if (is_correct) {
         score->trust_score += 0.1;
@@ -517,32 +517,32 @@ struct array* generate_balance_adjustment_payments(
 ) {
     struct array* balance_payments = array_initialize(100);
 
-    if (network == NULL || network->num_monitors == 0) {
+    if (network == NULL || network->num_judges == 0) {
         return balance_payments;
     }
 
     uint64_t payment_id_base = 1000000;  // High base to avoid collision with normal payments
     uint64_t current_time = start_time;
 
-    // For each monitor, generate balance adjustment payments to other monitors
-    // Strategy: Create payments to equalize balances across monitor network
-    for (int src = 0; src < network->num_monitors; src++) {
-        MonitorAgent* src_monitor = &network->monitors[src];
-        struct node* src_node = (struct node*)array_get(network->nodes, src_monitor->node_id);
+    // For each judge, generate balance adjustment payments to other judges
+    // Strategy: Create payments to equalize balances across judge network
+    for (int src = 0; src < network->num_judges; src++) {
+        JudgeAgent* src_judge = &network->judges[src];
+        struct node* src_node = (struct node*)array_get(network->nodes, src_judge->node_id);
 
         if (src_node == NULL) {
             continue;
         }
 
-        // Find nearby monitors to send balance adjustments
-        // For simplicity, pair monitors sequentially
-        int dst = (src + 1) % network->num_monitors;
+        // Find nearby judges to send balance adjustments
+        // For simplicity, pair judges sequentially
+        int dst = (src + 1) % network->num_judges;
         if (dst == src) {
-            continue;  // Only 1 monitor, no need for adjustment
+            continue;  // Only 1 judge, no need for adjustment
         }
 
-        MonitorAgent* dst_monitor = &network->monitors[dst];
-        struct node* dst_node = (struct node*)array_get(network->nodes, dst_monitor->node_id);
+        JudgeAgent* dst_judge = &network->judges[dst];
+        struct node* dst_node = (struct node*)array_get(network->nodes, dst_judge->node_id);
 
         if (dst_node == NULL) {
             continue;
@@ -556,8 +556,8 @@ struct array* generate_balance_adjustment_payments(
             (struct balance_adjustment_payment*)malloc(sizeof(struct balance_adjustment_payment));
 
         ba_payment->payment_id = payment_id_base + array_len(balance_payments);
-        ba_payment->src_monitor_id = src_monitor->node_id;
-        ba_payment->dst_monitor_id = dst_monitor->node_id;
+        ba_payment->src_judge_id = src_judge->node_id;
+        ba_payment->dst_judge_id = dst_judge->node_id;
         ba_payment->amount = adjustment_amount;
         ba_payment->timestamp = current_time;
         ba_payment->is_internal = 1;
@@ -570,12 +570,12 @@ struct array* generate_balance_adjustment_payments(
     return balance_payments;
 }
 
-/* === Monitor Information Sharing & Dynamic Reputation System === */
+/* === Judge Information Sharing & Dynamic Reputation System === */
 
-/* 全監視器の観測を統合し、グローバル評判スコアを更新する。
- * 1. 全監視器の観測を統合  2. 決済経路から疑わしいノードを特定
+/* 全判定ノードの観測を統合し、グローバル評判スコアを更新する。
+ * 1. 全判定ノードの観測を統合  2. 決済経路から疑わしいノードを特定
  * 3. 全ノードの評判スコアを更新  4. 評判データをルーティングから参照可能にする。 */
-void share_monitor_information_and_update_reputation(
+void share_judge_information_and_update_reputation(
     struct network* network,
     struct network_params net_params
 ) {
@@ -589,11 +589,11 @@ void share_monitor_information_and_update_reputation(
         return;
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Sharing information across monitors...\n");
-    if (cloth_debug_enabled()) printf("[Monitoring] Total observations: %d\n", num_observations);
+    if (cloth_debug_enabled()) printf("[Judging] Sharing information across judges...\n");
+    if (cloth_debug_enabled()) printf("[Judging] Total observations: %d\n", num_observations);
 
     // Integrate observations to get estimated payment paths
-    struct array* estimated_payments = integrate_observations_from_monitors(network, NULL);
+    struct array* estimated_payments = integrate_observations_from_judges(network, NULL);
 
     if (estimated_payments == NULL) {
         return;
@@ -601,7 +601,7 @@ void share_monitor_information_and_update_reputation(
 
     // Analyze estimated payments to identify suspicious nodes
     int num_estimated = array_len(estimated_payments);
-    if (cloth_debug_enabled()) printf("[Monitoring] Estimated payments from integration: %d\n", num_estimated);
+    if (cloth_debug_enabled()) printf("[Judging] Estimated payments from integration: %d\n", num_estimated);
 
     // Initialize node suspicion scores (0.0 = trusted, 1.0 = malicious)
     double* node_suspicion = (double*)calloc(array_len(network->nodes), sizeof(double));
@@ -646,7 +646,7 @@ void share_monitor_information_and_update_reputation(
     }
 
     // Update global reputation scores based on integrated information
-    if (cloth_debug_enabled()) printf("[Monitoring] Updating reputation scores...\n");
+    if (cloth_debug_enabled()) printf("[Judging] Updating reputation scores...\n");
 
     int nodes_updated = 0;
     int num_nodes = array_len(network->nodes);
@@ -661,7 +661,7 @@ void share_monitor_information_and_update_reputation(
         /* Fix 1 (non-destructive batch update): if this sweep has no suspicion
          * evidence against the node, leave its reputation untouched. Recomputing
          * from a 1.0 baseline here would wipe out penalties already accumulated by
-         * the realtime detection path (report_attacked_node_to_monitors ->
+         * the realtime detection path (report_attacked_node_to_judges ->
          * update_node_reputation_on_detection), which is currently the only path
          * that actually lowers reputation. */
         if (node_suspicion_count[i] == 0) {
@@ -681,7 +681,7 @@ void share_monitor_information_and_update_reputation(
              * accumulate suspicion reports faster than low-degree nodes,
              * so scale down the penalty proportionally to degree.
              * degree=0: scale=1.0, degree=200: scale=0.5, degree=1000: scale=0.17
-             * Consistent with the scaling in report_attacked_node_to_monitors. */
+             * Consistent with the scaling in report_attacked_node_to_judges. */
             long degree = 0;
             if (node->open_edges != NULL) degree = array_len(node->open_edges);
             double degree_scale = 1.0 / (1.0 + (double)degree / 200.0);
@@ -715,7 +715,7 @@ void share_monitor_information_and_update_reputation(
         double old_rep = node->reputation_score;
         /* このバッチ統合は「疑い」に基づく更新なので評判を上げてはならない。
          * 従来は 1.0 基準で再計算した値をそのまま代入しており、realtime 検知
-         * (report_attacked_node_to_monitors) が積み上げたペナルティを毎スイープ
+         * (report_attacked_node_to_judges) が積み上げたペナルティを毎スイープ
          * 帳消しにして高次数攻撃者 (node2 等) の評判を 1.0 に戻していた。
          * 下げる方向のみ反映する。正常ハブの誤報による低下の回復経路は
          * 評判減衰レバー (cloth.c, env CLOTH_REPUTATION_DECAY_RATE, 既定0=OFF)
@@ -730,7 +730,7 @@ void share_monitor_information_and_update_reputation(
         }
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Updated reputation for %d nodes\n", nodes_updated);
+    if (cloth_debug_enabled()) printf("[Judging] Updated reputation for %d nodes\n", nodes_updated);
 
     // Identify and report suspected malicious nodes
     int suspect_count = 0;
@@ -741,8 +741,8 @@ void share_monitor_information_and_update_reputation(
         }
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Nodes with low reputation (<0.5): %d\n", suspect_count);
-    if (cloth_debug_enabled()) printf("[Monitoring] Information sharing complete - Routing can now use reputation scores\n");
+    if (cloth_debug_enabled()) printf("[Judging] Nodes with low reputation (<0.5): %d\n", suspect_count);
+    if (cloth_debug_enabled()) printf("[Judging] Information sharing complete - Routing can now use reputation scores\n");
 
     // Clean up
     free(node_suspicion);
@@ -760,7 +760,7 @@ void share_monitor_information_and_update_reputation(
     }
 }
 
-void report_attacked_node_to_monitors(
+void report_attacked_node_to_judges(
     struct network* network,
     long reporter_node_id,
     long attacked_node_id,
@@ -768,7 +768,7 @@ void report_attacked_node_to_monitors(
     uint64_t timestamp,
     struct network_params net_params
 ) {
-    if (network == NULL || !net_params.monitoring_strategy || !net_params.enable_reputation_system) {
+    if (network == NULL || !net_params.judging_strategy || !net_params.enable_reputation_system) {
         return;
     }
 
@@ -782,7 +782,7 @@ void report_attacked_node_to_monitors(
     }
 
     if (cloth_debug_enabled())
-        printf("[Monitoring] reporter=%ld reported attack on node=%ld for payment=%" PRIu64 "\n",
+        printf("[Judging] reporter=%ld reported attack on node=%ld for payment=%" PRIu64 "\n",
                reporter_node_id,
                attacked_node_id,
                payment_id);
@@ -824,7 +824,7 @@ void report_attacked_node_to_monitors(
         double scaled_penalty = net_params.reputation_penalty_on_detection * degree_scale;
 
         if (cloth_debug_enabled())
-            printf("[Monitoring] applying scaled penalty to node=%ld degree=%ld scale=%.4f base_penalty=%.4f scaled_penalty=%.4f\n",
+            printf("[Judging] applying scaled penalty to node=%ld degree=%ld scale=%.4f base_penalty=%.4f scaled_penalty=%.4f\n",
                    attacked_node_id, degree, degree_scale, net_params.reputation_penalty_on_detection, scaled_penalty);
 
         update_node_reputation_on_detection(
@@ -932,7 +932,7 @@ void update_fail_baseline_lognormal(struct node* node, double observed_latency_m
  *
  * htlc.c 側で hop_send_times[i] → hop_send_times[i+1]（または result_time）を
  * 1 ホップ分の区間レイテンシとして渡すため、ここでは 1 ホップ単体を検定する。
- * 監視ノードの有無に関係なく、各ノードを独立に評価できる。
+ * 判定ノードの有無に関係なく、各ノードを独立に評価できる。
  *
  * 処理:
  * 1. warmup 中 (payment_count_global < CLOTH_WARMUP_PAYMENTS, 既定 500) は
@@ -1034,7 +1034,7 @@ int on_fail_hypothesis_test(
         /* === 従来: suspicion_score ランダムウォーク (+1異常/-1正常, +2で報告) === */
         if (anomalous) {
             forwarding_node->suspicion_score++;
-            /* lever②: per-hop 1-strike。報告者の2-strikeを待たず、この異常ホップで
+            /* lever②: per-hop 1-strike。計測・報告者の2-strikeを待たず、この異常ホップで
              * 即報告し、証拠累積を攻撃者側(malicious_reports>=CLOTH_FLAG_MIN_REPORTS)に
              * 委ねる。suspicion_score の加算は診断用に残す。 */
             int report_strike = get_attrib_per_hop() ? 1 : 2;

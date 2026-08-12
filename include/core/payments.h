@@ -66,8 +66,8 @@ struct payment {
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments
   
-  /* === Monitoring: Observation tracking === */
-  unsigned int is_observed;         // 1 if at least one monitor observed this payment
+  /* === Judging: Observation tracking === */
+  unsigned int is_observed;         // 1 if at least one judge observed this payment
 
   /* === Attack Report Tracking (per payment) === */
   long* attack_reporters;          // node IDs that filed an attack report for this payment

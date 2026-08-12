@@ -992,7 +992,7 @@ struct array* find_reputation_based_route(
             // Line 8: If node has low reputation and not yet avoided
             // Dynamic threshold: high-degree hubs require stronger evidence
             // (lower score) before being hard-excluded, matching the degree-
-            // scaled penalty applied during monitoring sweeps.
+            // scaled penalty applied during judging sweeps.
             // degree=0: threshold=0.30, degree=200: threshold=0.15, degree=1000: threshold=0.05
             long node_degree = (N->open_edges != NULL) ? (long)array_len(N->open_edges) : 0L;
             double blacklist_threshold = 0.3 / (1.0 + (double)node_degree / 200.0);

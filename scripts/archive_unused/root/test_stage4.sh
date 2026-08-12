@@ -42,13 +42,13 @@ mpp=1
 malicious_node_ratio=0.0
 malicious_failure_probability=0.0
 hub_degree_threshold=50
-monitoring_strategy=method1
+judging_strategy=method1
 top_hub_count=30
 enable_reputation_system=false
 reputation_decay_rate=0.0
 reputation_penalty_on_detection=0.0
 reputation_recovery_rate=0.0
-enable_monitor_movement=false
+enable_judge_movement=false
 movement_credit_limit=0
 enable_pra=false
 enable_prt=false
@@ -96,13 +96,13 @@ mpp=1
 malicious_node_ratio=0.15
 malicious_failure_probability=0.8
 hub_degree_threshold=50
-monitoring_strategy=method1
+judging_strategy=method1
 top_hub_count=30
 enable_reputation_system=false
 reputation_decay_rate=0.0
 reputation_penalty_on_detection=0.0
 reputation_recovery_rate=0.0
-enable_monitor_movement=false
+enable_judge_movement=false
 movement_credit_limit=0
 enable_pra=false
 enable_prt=false
@@ -115,9 +115,9 @@ EOF
 mkdir -p result_attack
 GSL_RNG_SEED=42 timeout 120 ./CLoTH_Gossip ./result_attack/ 2>&1 | tail -15
 
-# Test 3: Defense (15% malicious + PRT + monitoring + reputation)
+# Test 3: Defense (15% malicious + PRT + judging + reputation)
 echo ""
-echo "[Test 3] Defense: 15% malicious + PRT + monitoring + reputation"
+echo "[Test 3] Defense: 15% malicious + PRT + judging + reputation"
 cat > cloth_input.txt << 'EOF'
 generate_network_from_file=true
 nodes_filename=nodes_ln.csv
@@ -150,13 +150,13 @@ mpp=1
 malicious_node_ratio=0.15
 malicious_failure_probability=0.8
 hub_degree_threshold=50
-monitoring_strategy=method2
+judging_strategy=method2
 top_hub_count=30
 enable_reputation_system=true
 reputation_decay_rate=0.01
 reputation_penalty_on_detection=0.3
 reputation_recovery_rate=0.01
-enable_monitor_movement=true
+enable_judge_movement=true
 movement_credit_limit=5
 enable_pra=true
 enable_prt=true
@@ -181,6 +181,6 @@ echo ""
 echo "Scenario 2: Attack (no defense)"
 grep "success_rate" result_attack/baseline_metrics.csv
 echo ""
-echo "Scenario 3: Defense (PRT + RBR + monitoring)"
+echo "Scenario 3: Defense (PRT + RBR + judging)"
 grep "success_rate" result_defense/baseline_metrics.csv
 echo ""

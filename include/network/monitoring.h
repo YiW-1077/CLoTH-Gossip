@@ -7,14 +7,14 @@
 
 struct payment; /* forward declaration */
 
-/* === Stage ② Monitoring: HTLC Information Observation ===
+/* === Stage ② Judging: HTLC Information Observation ===
  * 
- * Monitors deployed on the network observe HTLC forwarding events.
- * By integrating observations from multiple monitors, the complete
+ * Judges deployed on the network observe HTLC forwarding events.
+ * By integrating observations from multiple judges, the complete
  * payment path and amount can be estimated (onion routing attack).
  */
 
-/* === HTLC Observation: Information captured by monitor nodes === */
+/* === HTLC Observation: Information captured by judge nodes === */
 struct htlc_observation {
     uint64_t payment_id;       // Payment identifier
     long prev_node_id;         // Previous hop node (source side)
@@ -22,12 +22,12 @@ struct htlc_observation {
     uint64_t amount;           // Amount being forwarded
     uint64_t timestamp;        // When observation was made
     uint32_t timelock;         // HTLC timelock value
-    long monitor_id;           // ID of monitor recording this observation
+    long judge_id;           // ID of judge recording this observation
     long current_node_id;      // Node where this observation occurred
     
     /* === Balance Adjustment Tracking === */
-    double channel_balance_before;  // Monitor's channel balance before HTLC forward
-    double channel_balance_after;   // Monitor's channel balance after HTLC forward
+    double channel_balance_before;  // Judge's channel balance before HTLC forward
+    double channel_balance_after;   // Judge's channel balance after HTLC forward
     int is_balance_adjustment;      // 1 if this is a balance adjustment payment
 };
 
@@ -35,7 +35,7 @@ struct htlc_observation {
 struct estimated_payment {
     long* complete_path;       // Reconstructed complete path
     int path_length;           // Number of hops in path
-    uint64_t amount;           // Estimated payment amount (observed at first monitor)
+    uint64_t amount;           // Estimated payment amount (observed at first judge)
     uint64_t upstream_amount;  // Amount observed upstream (closest to sender)
     uint64_t downstream_amount;// Amount observed downstream (closest to receiver)
     int num_observations;      // Number of observations used
@@ -46,18 +46,18 @@ struct estimated_payment {
 /* === Balance Adjustment Payment Structure === */
 struct balance_adjustment_payment {
     uint64_t payment_id;          // Unique payment identifier
-    long src_monitor_id;          // Source monitor node ID
-    long dst_monitor_id;          // Destination monitor node ID
+    long src_judge_id;          // Source judge node ID
+    long dst_judge_id;          // Destination judge node ID
     uint64_t amount;              // Amount to transfer
     uint64_t timestamp;           // When generated
-    int is_internal;              // 1 if internal monitor-to-monitor payment
+    int is_internal;              // 1 if internal judge-to-judge payment
 };
 
 /* === Global observation storage === */
 extern struct array* g_htlc_observations;
-extern int g_monitoring_enabled;
+extern int g_judging_enabled;
 
-/* === Monitor Recording Functions === */
+/* === Judge Recording Functions === */
 
 /**
  * Initialize global observation storage
@@ -65,8 +65,8 @@ extern int g_monitoring_enabled;
 void initialize_observation_storage();
 
 /**
- * Record an HTLC observation when monitor node processes a forwarding HTLC
- * Called from forward_payment() if current node is a monitor
+ * Record an HTLC observation when judge node processes a forwarding HTLC
+ * Called from forward_payment() if current node is a judge
  */
 void record_htlc_observation(
     struct network* network,
@@ -77,7 +77,7 @@ void record_htlc_observation(
     uint64_t timestamp,
     uint32_t timelock,
     long current_node_id,
-    long monitor_id,
+    long judge_id,
     double channel_balance_before,
     double channel_balance_after,
     int is_balance_adjustment
@@ -86,8 +86,8 @@ void record_htlc_observation(
 /* === Balance Adjustment Payment Generation === */
 
 /**
- * Generate balance adjustment payments for monitor nodes
- * Ensures monitors have balanced channels to relay normal payments
+ * Generate balance adjustment payments for judge nodes
+ * Ensures judges have balanced channels to relay normal payments
  * Called during initialization before normal payments
  */
 struct array* generate_balance_adjustment_payments(
@@ -99,27 +99,27 @@ struct array* generate_balance_adjustment_payments(
 /* === Information Integration Functions === */
 
 /**
- * Integrate observations from all monitors to reconstruct payment paths
+ * Integrate observations from all judges to reconstruct payment paths
  * Called at end of simulation
  * Returns array of estimated_payment structures
  */
-struct array* integrate_observations_from_monitors(struct network* network, struct array* payments);
+struct array* integrate_observations_from_judges(struct network* network, struct array* payments);
 
 /**
- * Share monitor observations across monitors and update global reputation scores
+ * Share judge observations across judges and update global reputation scores
  * Called during simulation after HTLC observations are recorded
  * Updates network->nodes[*]->reputation_score based on integrated information
  */
-void share_monitor_information_and_update_reputation(
+void share_judge_information_and_update_reputation(
     struct network* network,
     struct network_params net_params
 );
 
 /**
- * Report an attacked node from the one-hop upstream node to the monitoring layer.
+ * Report an attacked node from the one-hop upstream node to the judging layer.
  * This is invoked at the node that first observes the failure.
  */
-void report_attacked_node_to_monitors(
+void report_attacked_node_to_judges(
     struct network* network,
     long reporter_node_id,
     long attacked_node_id,
@@ -130,7 +130,7 @@ void report_attacked_node_to_monitors(
 
 /**
  * Reconstruct path from observation chains
- * Used internally by integrate_observations_from_monitors
+ * Used internally by integrate_observations_from_judges
  */
 long* reconstruct_payment_path_from_chain(
     struct array* observation_chain,
@@ -162,24 +162,24 @@ void free_estimated_payment(struct estimated_payment* est);
 void free_all_observations();
 
 /**
- * Monitor trust score management
+ * Judge trust score management
  */
-struct monitor_trust_score {
-    long monitor_id;
+struct judge_trust_score {
+    long judge_id;
     double trust_score;  // [0.0, 1.0]
     int correct_observations;
     int contradicted_observations;
 };
 
 /**
- * Initialize monitor trust scores (all monitors start at 0.8)
+ * Initialize judge trust scores (all judges start at 0.8)
  */
-void initialize_monitor_trust_scores(struct network* network);
+void initialize_judge_trust_scores(struct network* network);
 
 /**
- * Update monitor trust score based on observation accuracy
+ * Update judge trust score based on observation accuracy
  */
-void update_monitor_trust_score(long monitor_id, int is_correct);
+void update_judge_trust_score(long judge_id, int is_correct);
 
 /**
  * Register node_id as having filed an attack report for payment.
@@ -193,6 +193,27 @@ void register_attack_reporter(struct payment* payment, long node_id);
 int has_attack_reporter(struct payment* payment, long node_id);
 
 /* ===========================================================================
+ * === 役割の用語: 「計測・報告者」/「判定ノード」 ===
+ *
+ * 検知は 2 つの役割に分かれる。呼称はこの 2 語で統一する:
+ *
+ *   計測・報告者 (reporter)  必ず PCN ノード。HTLC を実際に転送する立場で
+ *       レイテンシを計測し、異常を検知したら判定ノードへ報告する。fail 検知器では
+ *       異常ホップの上流ノード、hold 検知器では決済を受け取る上流ノード
+ *       (prev_node_id) が該当する。コード上の識別子は reporter_* / *_reporters。
+ *
+ *   判定ノード (judge)  報告されたデータをもとに検定で判定し、評判を更新する層。
+ *       JudgeAgent として配置され、node->is_judge で識別する。
+ *       report_attacked_node_to_judges() が報告の受け口。
+ *
+ * 判定ノードが報告を受け付けられる攻撃者かどうかは is_node_observed_by_judges()
+ * が決める (method1 = 判定ノードと同一ノードのみ / method2 = 担当先。担当先は
+ * 既定で全ノード、env CLOTH_OBSERVE_DEGREE_MIN で次数下限を設定可)。
+ *
+ * ⚠️ 旧称「監視ノード」は使わない: 観測するだけでなく検定して判定を下す層なので、
+ *    「監視」だと計測・報告者との役割の違いが曖昧になるため。
+ *
+ * ===========================================================================
  * === 検知器の用語: 「fail 検知器」/「hold 検知器」 ===
  *
  * 2 つの検知器は「攻撃型ごと」ではなく「HTLC のどちらのレグを測るか」で分かれて

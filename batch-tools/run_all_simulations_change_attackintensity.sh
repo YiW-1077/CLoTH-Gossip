@@ -151,8 +151,8 @@ for routing_method in "${ROUTING_METHODS[@]}"; do
 
         enqueue_simulation "./run-simulation.sh $seed $base/baseline_no_attack \
             n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
-            malicious_node_ratio=0.0 malicious_failure_probability=0.0 monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT \
-            enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 \
+            malicious_node_ratio=0.0 malicious_failure_probability=0.0 judging_strategy=disabled top_hub_count=$TOP_HUB_COUNT \
+            enable_reputation_system=false enable_judge_movement=false movement_credit_limit=0 \
             enable_pra=false enable_prt=false enable_rbr=false \
             average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt \
             $ATTACK_DELAY_PARAMS_OFF $method_params"
@@ -163,24 +163,24 @@ for routing_method in "${ROUTING_METHODS[@]}"; do
 
                 enqueue_simulation "./run-simulation.sh $seed $intensity/no_defense \
                     n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
-                    malicious_node_ratio=$ratio malicious_failure_probability=$prob monitoring_strategy=disabled top_hub_count=$TOP_HUB_COUNT \
-                    enable_reputation_system=false enable_monitor_movement=false movement_credit_limit=0 \
+                    malicious_node_ratio=$ratio malicious_failure_probability=$prob judging_strategy=disabled top_hub_count=$TOP_HUB_COUNT \
+                    enable_reputation_system=false enable_judge_movement=false movement_credit_limit=0 \
                     enable_pra=false enable_prt=false enable_rbr=false \
                     average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt \
                     $ATTACK_DELAY_PARAMS_ON $method_params"
 
                 enqueue_simulation "./run-simulation.sh $seed $intensity/detection_only \
                     n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
-                    malicious_node_ratio=$ratio malicious_failure_probability=$prob monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT \
-                    enable_reputation_system=true enable_monitor_movement=false movement_credit_limit=0 \
+                    malicious_node_ratio=$ratio malicious_failure_probability=$prob judging_strategy=method2 top_hub_count=$TOP_HUB_COUNT \
+                    enable_reputation_system=true enable_judge_movement=false movement_credit_limit=0 \
                     enable_pra=false enable_prt=false enable_rbr=false \
                     average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt \
                     $ATTACK_DELAY_PARAMS_ON $method_params"
 
                 enqueue_simulation "./run-simulation.sh $seed $intensity/full_defense \
                     n_payments=$N_PAYMENTS mpp=0 payment_timeout=$PAYMENT_TIMEOUT_MS routing_method=$routing_method \
-                    malicious_node_ratio=$ratio malicious_failure_probability=$prob monitoring_strategy=method2 top_hub_count=$TOP_HUB_COUNT \
-                    enable_reputation_system=true enable_monitor_movement=true movement_credit_limit=5 \
+                    malicious_node_ratio=$ratio malicious_failure_probability=$prob judging_strategy=method2 top_hub_count=$TOP_HUB_COUNT \
+                    enable_reputation_system=true enable_judge_movement=true movement_credit_limit=5 \
                     enable_pra=true enable_prt=true enable_rbr=true rbr_reputation_weight=10.0 \
                     average_payment_amount=$avg_pmt_amt variance_payment_amount=$var_pmt_amt \
                     $ATTACK_DELAY_PARAMS_ON $method_params"

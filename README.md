@@ -87,7 +87,7 @@ When enabled, hops traversing malicious nodes inside the attack window get addit
 
 Set `enable_simple_progress_mode=true` in `config/cloth_input.txt` to print one-line live simulation progress:
 - red: malicious node
-- blue: monitor node
+- blue: judge node
 - black: normal node
 
 To open a separate live graph window with connected channel lines, also set:
