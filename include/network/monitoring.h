@@ -192,6 +192,41 @@ void register_attack_reporter(struct payment* payment, long node_id);
  */
 int has_attack_reporter(struct payment* payment, long node_id);
 
+/* ===========================================================================
+ * === 検知器の用語: 「fail 検知器」/「hold 検知器」 ===
+ *
+ * 2 つの検知器は「攻撃型ごと」ではなく「HTLC のどちらのレグを測るか」で分かれて
+ * いる。ただし報告する攻撃型は 1 対 1 に対応するので、呼称は報告対象で統一する:
+ *
+ *   fail 検知器 : on_fail_hypothesis_test()
+ *       測定 = forward leg のホップ間レイテンシ
+ *              (hop_send_times[i] → hop_send_times[i+1] または result_time)
+ *       報告 = fail 型攻撃のみ。is_fail=0 (成功) では should_report を立てない
+ *              (成功経路の呼び出しは baseline 更新と Axis-2 カウンタ蓄積が目的)。
+ *
+ *   hold 検知器 : on_hold_hypothesis_test()
+ *       測定 = settlement (backward) レグの転送レイテンシ
+ *              (= preimage を上流へ release するまでの保持時間)
+ *       報告 = hold 型攻撃。hold 型は支払いを成功させるので fail 検知器には映らない。
+ *
+ * 各ノードは両検知器の検定を独立に受ける。どちらの検知器が呼ばれるかはイベント種別
+ * (receive_fail / forward_success) による機械的なディスパッチであり、ノードが
+ * fail 型か hold 型かの事前判定 (教師ラベル) は一切使わない。
+ *
+ * ⚠️ 「forward 検知器」という呼称は使わない: forward leg を測ってはいるが報告する
+ *    のは失敗ケースのみで、forward leg で遅延させつつ成功させる攻撃 (slow-forward)
+ *    はどちらの検知器も報告しない。レグ名で呼ぶと実装より広い範囲をカバーしている
+ *    印象を与えるため。将来 slow-forward の報告経路を足す場合は、同じ forward leg
+ *    測定に 3 本目の報告経路 (slow 検知器) が増える、という位置づけになる。
+ *
+ * env 名は過去 run の再現性のため旧称のまま。対応は以下:
+ *   fail 検知器 : CLOTH_NULL_DEGREE_SIGMA, CLOTH_NULL_QUANTILE, CLOTH_NULL_Q_STEP,
+ *                 CLOTH_DETECT_KOFM, CLOTH_DETECT_WINDOW, CLOTH_DETECT_K,
+ *                 CLOTH_ATTRIB_PER_HOP
+ *   hold 検知器 : CLOTH_DETECT_GRIEF ("grief"=hold), CLOTH_SETTLE_* ("settle"=hold)
+ *   両方で共有   : CLOTH_PVALUE_THRESHOLD (α), CLOTH_WARMUP_PAYMENTS
+ * =========================================================================== */
+
 /**
  * Calculate p-value using log-normal distribution hypothesis test
  * H0: latency is normal network congestion
@@ -206,14 +241,16 @@ double calculate_p_value_log_normal(double observed_latency_ms, double baseline_
  * μ_new = μ_old × 0.99 + ln(latency + 1) × 0.01
  * σ_new updated to match observed variance around new μ
  */
-void update_baseline_lognormal(struct node* node, double observed_latency_ms);
+void update_fail_baseline_lognormal(struct node* node, double observed_latency_ms);
 
 /**
- * Process payment completion/failure result: compute latency, check for attacks via p-value
- * Called when HTLC result is received (Fulfill or Fail event)
- * Returns 1 if node should be reported (p < 0.01 and suspicion_score >= 3), 0 otherwise
+ * fail 検知器: forward leg のホップ間レイテンシを対数正規 null で検定する。
+ * htlc.c の receive_fail() (is_fail=1) と receive_success() (is_fail=0) の双方から
+ * 経路上の全ホップについて呼ばれるが、報告 (戻り値 1) は is_fail=1 のときのみ。
+ * is_fail=0 の呼び出しは baseline 更新と Axis-2 カウンタ蓄積が目的。
+ * 戻り値: 1=fail 型攻撃として報告すべき, 0=正常 / warmup 中 / 成功経路。
  */
-int on_payment_result_hypothesis_test(
+int on_fail_hypothesis_test(
     struct node* forwarding_node,
     uint64_t htlc_send_time,
     uint64_t result_time,
@@ -222,13 +259,14 @@ int on_payment_result_hypothesis_test(
 );
 
 /**
- * Grief-hold detection (Phase 1): 決済(backward)経路でノードが success を上流へ
+ * hold 検知器 (Phase 1): settlement (backward) レグでノードが success を上流へ
  * release するまでの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。
- * フォワードの baseline_* とは別系統(settle_baseline_*)を用い、保持攻撃者本人を
+ * fail 検知器の baseline_* とは別系統(settle_baseline_*)を用い、保持攻撃者本人を
  * 直接特定する(下流帰属トリック不要 — 保持ノード自身が release を転送するため)。
- * 戻り値: 1=報告すべき異常(保持), 0=正常 or warmup中。
+ * hold 型は支払いを成功させるため fail 検知器には映らず、この検知器だけが拾える。
+ * 戻り値: 1=hold 型攻撃として報告すべき, 0=正常 or warmup中。
  */
-int on_settlement_result_hypothesis_test(
+int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
     long payment_count_global,

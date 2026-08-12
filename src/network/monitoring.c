@@ -9,8 +9,13 @@
 #include "network/network.h"
 #include "core/payments.h"
 
-/* Runtime-configurable detection parameters (via env vars):
- * CLOTH_PVALUE_THRESHOLD - p-value threshold for anomaly (default 0.005)
+/* 検知器の呼称は「fail 検知器」(forward leg 測定 / fail 型を報告) と
+ * 「hold 検知器」(settlement レグ測定 / hold 型を報告) で統一する。定義と env 名の
+ * 対応表は monitoring.h 冒頭の「検知器の用語」ブロックを参照。
+ *
+ * Runtime-configurable detection parameters (via env vars):
+ * CLOTH_PVALUE_THRESHOLD - p-value threshold for anomaly (default 0.005)。α は
+ *                          fail / hold 両検知器で共有。
  * CLOTH_TIME_WINDOW_MS  - time window for chaining observations in ms (default 10000)
  */
 static double get_pvalue_threshold() {
@@ -21,14 +26,17 @@ static double get_pvalue_threshold() {
     return v;
 }
 
-/* === Axis-3: 次数依存の null σ 膨張 ===
+/* === Axis-3: 次数依存の null σ 膨張 (fail 検知器のみ) ===
  * 多忙ハブは本物の輻輳で log-latency の裾が重く、単一対数正規 null では異常率が
  * α を超える(=null誤特定→ハブ底上げ)。σ_eff = σ·(1 + k·log(1+degree)) で次数が
  * 高いノードほど null を広げ、honest hub の異常率を α に戻す。
- * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.04 = ON)。n 増に伴う forward 検知器の FWER
+ * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.04 = ON)。n 増に伴う fail 検知器の FWER
  * (高次数ハブの誤報告) を抑え precision を保つ。n=12800 で precision 90->96% を実測。
- * env で上書き可、0 を明示すると無効=従来の単一対数正規 null。 */
-static double get_null_degree_sigma() {
+ * env で上書き可、0 を明示すると無効=従来の単一対数正規 null。
+ * ⚠️ hold 検知器はこの σ 膨張を使わない: settlement レグのレイテンシは次数非依存
+ *    (Phase0 実測) なので degree を説明変数にする根拠がなく、代わりに per-node
+ *    経験分位点 null (下の hold 版) を用いる。 */
+static double get_fail_null_degree_sigma() {
     char *env = getenv("CLOTH_NULL_DEGREE_SIGMA");
     if (env == NULL) return 0.04;
     double v = atof(env);
@@ -36,16 +44,16 @@ static double get_null_degree_sigma() {
     return v;
 }
 
-/* === Axis-3(forward検知の実験レバー, 既定OFF, CLOTH_NULL_QUANTILE=true): per-node 経験的 heavy-tail null ===
+/* === Axis-3(fail 検知器の実験レバー, 既定OFF, CLOTH_NULL_QUANTILE=true): per-node 経験的 heavy-tail null ===
  * 各ノードが自分の log-latency の (1-α) 分位点 anom_q を Robbins-Monro で学習し、
  * anomalous = (log_lat > anom_q) と判定する。これにより per-node の異常率が α に
  * 収束 → 多忙ハブも自分の本物の裾に合わせた高い閾値を学び FP が消える(degree不使用)。
- * 静かなノードは低い閾値のまま感度を保つ。採用済みの決済(hold)版は下記 settle 版を参照。 */
-static int get_null_quantile_mode() {
+ * 静かなノードは低い閾値のまま感度を保つ。hold 検知器では同方式を採用済み(下の hold 版)。 */
+static int get_fail_null_quantile_mode() {
     char *env = getenv("CLOTH_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
 }
-static double get_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
+static double get_fail_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
     char *env = getenv("CLOTH_NULL_Q_STEP");
     if (env == NULL) return 0.05;
     double v = atof(env);
@@ -53,18 +61,18 @@ static double get_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
     return v;
 }
 
-/* === 決済(hold)検知器の per-node heavy-tail null (CLOTH_SETTLE_NULL_QUANTILE=true) ===
+/* === hold 検知器の per-node heavy-tail null (CLOTH_SETTLE_NULL_QUANTILE=true) ===
  * 各ノードが warmup 中(=攻撃非アクティブ=クリーン)に自分の log-settle-latency の
  * (1-α)分位点 settle_anom_q を Robbins-Monro で学習し、post-warmup は凍結してその
  * per-node 閾値で判定する。多忙な正直ハブは自分の重い裾を学習するので過剰発火せず
  * (hub-bottom-drag の FP を抑制)、保持(≈2x)はどのノードの裾も超えるので検出は残る。
  * 汚染回避のため学習は warmup 限定(post-warmup の保持サンプルは裾に混ぜない)。
  * step は絶対値(σで割らない)=低トラフィックノード固着(旧試作の不安定②)を回避。 */
-static int get_settle_null_quantile_mode() {
+static int get_hold_null_quantile_mode() {
     char *env = getenv("CLOTH_SETTLE_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
 }
-static double get_settle_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
+static double get_hold_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
     char *env = getenv("CLOTH_SETTLE_Q_STEP");
     if (env == NULL) return 0.05;
     double v = atof(env);
@@ -132,12 +140,12 @@ static int get_detect_k() {      /* k: 窓内の異常回数しきい値 */
     return v;
 }
 /* === lever②: 報告 strike を「報告者(上流)」から「攻撃者(帰属先)」へ移す ===
- * fail 検知の既定を per-hop 1-strike にする。従来は報告者ノードの suspicion_score>=2
+ * fail 検知器の既定を per-hop 1-strike にする。従来は報告者ノードの suspicion_score>=2
  * を要求していた(報告者ごとの2-strike)が、低 n では1攻撃者あたりの異常が希少かつ
  * 別ルート=別上流に断片化し、どの上流も2に届かず攻撃者が取り残されていた
  * ([[recall_low_n_observation_gap]])。per-hop は各異常ホップで即時 1-strike 報告し、
  * 多重証拠ガードを攻撃者側の報告累計(CLOTH_FLAG_MIN_REPORTS, cloth.c, 既定1)に委ねる
- * (=settle検知器と同じ設計)。frozen-denominator 実測(method2/mix, seed42)で
+ * (=hold 検知器と同じ設計)。frozen-denominator 実測(method2/mix, seed42)で
  * recall +3.5〜+11.4pp(低nほど大), precision 不変(FP増なし)を確認。
  * **既定 ON**。CLOTH_ATTRIB_PER_HOP=0 (または false) で従来の報告者2-strikeに戻せる
  * (過去 run との比較再現用)。 */
@@ -889,7 +897,7 @@ double calculate_p_value_log_normal(double observed_latency_ms, double baseline_
  * Update baseline using exponential moving average (EMA)
  * EMA weight: 0.99 old, 0.01 new (slow adaptation)
  */
-void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
+void update_fail_baseline_lognormal(struct node* node, double observed_latency_ms) {
     if (node == NULL) return;
 
     double log_latency = log(observed_latency_ms + 1.0);
@@ -920,36 +928,34 @@ void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
 }
 
 /**
- * Process HTLC result and apply hypothesis testing
- *
- * Returns: 1 if attack should be reported (suspicion_score >= 2), 0 otherwise
- *
- * Logic:
- * 1. Compute p-value from observed latency
- * 2. During warm-up (payment_count < 500): learn baseline, update score but don't report
- * 3. After warm-up:
- *    - If p < 0.005: increment suspicion_score
- *    - If p >= 0.005: decrement suspicion_score (if > 0)
- *    - If suspicion_score >= 2: return 1 (report attack)
- * 4. Always update baseline for next iteration
- */
-/**
- * on_payment_result_hypothesis_test  ― ホップ間レイテンシ仮説検定版
+ * on_fail_hypothesis_test ― fail 検知器 (forward leg のホップ間レイテンシ)
  *
  * htlc.c 側で hop_send_times[i] → hop_send_times[i+1]（または result_time）を
  * 1 ホップ分の区間レイテンシとして渡すため、ここでは 1 ホップ単体を検定する。
  * 監視ノードの有無に関係なく、各ノードを独立に評価できる。
  *
+ * 処理:
+ * 1. warmup 中 (payment_count_global < CLOTH_WARMUP_PAYMENTS, 既定 500) は
+ *    baseline 学習のみで報告しない。
+ * 2. post-warmup は p < α (CLOTH_PVALUE_THRESHOLD, 既定 0.005) で異常と判定し、
+ *    Axis-2 カウンタ (hyp_test_count / hyp_anomaly_count) を蓄積する。
+ * 3. 報告 (戻り値 1) は is_fail=1 のときのみ。既定は per-hop 1-strike
+ *    (CLOTH_ATTRIB_PER_HOP)、k-of-m モードでは窓内異常数 >= k を要求。
+ * 4. 非異常観測でのみ baseline を更新する (攻撃レイテンシでの汚染回避)。
+ *
  * 引数:
- *   forwarding_node     : 検定対象のノード
+ *   forwarding_node     : 検定対象のノード (= hop[i].from_node)
  *   htlc_send_time      : そのホップの送信開始時刻
  *   result_time         : そのホップの処理完了時刻（次ホップ送信 or 最終結果時刻）
  *   payment_count_global: グローバル支払いカウント（ウォームアップ判定用）
- *   is_fail             : 1=forward_fail, 0=forward_success
+ *   is_fail             : 1=receive_fail 経路, 0=receive_success 経路(報告なし)
  *
- * 戻り値: 1=報告すべき異常検知, 0=正常 or ウォームアップ中
+ * 戻り値: 1=fail 型攻撃として報告すべき, 0=正常 / warmup 中 / 成功経路
+ *
+ * hold 型 (支払いを成功させ settlement レグで preimage を保持) はこの検知器には
+ * 映らない。on_hold_hypothesis_test (hold 検知器) が担当する。
  */
-int on_payment_result_hypothesis_test(
+int on_fail_hypothesis_test(
     struct node* forwarding_node,
     uint64_t htlc_send_time,
     uint64_t result_time,
@@ -966,7 +972,7 @@ int on_payment_result_hypothesis_test(
 
     /* === ウォームアップ(最初の500支払い): ベースライン学習のみ === */
     if (payment_count_global < get_warmup_payments()) {
-        update_baseline_lognormal(forwarding_node, latency_ms);
+        update_fail_baseline_lognormal(forwarding_node, latency_ms);
         return 0;
     }
 
@@ -975,7 +981,7 @@ int on_payment_result_hypothesis_test(
     double p_threshold = get_pvalue_threshold();
     int anomalous;
     double p_value = -1.0; /* 診断ログ用 (quantileモードでは未使用→-1) */
-    if (get_null_quantile_mode()) {
+    if (get_fail_null_quantile_mode()) {
         /* per-node 経験的分位点 null: log_lat が学習済み (1-α)分位点 anom_q を超えたら異常。
          * anom_q を Robbins-Monro で更新し per-node 異常率を α に収束させる。 */
         double log_lat = log(latency_ms + 1.0);
@@ -985,13 +991,13 @@ int on_payment_result_hypothesis_test(
         double gauss_thresh = forwarding_node->baseline_mean + 2.326 * sd; /* α=0.01 の z */
         if (forwarding_node->anom_q < gauss_thresh) forwarding_node->anom_q = gauss_thresh;
         anomalous = (log_lat > forwarding_node->anom_q);
-        double step = get_null_q_step() * sd;
+        double step = get_fail_null_q_step() * sd;
         forwarding_node->anom_q += step * ((anomalous ? 1.0 : 0.0) - p_threshold);
         if (forwarding_node->anom_q < gauss_thresh) forwarding_node->anom_q = gauss_thresh;
     } else {
         /* Axis-3(degree版) or 従来: 次数依存で null σ を広げる (k=0 なら従来の baseline_std)。 */
         double sigma_eff = forwarding_node->baseline_std;
-        double k_null = get_null_degree_sigma();
+        double k_null = get_fail_null_degree_sigma();
         if (k_null > 0.0) {
             long deg = (forwarding_node->open_edges != NULL)
                            ? array_len(forwarding_node->open_edges) : 0;
@@ -1022,7 +1028,7 @@ int on_payment_result_hypothesis_test(
                 should_report = 1;
         } else {
             /* 正常観測でベースライン更新(攻撃レイテンシでの汚染を避ける) */
-            update_baseline_lognormal(forwarding_node, latency_ms);
+            update_fail_baseline_lognormal(forwarding_node, latency_ms);
         }
     } else {
         /* === 従来: suspicion_score ランダムウォーク (+1異常/-1正常, +2で報告) === */
@@ -1037,7 +1043,7 @@ int on_payment_result_hypothesis_test(
         } else {
             if (forwarding_node->suspicion_score > 0)
                 forwarding_node->suspicion_score--;
-            update_baseline_lognormal(forwarding_node, latency_ms);
+            update_fail_baseline_lognormal(forwarding_node, latency_ms);
         }
     }
 
@@ -1067,15 +1073,15 @@ int on_payment_result_hypothesis_test(
     return should_report;
 }
 
-/* === Grief-hold detection (Phase 1): 決済(backward)経路レイテンシの baseline 更新 ===
- * フォワードの update_baseline_lognormal と同型だが settle_baseline_* を更新する。
+/* === hold 検知器 (Phase 1): settlement (backward) レグレイテンシの baseline 更新 ===
+ * fail 検知器の update_fail_baseline_lognormal と同型だが settle_baseline_* を更新する。
  * 正常観測でのみ呼ぶこと(保持攻撃のレイテンシで baseline を汚染しないため)。 */
-static void update_settle_baseline_lognormal(struct node* node, double latency_ms) {
+static void update_hold_baseline_lognormal(struct node* node, double latency_ms) {
     double log_latency = log(latency_ms + 1.0);
     if (node->settle_baseline_mean == 0.0 && node->settle_baseline_var == 0.0) {
         node->settle_baseline_mean = log_latency;
-        /* 初期 σ²=0.01 (σ=0.1)。決済レイテンシは log空間で非常に密(実測 std~0.02)
-         * なので forward版の 0.25 は緩すぎ、2×保持(log+0.685)でも z=1.45 にしかならず
+        /* 初期 σ²=0.01 (σ=0.1)。settlement レグのレイテンシは log空間で非常に密
+         * (実測 std~0.02) なので fail 検知器の 0.25 は緩すぎ、2×保持(log+0.685)でも z=1.45 にしかならず
          * p<0.01 を超えられない(=保持を全く検知できない)。0.01 なら保持 z=6.85 で確実に
          * 異常、正常揺らぎ(z~0.3)は非異常。env CLOTH_SETTLE_VAR_INIT で調整可。 */
         double var_init = 0.01;
@@ -1089,8 +1095,12 @@ static void update_settle_baseline_lognormal(struct node* node, double latency_m
     node->settle_baseline_var  = 0.99 * node->settle_baseline_var  + 0.01 * (dev * dev);
 }
 
-/* See monitoring.h. 決済転送レイテンシ(=preimage保持時間)を対数正規 null で検定。 */
-int on_settlement_result_hypothesis_test(
+/* hold 検知器。See monitoring.h.
+ * settlement レグの転送レイテンシ(=preimage保持時間)を対数正規 null で検定する。
+ * 入力は (ノード, 観測レイテンシ, 支払い数, seed) のみで、そのノードが hold 型攻撃者
+ * かどうかの事前ラベル (payment->grief_hold_node_id / node->is_malicious) は渡らない。
+ * forward_success を処理する全ノードが同じ検定を受ける。 */
+int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
     long payment_count_global,
@@ -1098,13 +1108,13 @@ int on_settlement_result_hypothesis_test(
 ) {
     if (node == NULL || settle_latency_ms <= 0.0) return 0;
 
-    /* === グローバル決済 baseline で seed ===
-     * Phase0 で決済レイテンシは次数非依存・全 honest ノードでほぼ一定(=平均転送
-     * インターバル付近)と判明。よって per-node 学習を待たず、全ノードを共通の
+    /* === グローバルな settlement baseline で seed ===
+     * Phase0 で settlement レグのレイテンシは次数非依存・全 honest ノードでほぼ一定
+     * (=平均転送インターバル付近)と判明。よって per-node 学習を待たず、全ノードを共通の
      * グローバル既定値で初期化する。これで (a) 未学習ノードがゼロ=カバレッジ全域、
      * (b) 保持(2×)は seed に対し常に異常→baseline 更新されず汚染なし、を同時に解決。
-     * 旧 per-node 学習方式は決済サンプルが疎で大半が未検定&warmup後初出ノードが保持を
-     * 学習して汚染、という二重の取りこぼしがあった。 */
+     * 旧 per-node 学習方式は settlement サンプルが疎で大半が未検定&warmup後初出ノードが
+     * 保持を学習して汚染、という二重の取りこぼしがあった。 */
     if (node->settle_baseline_mean == 0.0) {
         double seed = (expected_settle_ms > 0.0) ? expected_settle_ms : 100.0;
         node->settle_baseline_mean = log(seed + 1.0);
@@ -1115,20 +1125,20 @@ int on_settlement_result_hypothesis_test(
     }
 
     double p_threshold = get_pvalue_threshold();
-    int settle_qmode = get_settle_null_quantile_mode();
+    int settle_qmode = get_hold_null_quantile_mode();
 
     /* グローバル warmup 中は報告しない(攻撃遅延も非アクティブ)。baseline は refine のみ。
      * quantile モードでは warmup のクリーン(攻撃非アクティブ)サンプルで per-node の
      * (1-α)分位点 settle_anom_q も RM 学習する(post-warmup は凍結=保持サンプルで汚染しない)。 */
     if (payment_count_global < get_warmup_payments()) {
-        update_settle_baseline_lognormal(node, settle_latency_ms);
+        update_hold_baseline_lognormal(node, settle_latency_ms);
         if (settle_qmode) {
             double log_lat = log(settle_latency_ms + 1.0);
             double sdw = sqrt(node->settle_baseline_var); if (sdw < 1e-6) sdw = 0.1;
             double gauss = node->settle_baseline_mean + 2.326 * sdw; /* Gaussian ~99%点(下限) */
             if (node->settle_anom_q < gauss) node->settle_anom_q = gauss;
             int a = (log_lat > node->settle_anom_q) ? 1 : 0;
-            node->settle_anom_q += get_settle_q_step() * ((double)a - p_threshold); /* 絶対ステップ(②安定化) */
+            node->settle_anom_q += get_hold_q_step() * ((double)a - p_threshold); /* 絶対ステップ(②安定化) */
             if (node->settle_anom_q < gauss) node->settle_anom_q = gauss;
         }
         return 0;
@@ -1154,7 +1164,7 @@ int on_settlement_result_hypothesis_test(
     if (anomalous) node->settle_anomaly_count++;
 
     /* 報告に要する異常回数 (strike)。既定 1 (初回異常で報告)。
-     * 本検知器は正常ノードの異常率が ~0 (seed42/7 で honest anomaly=0) なので、
+     * hold 検知器は正常ノードの異常率が ~0 (seed42/7 で honest anomaly=0) なので、
      * 1-strike でも FP を増やさず recall を感度上限近く(47%->76%)まで上げられる
      * ことを実測済み。保守側に戻したい場合は env CLOTH_SETTLE_REPORT_STRIKES=2。 */
     int report_strikes = 1;
@@ -1171,7 +1181,7 @@ int on_settlement_result_hypothesis_test(
         if (node->settle_suspicion >= report_strikes) should_report = 1;
     } else {
         if (node->settle_suspicion > 0) node->settle_suspicion--;
-        update_settle_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
+        update_hold_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
     }
     return should_report;
 }

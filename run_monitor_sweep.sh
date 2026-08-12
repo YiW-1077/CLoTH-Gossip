@@ -104,8 +104,9 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 
 # ---------------------------------------------------------------------------
 # FWER対策 (攻撃者検知 precision の n 依存低下の緩和) を全 sim で有効化。
-#   CLOTH_NULL_DEGREE_SIGMA : degree-σ null。高次数ノードの仮説検定 null を
-#                             広げて誤報告(FP源)を走行中に抑える (Axis-3)。
+#   CLOTH_NULL_DEGREE_SIGMA : fail 検知器の degree-σ null。高次数ノードの仮説検定
+#                             null を広げて誤報告(FP源)を走行中に抑える (Axis-3)。
+#                             hold 検知器には適用されない (次数非依存のため)。
 #   CLOTH_RATE_GATE_TAU     : report-rate gate。低レポートレートの flag を実行末に
 #                             取り消す測定専用フィルタ (経路・評判には不干渉)。
 # 検証値: k=0.04 + τ=1e-3 で FP 6->0 / precision 100% / recall 無損失。
@@ -127,7 +128,7 @@ GRIEF_HOLD_RATIO=0.5   # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ---------------------------------------------------------------------------
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
-[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で決済検知器を自動ON
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で hold 検知器を自動ON
 echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 
 # ---------------------------------------------------------------------------
@@ -153,8 +154,8 @@ else
     echo "[Config] 代役ハブ OFF (SUBSTITUTE_COUNT=0 指定・全モードrealistic baseline)。"
 fi
 
-# 決済(hold)検知の per-node heavy-tail null。既定ON。各ノードが warmup 中に自分の
-# (1-α)決済レイテンシ分位点 settle_anom_q を学習し post-warmup 凍結→多忙ハブの重い裾を
+# hold 検知器の per-node heavy-tail null。既定ON。各ノードが warmup 中に自分の
+# (1-α) settlement レグレイテンシ分位点 settle_anom_q を学習し post-warmup 凍結→多忙ハブの重い裾を
 # 自ノード baseline で吸収し、高nの誤検知(FP)を潰す(precision 87%→99.6% @ n=25600-102400,
 # seed7で確認)。代役ハブとは独立。防御モード(method1/2)のみに適用(no_defenseは検知OFFで
 # 無関係)。旧グローバル lognormal null に戻したい場合は env SETTLE_QUANTILE_NULL=0。

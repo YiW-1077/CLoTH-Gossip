@@ -54,7 +54,7 @@ struct node* new_node(long id) {
   node->hyp_test_count = 0;
   node->hyp_anomaly_count = 0;
   node->anom_q = 0.0;
-  /* === Grief-hold detection (settlement baseline) === */
+  /* === hold 検知器 (settlement レグの baseline) === */
   node->settle_baseline_mean = 0.0;
   node->settle_baseline_var = 0.0;
   node->settle_anom_q = 0.0;

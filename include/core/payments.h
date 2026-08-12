@@ -56,9 +56,10 @@ struct payment {
   int hop_send_times_capacity;      // allocated size for hop_send_times
   int hop_send_times_initialized;   // flag: 1 if malloc'd, 0 if not
 
-  /* === Grief-hold attack (backward settlement delay, no fail) ===
-   * 混在モードで、ある悪意ノードが「フォワードで失敗させず、決済(backward)経路で
-   * preimage を保持して遅延させる」と決めた場合、そのノード id を記録する(-1=なし)。
+  /* === hold 型攻撃 (settlement レグでの保持遅延。支払いは失敗させない) ===
+   * 混在モードで、ある悪意ノードが「forward leg では失敗させず、settlement
+   * (backward) レグで preimage を保持して遅延させる」と決めた場合、そのノード id を
+   * 記録する(-1=なし)。この値は攻撃注入側の内部状態で、検知器には渡らない。
    * 1経路につき1ノード(最後に hold を選んだノード)を保持。計測フェーズには十分。 */
   long grief_hold_node_id;
   

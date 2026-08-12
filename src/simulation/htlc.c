@@ -107,8 +107,8 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
 
 /* === 攻撃手法セレクタ (CLOTH_ATTACK_MODE) ===
  * 悪意ノードが行う攻撃の種別をスクリプトから選択する:
- *   1 = fail 型のみ        (従来の HTLC 失敗攻撃; hold 割合 0.0)
- *   2 = hold 型のみ        (決済 backward 経路での preimage 保持グリーフィング単独; 割合 1.0)
+ *   1 = fail 型のみ        (forward leg で遅延させ HTLC を失敗させる; hold 割合 0.0)
+ *   2 = hold 型のみ        (settlement=backward レグでの preimage 保持グリーフィング単独; 割合 1.0)
  *   3 = 混在 (fail + hold) (hold 割合は CLOTH_GRIEF_HOLD_RATIO、既定 0.5)
  * 未設定/範囲外のときは 0 を返し、get_grief_hold_ratio() は後方互換のため
  * CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0 = 従来どおり全て fail 型)。 */
@@ -120,12 +120,13 @@ static int get_attack_mode(void) {
   return m;
 }
 
-/* === Grief-hold 攻撃 (決済=backward 経路での preimage 保持遅延) ===
+/* === hold 型攻撃 (settlement=backward レグでの preimage 保持遅延) ===
  * 悪意ノードが行う攻撃のうち「保持(hold)型」にする割合 [0,1] を返す。
  * CLOTH_ATTACK_MODE が設定されていればそれを優先 (1→0.0, 2→1.0, 3→混在割合)、
  * 未設定なら後方互換のため env CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0)。
- * hold 型に当たった攻撃は、フォワードで失敗させず通常転送し、backward 経路で
- * そのノードが preimage の release を遅延させる(失敗なし=支払いは成功)。 */
+ * hold 型に当たった攻撃は、forward leg では失敗させず通常転送し、settlement レグで
+ * そのノードが preimage の release を遅延させる(失敗なし=支払いは成功)。よって
+ * fail 検知器には映らず hold 検知器だけが拾える (monitoring.h の用語ブロック参照)。 */
 static double get_grief_hold_ratio(void) {
   int mode = get_attack_mode();
   if (mode == 1) return 0.0;   /* fail 型のみ */
@@ -147,15 +148,17 @@ static double get_grief_hold_ratio(void) {
 }
 
 /* シャドウ計測(報告はせず CSV 出力のみ)の有効化。CLOTH_GRIEF_SHADOW_LOG が
- * 設定されているときだけ /tmp/cloth_grief_shadow.csv に決済転送レイテンシを記録。 */
-static int grief_shadow_log_enabled(void) {
+ * 設定されているときだけ /tmp/cloth_grief_shadow.csv に settlement レグの転送
+ * レイテンシを記録。 */
+static int hold_shadow_log_enabled(void) {
   return getenv("CLOTH_GRIEF_SHADOW_LOG") != NULL;
 }
 
-/* Grief-hold 検知器 (Phase 1) の有効化。CLOTH_DETECT_GRIEF が設定されているとき、
- * forward_success() で各ノードの決済転送レイテンシを仮説検定し、保持攻撃者を
- * 直接特定して report_attacked_node_to_monitors() に報告する。既定 OFF。 */
-static int get_detect_grief(void) {
+/* hold 検知器 (Phase 1) の有効化。CLOTH_DETECT_GRIEF が設定されているとき、
+ * forward_success() で各ノードの settlement レグ転送レイテンシを仮説検定し、保持
+ * 攻撃者を直接特定して report_attacked_node_to_monitors() に報告する。既定 OFF。
+ * (env 名の "GRIEF" は過去 run の再現性のため旧称のまま = hold 検知器のこと) */
+static int get_detect_hold(void) {
   return getenv("CLOTH_DETECT_GRIEF") != NULL;
 }
 
@@ -1005,11 +1008,13 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
   prev_node_id = prev_hop->from_node_id;
   event_type = prev_node_id == payment->sender ? RECEIVESUCCESS : FORWARDSUCCESS;
 
-  /* === backward(決済)経路の保持時間 ===
-   * 通常はランダムな転送インターバル。このノードが grief-hold 攻撃者として
-   * 予約 (payment->grief_hold_node_id) されている場合は、フォワードの攻撃遅延
+  /* === settlement (backward) レグの保持時間 ===
+   * 通常はランダムな転送インターバル。このノードが hold 型攻撃者として予約
+   * (payment->grief_hold_node_id) されている場合は、forward leg の攻撃遅延
    * モデル(×attack_delay_intensity)を流用して preimage の release を遅延させる。
-   * 失敗はさせない (= 支払いは成功する)。保持しない場合は従来と同一値。 */
+   * 失敗はさせない (= 支払いは成功する)。保持しない場合は従来と同一値。
+   * この settle_base は forward leg のレイテンシとは独立にサンプリングされるので、
+   * forward leg 側の遅延は hold 検知器の入力には一切入らない。 */
   uint64_t settle_base = net_params.average_payment_forward_interval +
       (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));
   uint64_t settle_delay = settle_base;
@@ -1030,7 +1035,7 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
   /* === シャドウ計測 (Phase 0): 報告はしない。各ノードの決済転送レイテンシを記録し、
    * 攻撃者(保持) vs 正常ノードの分離度(SNR) を実測する。CLOTH_GRIEF_SHADOW_LOG 時のみ。
    * 列: pid,node_id,is_malicious,degree,settle_delay_ms,settle_base_ms,held === */
-  if (grief_shadow_log_enabled()) {
+  if (hold_shadow_log_enabled()) {
     long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
     FILE* fh = fopen("/tmp/cloth_grief_shadow.csv", "a");
     if (fh) {
@@ -1042,13 +1047,15 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
     }
   }
 
-  /* === Grief-hold 検知 (Phase 1) ===
-   * 各ノードの決済転送レイテンシ settle_delay を per-node 仮説検定し、異常(=保持)を
-   * 出したノード本人を攻撃者として報告する。保持ノードは自分で release を転送するので
-   * 直接帰属でよい(下流帰属トリック不要)。報告者は上流ノード(prev_node_id)。
-   * 観測ゲート(method1/method2)はフォワード検知と共通。既定 OFF (CLOTH_DETECT_GRIEF)。 */
-  if (net_params.enable_reputation_system && get_detect_grief()) {
-    int should_report = on_settlement_result_hypothesis_test(
+  /* === hold 検知器 (Phase 1) ===
+   * 各ノードの settlement レグ転送レイテンシ settle_delay を per-node 仮説検定し、
+   * 異常(=保持)を出したノード本人を攻撃者として報告する。保持ノードは自分で release を
+   * 転送するので直接帰属でよい(下流帰属トリック不要)。報告者は上流ノード(prev_node_id)。
+   * 観測ゲート(method1/method2)は fail 検知器と共通。既定 OFF (CLOTH_DETECT_GRIEF)。
+   * 検知器に渡すのは (ノード, 観測レイテンシ, 支払い数, seed) だけで、grief_hold_node_id
+   * や is_malicious は渡さない = 攻撃型の事前ラベルなしで判定する。 */
+  if (net_params.enable_reputation_system && get_detect_hold()) {
+    int should_report = on_hold_hypothesis_test(
         node, (double)settle_delay, (long)simulation->processed_payments,
         (double)net_params.average_payment_forward_interval);
     if (should_report && is_node_observed_by_monitors(network, node->id)) {
@@ -1079,11 +1086,12 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
   /* === Stage ④ Hypothesis Testing: Increment global payment counter === */
   simulation->processed_payments++;
 
-  /* === Stage ④ Hypothesis Testing: ホップ間レイテンシで各ノードを個別検定 ===
+  /* === Stage ④ fail 検知器: forward leg のホップ間レイテンシで各ノードを個別検定 ===
    * hop_send_times[i]     : ホップ i の送信時刻
    * hop_send_times[i+1]   : ホップ i+1 の送信時刻（= ホップ i の処理+転送完了時刻）
    * 最終ホップは result_time（= receive_success の現在時刻）を終端とする。
-   * これにより監視ノードの有無に関係なく各ノードの処理遅延を独立に検定できる。 */
+   * これにより監視ノードの有無に関係なく各ノードの処理遅延を独立に検定できる。
+   * ここは成功経路なので is_fail=0 で呼ぶ = 報告はしない (下のコメント参照)。 */
   if (net_params.enable_reputation_system && payment->route != NULL && payment->hop_send_times != NULL) {
       int n_hops = array_len(payment->route->route_hops);
       for (int hop_idx = 0; hop_idx < n_hops; hop_idx++) {
@@ -1114,13 +1122,15 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
 
           /* 成功経路の検定はベースライン更新と Axis-2 用カウンタ
            * (hyp_test_count/hyp_anomaly_count) の蓄積のみが目的。
-           * on_payment_result_hypothesis_test は is_fail=1 のときしか
+           * on_fail_hypothesis_test (fail 検知器) は is_fail=1 のときしか
            * should_report を立てない (monitoring.c の k-of-m / 1-strike 両分岐)
            * ため、ここでの報告は構造的に発生しない。以前ここにあった報告ブロックは
-           * 到達不能なデッドコードだったので除去した。フォワード方向の報告は
-           * receive_fail 側、hold 型の報告は forward_success の settle 検定
-           * (CLOTH_DETECT_GRIEF) が担う。 */
-          (void) on_payment_result_hypothesis_test(
+           * 到達不能なデッドコードだったので除去した。fail 型の報告は receive_fail 側、
+           * hold 型の報告は forward_success の hold 検知器 (CLOTH_DETECT_GRIEF) が担う。
+           * ⚠️ したがって「forward leg で遅延させるが失敗させない」攻撃 (slow-forward)
+           *    はどちらの検知器も報告しない。異常自体は上の hyp_anomaly_count に
+           *    載るので、拾えるのは Axis-2 BH-FDR モード (CLOTH_FLAG_MODE=bh) のみ。 */
+          (void) on_fail_hypothesis_test(
               hop_node,
               t_start,
               t_end,
@@ -1307,7 +1317,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
           }
           if (t_end <= t_start) continue;
 
-          int should_report = on_payment_result_hypothesis_test(
+          int should_report = on_fail_hypothesis_test(
               hop_node,
               t_start,
               t_end,

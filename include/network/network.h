@@ -52,7 +52,9 @@ struct node {
   uint64_t first_attack_time;       // first simulation time this malicious node triggered attack
   uint64_t first_detection_time;    // first simulation time this node was detected
   
-  /* === Stage ④ Research: Hypothesis Testing (p-value) Fields === */
+  /* === Stage ④ Research: Hypothesis Testing (p-value) Fields ===
+   * fail 検知器 (forward leg のホップ間レイテンシ) 用。用語は monitoring.h の
+   * 「検知器の用語」ブロック参照。hold 検知器用は下の settle_* 系。 */
   double baseline_mean;             // log-normal baseline mean (μ)
   double baseline_std;              // log-normal baseline std dev (σ) = sqrt(baseline_var)
   double baseline_var;              // log-normal baseline variance (σ²): EMA of squared deviation
@@ -66,15 +68,15 @@ struct node {
   long hyp_anomaly_count;           // そのうち p<α だった回数
   double anom_q;                    // per-node 経験的 (1-α)分位点 null 閾値 (CLOTH_NULL_QUANTILE)
 
-  /* === Grief-hold 検知: 決済(backward)経路の処理レイテンシ baseline (Phase 1) ===
-   * フォワードの baseline_* とは別系統。各ノードが success を上流へ release する
+  /* === hold 検知器: settlement (backward) レグの処理レイテンシ baseline (Phase 1) ===
+   * fail 検知器の baseline_* とは別系統。各ノードが success を上流へ release する
    * までの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。 */
   double settle_baseline_mean;      // log-normal μ of settlement-forward latency
   double settle_baseline_var;       // σ² (squared-deviation EMA)
   double settle_anom_q;             // per-node heavy-tail null: warmup で学習する log-settle-latency の(1-α)分位点。CLOTH_SETTLE_NULL_QUANTILE 時に使用(post-warmupは凍結)。0=未学習
-  int    settle_suspicion;          // 異常ランダムウォーク (>=2 で報告)
+  int    settle_suspicion;          // 異常ランダムウォーク (CLOTH_SETTLE_REPORT_STRIKES 以上で報告。既定1)
   long   settle_learn_count;        // baseline 学習に使ったサンプル数(per-node warmup用)
-  long   settle_test_count;         // 診断: post-warmup の決済検定総数
+  long   settle_test_count;         // 診断: post-warmup の settlement レグ検定総数
   long   settle_anomaly_count;      // 診断: そのうち異常だった回数
 };
 
