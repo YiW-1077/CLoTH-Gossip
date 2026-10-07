@@ -286,12 +286,15 @@ int on_fail_hypothesis_test(
  * 直接特定する(下流帰属トリック不要 — 保持ノード自身が release を転送するため)。
  * hold 型は支払いを成功させるため fail 検知器には映らず、この検知器だけが拾える。
  * 戻り値: 1=hold 型攻撃として報告すべき, 0=正常 or warmup中。
+ * n_hops: この決済の経路ホップ数(=決済が通るノード数の代理)。経路長σ膨張
+ *         (CLOTH_SETTLE_HOP_SIGMA) を使うときだけ参照する。不明なら 0 を渡す。
  */
 int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
     long payment_count_global,
-    double expected_settle_ms
+    double expected_settle_ms,
+    int n_hops
 );
 
 #endif

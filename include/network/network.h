@@ -48,6 +48,9 @@ struct node {
   /* === Stage ③ Research: Reputation System Fields === */
   double reputation_score;          // [0.0, 1.0] - 1.0=trusted, 0.0=malicious
   int malicious_reports;            // count of detection incidents
+  long attest_dispute_count;        // 相互証明の突き合わせ不一致に関与した回数 (偽報告の痕跡)
+  long nesting_violation_count;     // 入れ子制約(recv[i]>recv[i+1])違反で検定を飛ばした回数
+  long silence_count;               // 自分の時刻記録を提出しなかった(黙秘した)回数
   long last_movement_time;          // last time this judge relocated (for movement tracking)
   uint64_t first_attack_time;       // first simulation time this malicious node triggered attack
   uint64_t first_detection_time;    // first simulation time this node was detected

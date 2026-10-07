@@ -53,6 +53,7 @@ struct payment* new_payment(long id, long sender, long receiver, uint64_t amount
   p->hop_send_times_initialized = 0;
   p->hop_settle_recv_times = NULL;
   p->hop_settle_recv_capacity = 0;
+  p->hop_settle_send_times = NULL;
   /* === Grief-hold attack === */
   p->grief_hold_node_id = -1;
   /* === Attack Report Tracking Initialization === */

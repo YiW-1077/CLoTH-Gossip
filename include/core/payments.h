@@ -61,6 +61,11 @@ struct payment {
    * receive_success の冒頭で current_time を記録する。0 = 未記録。 */
   uint64_t* hop_settle_recv_times;  // array of preimage-return receive timestamps per hop
   int hop_settle_recv_capacity;     // allocated size (= hop_send_times_capacity)
+  /* === 偽報告対策の検証用: 隣接ノードによる相互証明 (CLOTH_REPORT_ATTEST) ===
+   * hop_settle_send_times[i] = hop[i].from_node が preimage を「上流へ送った」と
+   * 申告する時刻。hop_settle_recv_times[i-1] (上流が受け取ったと申告する時刻) と
+   * 同一イベントの二者申告になるので、突き合わせると片側の嘘を検出できる。 */
+  uint64_t* hop_settle_send_times;  // array of preimage-forward send timestamps per hop
 
   /* === hold 型攻撃 (settlement レグでの保持遅延。支払いは失敗させない) ===
    * 混在モードで、ある悪意ノードが「forward leg では失敗させず、settlement

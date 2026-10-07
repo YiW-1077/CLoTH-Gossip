@@ -78,6 +78,87 @@ static void mark_no_response_failure(struct payment* payment, struct route_hop* 
   payment->is_timeout = 1;
 }
 
+/* === 攻撃遅延のばらつきモデル (CLOTH_ATTACK_DELAY_DIST) =========================
+ * 従来の注入遅延は base×attack_delay_intensity の決定論値だった。既定値
+ * (interval=100ms, intensity=2.0, jitter=0) では注入量が毎回ほぼ一律 +100ms になり、
+ * 「攻撃者の保持時間は常に同じ」という非現実的な仮定が入っていた。実網のグリーフィングは
+ * 保持時間が攻撃者・決済ごとにばらつくので、倍率の超過分に平均1の確率変数 X を掛けて
+ *     multiplier = 1 + (intensity - 1)·X,   E[X] = 1
+ * とする。E[X]=1 の分布だけを使うので「平均注入遅延は従来と同一・分散だけが変わる」形に
+ * なり、平均を動かした効果とばらつきの効果を分離して評価できる(平均も変えたいときは
+ * attack_delay_intensity 自体を上げる)。
+ *   fixed       : X=1  (既定。従来と完全同一で RNG も引かない = 既存結果と byte 一致)
+ *   lognormal   : X=exp(σZ-σ²/2)            σ=CLOTH_ATTACK_DELAY_SIGMA (既定 1.0)
+ *   exponential : X~Exp(1)                  メモリレスな保持時間
+ *   pareto      : X=xm·U^(-1/α), xm=(α-1)/α α=CLOTH_ATTACK_DELAY_ALPHA (既定 2.0, 重い裾)
+ *   uniform     : X~U(0,2)                  有界なばらつき
+ * ⚠️ 注入点は apply_attack_delay_if_needed の全呼び出し箇所 (hold-to-timeout型のフォワード遅延と
+ *    hold型の settle 保持、および悪意ノード経由時のフォワード遅延) で共通。hold モードでは
+ *    1決済あたりフォワード側と settle 側で独立に2回サンプルされる。 */
+#define ATTACK_DELAY_DIST_FIXED       0
+#define ATTACK_DELAY_DIST_LOGNORMAL   1
+#define ATTACK_DELAY_DIST_EXPONENTIAL 2
+#define ATTACK_DELAY_DIST_PARETO      3
+#define ATTACK_DELAY_DIST_UNIFORM     4
+
+static int get_attack_delay_dist(void) {
+  static int cached = -1;
+  if (cached >= 0) return cached;
+  const char* e = getenv("CLOTH_ATTACK_DELAY_DIST");
+  if (e == NULL || e[0] == '\0' || strcmp(e, "fixed") == 0)        cached = ATTACK_DELAY_DIST_FIXED;
+  else if (strcmp(e, "lognormal") == 0)                            cached = ATTACK_DELAY_DIST_LOGNORMAL;
+  else if (strcmp(e, "exponential") == 0 || strcmp(e, "exp") == 0) cached = ATTACK_DELAY_DIST_EXPONENTIAL;
+  else if (strcmp(e, "pareto") == 0)                               cached = ATTACK_DELAY_DIST_PARETO;
+  else if (strcmp(e, "uniform") == 0)                              cached = ATTACK_DELAY_DIST_UNIFORM;
+  else {
+    fprintf(stderr, "WARNING: unknown CLOTH_ATTACK_DELAY_DIST='%s' -> fixed\n", e);
+    cached = ATTACK_DELAY_DIST_FIXED;
+  }
+  if (cached != ATTACK_DELAY_DIST_FIXED)
+    printf("[Config] 攻撃遅延分布 CLOTH_ATTACK_DELAY_DIST=%s (平均保持は fixed と同一・分散のみ変化)\n", e);
+  return cached;
+}
+
+static double get_attack_delay_sigma(void) {
+  static double cached = -1.0;
+  if (cached >= 0.0) return cached;
+  const char* e = getenv("CLOTH_ATTACK_DELAY_SIGMA");
+  cached = 1.0;
+  if (e != NULL && e[0] != '\0') { double v = atof(e); if (v > 0.0) cached = v; }
+  return cached;
+}
+
+static double get_attack_delay_alpha(void) {
+  static double cached = -1.0;
+  if (cached >= 0.0) return cached;
+  const char* e = getenv("CLOTH_ATTACK_DELAY_ALPHA");
+  cached = 2.0;
+  /* α<=1 は平均が発散するので平均保存の前提が崩れる。1 超のみ受け付ける。 */
+  if (e != NULL && e[0] != '\0') { double v = atof(e); if (v > 1.0) cached = v; }
+  return cached;
+}
+
+/* 平均1の倍率係数 X を1個サンプルする。fixed のときは RNG を一切引かない
+ * (= 乱数ストリームが従来と同一で既存結果と byte 一致する条件)。 */
+static double sample_attack_delay_factor(struct simulation* simulation) {
+  switch (get_attack_delay_dist()) {
+    case ATTACK_DELAY_DIST_LOGNORMAL: {
+      double s = get_attack_delay_sigma();
+      return gsl_ran_lognormal(simulation->random_generator, -0.5 * s * s, s);
+    }
+    case ATTACK_DELAY_DIST_EXPONENTIAL:
+      return gsl_ran_exponential(simulation->random_generator, 1.0);
+    case ATTACK_DELAY_DIST_PARETO: {
+      double a = get_attack_delay_alpha();
+      return gsl_ran_pareto(simulation->random_generator, a, (a - 1.0) / a);
+    }
+    case ATTACK_DELAY_DIST_UNIFORM:
+      return 2.0 * gsl_rng_uniform(simulation->random_generator);
+    default:
+      return 1.0;
+  }
+}
+
 static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
                                              struct network_params net_params,
                                              struct payment* payment,
@@ -89,6 +170,13 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
   }
 
   double multiplier = net_params.attack_delay_intensity;
+  /* ばらつきモデル有効時は超過分 (intensity-1) を平均1の確率変数でスケールする。
+   * intensity<=1.0 のときは超過分が無いのでサンプルせず従来どおり。 */
+  if (get_attack_delay_dist() != ATTACK_DELAY_DIST_FIXED) {
+    double excess = multiplier - 1.0;
+    if (excess > 0.0)
+      multiplier = 1.0 + excess * sample_attack_delay_factor(simulation);
+  }
   if (net_params.attack_delay_jitter > 0.0) {
     multiplier += gsl_ran_gaussian(simulation->random_generator, net_params.attack_delay_jitter);
   }
@@ -103,6 +191,162 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
   }
 
   return adjusted_delay;
+}
+
+/* ============================================================================
+ * === 偽報告(嘘の報告)の検証ハーネス ==========================================
+ * 悪意ノードは報告者にもなれるので、自分の観測時刻を偽って隣接ノードを陥れたり
+ * 自分の保持を隠したりできる。これを定量するための実験用ノブ群。すべて既定 0 =
+ * 無効で、無効時は乱数も引かず従来と完全に同一の挙動になる。
+ *
+ *  CLOTH_FALSE_REPORT_MS = X : 悪意ノードが自分の申告を X[ms] 水増しする。
+ *      申告 RT = recv - send を膨らませる方向(recv を +X, send を -X)に偽る。
+ *      現行の帰属 Δ[i]=RT[i]-RT[i+1] では、これは同時に
+ *        (a) 自分への嫌疑 Δ[i-1] を縮める = 自己免罪
+ *        (b) 下流への嫌疑 Δ[i]   を膨らませる = 下流の冤罪
+ *      の両方を達成する。preimage を上流へ送った申告時刻も -X して、相互証明側も偽る。
+ *  CLOTH_CLOCK_SKEW_MS = E : 各ノードに固定の時計オフセット(-E..+E)を与える。
+ *      ノード ID から決定論的に作るので乱数ストリームは動かない。
+ *      自ノード内の差分(RT)では相殺されるが、ノードをまたぐ突き合わせには効く。
+ *  CLOTH_REPORT_ATTEST = 1 : 帰属を「隣接ノードの申告のみ」で行う方式に切替。
+ *      詳細は receive_success 側の実装コメント参照。
+ * ========================================================================== */
+static long get_false_report_ms(void) {
+  static long v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_FALSE_REPORT_MS");
+  v = 0; if (e != NULL && e[0] != '\0') { long t = atol(e); if (t > 0) v = t; }
+  return v;
+}
+static long get_clock_skew_ms(void) {
+  static long v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_CLOCK_SKEW_MS");
+  v = 0; if (e != NULL && e[0] != '\0') { long t = atol(e); if (t > 0) v = t; }
+  return v;
+}
+/* 報告の帰属方式。0 = 現行(被疑ノード自身の申告を使う), 1 = 隣接ノードの申告のみ(相互証明)。 */
+/* 報告の帰属方式。**2026-10-06 に既定を 1(相互証明) へ変更**。
+ * 0 にすると旧来の「被疑者自身の申告 RT を使う」方式に戻る。
+ * 旧方式は悪意ノードが報告者になれる前提の下では成立しない:
+ *   嘘100ms/毎回 → 冤罪152件・precision 42.4%、黙秘100% → recall 16.1%。
+ * 相互証明は hold[p]=recv[p-1]-send_back[p+1] と被疑者の申告を使わないので、
+ * 嘘にも黙秘にも不感 (seed{7,42,123} で recall 90.5-93.7%・冤罪0・precision100%)。
+ * ⚠️ 挙動変更: この既定変更以前の検知結果とは直接比較できない。 */
+static int get_report_attest(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_REPORT_ATTEST");
+  if (e != NULL && e[0] != '\0') return (v = (strcmp(e, "0") != 0) ? 1 : 0);
+  return (v = 1);   /* 既定 = 相互証明 */
+}
+/* 食い違い(dispute)が起きたときの扱い (CLOTH_ATTEST_DISPUTE_POLICY, 既定 0)。
+ *   0 = 従来: どちらか一方でも食い違えば帰属を破棄する。
+ *       → 被疑者が自分の2つの申告を偽ると d1,d2 が両方跳ね、**自分に不利な帰属を自分で消せる**。
+ *   1 = 共通点による特定: 被疑者 p の2本のリンクが**両方**食い違うなら、2本の共通ノードは
+ *       p しかいないので原因は p の申告だと断定できる。帰属式
+ *       hold[p]=recv[p-1]-send_back[p+1] は p の申告を使わないので、そのまま帰属してよい。
+ *       片方だけの食い違いはどちらが嘘か決められないので従来どおり破棄する(冤罪防止)。
+ *       これにより (a) 嘘つき本人は検出され (b) 嘘つきの申告を使う隣人の帰属は捨てられる。 */
+static int get_attest_dispute_policy(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_DISPUTE_POLICY");
+  if (e != NULL && e[0] != '\0') return (v = (strcmp(e, "0") != 0) ? 1 : 0);
+  return (v = 1);   /* 既定 ON (CLOTH_REPORT_ATTEST=1 のときだけ効く) */
+}
+
+/* 相互証明の突き合わせ許容差[ms]。既定は時計ずれ幅の2倍(両ノードのオフセット差の上界)。 */
+static long get_attest_tolerance_ms(void) {
+  static long v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_TOL_MS");
+  if (e != NULL && e[0] != '\0') { long t = atol(e); v = (t >= 0) ? t : 0; }
+  else { long sk = get_clock_skew_ms(); v = (sk > 0) ? (2 * sk) : 1; }
+  return v;
+}
+/* ノード固有の時計オフセット[ms]。ID からの決定論的ハッシュ(乱数を引かない)。 */
+static long node_clock_offset(long node_id) {
+  long E = get_clock_skew_ms();
+  if (E <= 0) return 0;
+  unsigned long h = (unsigned long)node_id * 2654435761UL;
+  h ^= (h >> 13); h *= 2246822519UL; h ^= (h >> 16);
+  return (long)(h % (unsigned long)(2 * E + 1)) - E;
+}
+/* 嘘をつく確率 (CLOTH_FALSE_REPORT_PROB, 既定 1.0 = 攻撃時は必ず嘘をつく)。 */
+static double get_false_report_prob(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_FALSE_REPORT_PROB");
+  v = 1.0;
+  if (e != NULL && e[0] != '\0') { double t = atof(e); if (t >= 0.0 && t <= 1.0) v = t; }
+  return v;
+}
+
+/* この決済でこのノードが嘘をつくか。
+ * 嘘をつけるのは**その決済で実際に保持攻撃を行っている本人のみ**に限定する
+ * (payment->grief_hold_node_id == nd->id)。攻撃していない悪意ノードや、たまたま
+ * 経路に乗っただけの悪意ノードは正直に申告する。
+ * 嘘をつくかは確率 CLOTH_FALSE_REPORT_PROB で決める。決済ID×ノードID の決定論的
+ * ハッシュで判定するので (a) 乱数ストリームを動かさない (b) 同一決済内の複数の
+ * 申告 (受領時刻と送出時刻) で判断がブレない、の2点が同時に満たされる。 */
+static int lies_on_this_payment(struct node* nd, struct payment* pm) {
+  if (nd == NULL || pm == NULL) return 0;
+  if (!nd->is_malicious) return 0;
+  if (get_false_report_ms() <= 0) return 0;
+  if (pm->grief_hold_node_id != nd->id) return 0;   /* 攻撃者本人のみ */
+  double pr = get_false_report_prob();
+  if (pr >= 1.0) return 1;
+  if (pr <= 0.0) return 0;
+  unsigned long h = ((unsigned long)pm->id * 1000003UL) ^ ((unsigned long)nd->id * 2654435761UL);
+  h ^= (h >> 13); h *= 2246822519UL; h ^= (h >> 16);
+  return ((double)(h % 100000UL) / 100000.0) < pr;
+}
+
+/* 黙秘(自分の時刻記録を提出しない)の確率 (CLOTH_SILENT_REPORT_PROB, 既定 0)。
+ * 嘘をつくより簡単な回避策: 現行の帰属は Δ=RT[i]−RT[i+1] に被疑者本人の記録を必要とするので、
+ * 記録を出さないだけで検定が成立しなくなる。嘘と同じく「その決済の保持者本人」に限定し、
+ * 決済ID×ノードIDの決定論的ハッシュで判定する(嘘とは別ソルトなので両者は独立に振れる)。 */
+static double get_silent_report_prob(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_SILENT_REPORT_PROB");
+  v = 0.0;
+  if (e != NULL && e[0] != '\0') { double t = atof(e); if (t >= 0.0 && t <= 1.0) v = t; }
+  return v;
+}
+/* 欠測(黙秘)の扱い。0 = 従来どおり黙ってスキップ(=逃がす), 1 = 証拠として扱う
+ * (被疑者の記録が無くても両隣の記録だけで帰属し、黙秘回数を計上する)。
+ * 相互証明の帰属式 hold[p]=recv[p-1]−send_back[p+1] は被疑者の記録を使わないので、
+ * 本来は黙秘に強い。突き合わせができないだけで帰属は成立する。 */
+static int get_attest_silence_policy(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_SILENCE_POLICY");
+  if (e != NULL && e[0] != '\0') return (v = (strcmp(e, "0") != 0) ? 1 : 0);
+  return (v = 1);   /* 既定 ON (CLOTH_REPORT_ATTEST=1 のときだけ効く) */
+}
+static int stays_silent_on_payment(struct node* nd, struct payment* pm) {
+  if (nd == NULL || pm == NULL) return 0;
+  if (!nd->is_malicious) return 0;
+  double pr = get_silent_report_prob();
+  if (pr <= 0.0) return 0;
+  if (pm->grief_hold_node_id != nd->id) return 0;   /* 保持者本人のみ */
+  if (pr >= 1.0) return 1;
+  unsigned long h = ((unsigned long)pm->id * 2246822519UL) ^ ((unsigned long)nd->id * 374761393UL);
+  h ^= (h >> 15); h *= 2654435761UL; h ^= (h >> 13);
+  return ((double)(h % 100000UL) / 100000.0) < pr;
+}
+
+/* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
+ * dir: +1 = 「遅く受け取った」方向に盛る, -1 = 「早く送った」方向に盛る。
+ * 保持者は「遅く受け取って、すぐ送った」と偽ることで見かけの保持時間を 2X 縮める。
+ * pm == NULL を渡すと嘘は乗らない(時計オフセットのみ)。 */
+static uint64_t reported_time(struct node* nd, struct payment* pm, uint64_t true_time, int dir) {
+  long adj = node_clock_offset(nd != NULL ? nd->id : 0);
+  if (lies_on_this_payment(nd, pm)) adj += dir * get_false_report_ms();
+  long t = (long)true_time + adj;
+  return (t < 0) ? 0 : (uint64_t)t;
 }
 
 /* === 攻撃手法セレクタ (CLOTH_ATTACK_MODE) ===
@@ -174,11 +418,11 @@ static int get_hold_roundtrip(void) {
   return 1;                             /* 既定=(A)差分版 */
 }
 
-/* hold検出を fail型と完全対称にする観測条件 (CLOTH_HOLD_RT_SELFTIME)。
+/* hold検出を hold-to-timeout型と完全対称にする観測条件 (CLOTH_HOLD_RT_SELFTIME)。
  * 各ノードが「自ノードだけで観測できる」往復時間 RT[i]=recv[i]-send[i] を測り、隣接差
  * Δ=RT[i]-RT[i+1] から平均インターバルを引いた resid(≈下流 i+1 の保持時間) を検定する。
  * 旧版(=0)は recv[i]-recv[i+1] 直接(下流=保持者本人の受領時刻を要する)。selftime版は
- * fail型 send[i+1]-send[i] と同じ観測条件で、保持者本人の時刻に依存しないより自然な形。
+ * hold-to-timeout型 send[i+1]-send[i] と同じ観測条件で、保持者本人の時刻に依存しないより自然な形。
  * **既定 ON (2026-08-01)**: seed{7,42,123}×n{3200,6400} で検出率+0.86〜1.48pp・precision
  * 100%不変を確証(劣化なし)。旧 recv差分に戻すには env CLOTH_HOLD_RT_SELFTIME=0。 */
 static int get_hold_rt_selftime(void) {
@@ -662,16 +906,31 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
       for (int i = 0; i < payment->hop_send_times_capacity; i++)
           payment->hop_send_times[i] = 0;
       payment->hop_send_times[0] = simulation->current_time;
-      /* hold round-trip(案A)用: preimage 受信時刻配列を hop_send_times と同容量で確保・ゼロ化 */
-      if (payment->hop_settle_recv_capacity < payment->hop_send_times_capacity) {
-          if (payment->hop_settle_recv_times != NULL) free(payment->hop_settle_recv_times);
-          payment->hop_settle_recv_times =
-              (uint64_t*)malloc(payment->hop_send_times_capacity * sizeof(uint64_t));
-          payment->hop_settle_recv_capacity = payment->hop_send_times_capacity;
+      /* hold round-trip(案A)用: preimage 受信/送出 時刻配列を hop_send_times と同容量で
+       * 確保・ゼロ化。⚠️ 2本の配列は必ず同じ容量変数 hop_settle_recv_capacity で
+       * 管理し、容量が伸びるときは**両方**作り直すこと。片方だけ据え置くと、より長い
+       * 経路の試行で領域外書き込みになる(過去の hop_send_times 容量固定バグと同根)。 */
+      if (payment->hop_settle_recv_capacity < payment->hop_send_times_capacity ||
+          payment->hop_settle_send_times == NULL) {
+          int cap = payment->hop_send_times_capacity;
+          if (cap < payment->hop_settle_recv_capacity) cap = payment->hop_settle_recv_capacity;
+          if (payment->hop_settle_recv_capacity < cap || payment->hop_settle_recv_times == NULL) {
+              if (payment->hop_settle_recv_times != NULL) free(payment->hop_settle_recv_times);
+              payment->hop_settle_recv_times = (uint64_t*)malloc(cap * sizeof(uint64_t));
+          }
+          /* 送出申告は nh+1 スロット確保する。末尾(index=nh)は**受信者**が
+           * 「最終中継ノードへ preimage を送った」と申告する枠。これが無いと
+           * 最終中継ノード(p=nh-1)は下流の証明が存在せず永久に判定できない。 */
+          if (payment->hop_settle_send_times != NULL) free(payment->hop_settle_send_times);
+          payment->hop_settle_send_times = (uint64_t*)malloc((cap + 1) * sizeof(uint64_t));
+          payment->hop_settle_recv_capacity = cap;
       }
       if (payment->hop_settle_recv_times != NULL)
           for (int i = 0; i < payment->hop_settle_recv_capacity; i++)
               payment->hop_settle_recv_times[i] = 0;
+      if (payment->hop_settle_send_times != NULL)
+          for (int i = 0; i <= payment->hop_settle_recv_capacity; i++)
+              payment->hop_settle_send_times[i] = 0;
   }
 
   /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
@@ -684,7 +943,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
    * 攻撃者(hop[0].to_node)を正しく特定できる。
    * fail/hold の分岐は forward_payment (Stage ①) と同一: hold_ratio>0 のときだけ
    * mode_roll を引き、hold 型なら失敗させず grief_hold_node_id を予約して通常転送
-   * (遅延注入と first_attack_time は forward_success 側)。従来はここが fail 型固定で、
+   * (遅延注入と first_attack_time は forward_success 側)。従来はここが hold-to-timeout 型固定で、
    * mode 2/3 でも送信者隣接の悪意ハブだけ fail する非対称があった。 */
   {
     struct node* first_hop_node = array_get(network->nodes, first_route_hop->to_node_id);
@@ -708,7 +967,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
         /* 分母正常化: 検知が報告可能になる post-warmup の攻撃のみ first_attack_time を立てる。
-         * warmup 中の失敗攻撃は仮説検定が抑制され報告できないため、recall 分母
+         * warmup 中の hold-to-timeout 攻撃は仮説検定が抑制され報告できないため、recall 分母
          * (observable_attacked=観測×攻撃)に数えると検知器を不当に減点する(測定アーティファクト)。
          * ゲートは is_warmup(injection ゲートと同根: 完了数基準は小 n で分母が過小/0 になる)。 */
         if (first_hop_node->first_attack_time == 0 && !payment->is_warmup) {
@@ -782,7 +1041,7 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
           struct route_hop* rh = (struct route_hop*)array_get(route->route_hops, i);
           if (rh != NULL && rh->from_node_id == node->id) {
               if (i < payment->hop_send_times_capacity)
-                  payment->hop_send_times[i] = simulation->current_time;
+                  payment->hop_send_times[i] = reported_time(node, NULL, simulation->current_time, -1);
               break;
           }
       }
@@ -845,7 +1104,7 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
     if (attack_roll < next_node->attack_probability) {
       /* === 混在モード: 攻撃のうち一部を「保持(hold)型グリーフィング」にする ===
        * env CLOTH_GRIEF_HOLD_RATIO の確率で hold 型 (失敗させず通常転送し、
-       * backward 経路でこのノードが preimage を保持して遅延)、残りは従来の fail 型。
+       * backward 経路でこのノードが preimage を保持して遅延)、残りは hold-to-timeout 型。
        * hold_ratio=0 のときは mode_roll を引かないので RNG ストリーム・挙動は不変。 */
       double hold_ratio = get_grief_hold_ratio();
       double mode_roll = (hold_ratio > 0.0)
@@ -858,7 +1117,7 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
          * fall through (return しない) して下の通常転送処理に進む。 */
         payment->grief_hold_node_id = next_node->id;
       } else {
-        /* === FAIL 型 (従来の攻撃挙動) === */
+        /* === hold-to-timeout 型 (HTLC を保持してタイムアウト失敗させる; 旧称 fail型/forward型) === */
         uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
         uint64_t forward_delay = apply_attack_delay_if_needed(
           simulation, net_params, payment, base_delay, 1
@@ -998,6 +1257,15 @@ void receive_payment(struct event* event, struct simulation* simulation, struct 
   prev_node_id = last_route_hop->from_node_id;
   event_type = prev_node_id == payment->sender ? RECEIVESUCCESS : FORWARDSUCCESS;
   next_event_time = simulation->current_time + net_params.average_payment_forward_interval + (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));//channel->latency;
+  /* 相互証明: 受信者が「最終中継ノードへ preimage を送った」と申告する時刻を
+   * 末尾スロット(index=nh)に記録する。これで p=nh-1 も両隣の証明が揃い判定可能になる。
+   * 受信者は送金の受け手であり保持攻撃者ではないので嘘モデルの対象外。 */
+  if (payment->hop_settle_send_times != NULL && payment->route != NULL) {
+      int nh_rcv = array_len(payment->route->route_hops);
+      if (nh_rcv <= payment->hop_settle_recv_capacity)
+          payment->hop_settle_send_times[nh_rcv] =
+              reported_time(array_get(network->nodes, payment->receiver), payment, next_event_time, -1);
+  }
   next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
   simulation->events = heap_insert(simulation->events, next_event, compare_event);
 }
@@ -1029,7 +1297,8 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
       for (int hi = 0; hi < nh_r && hi < payment->hop_settle_recv_capacity; hi++) {
           struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
           if (rh != NULL && rh->from_node_id == node->id) {
-              payment->hop_settle_recv_times[hi] = simulation->current_time;
+              if (stays_silent_on_payment(node, payment)) { node->silence_count++; }
+              else payment->hop_settle_recv_times[hi] = reported_time(node, payment, simulation->current_time, +1);
               break;
           }
       }
@@ -1069,6 +1338,19 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
       node->first_attack_time = simulation->current_time;
   }
   next_event_time = simulation->current_time + settle_delay;
+  /* 相互証明用: このノードが「上流へ preimage を送った」と申告する時刻。
+   * 上流の hop_settle_recv_times[自分の1つ上] と同一イベントの二者申告になる。 */
+  if (payment->hop_settle_send_times != NULL && payment->route != NULL) {
+      int nh_s = array_len(payment->route->route_hops);
+      for (int hi = 0; hi < nh_s && hi < payment->hop_settle_recv_capacity; hi++) {
+          struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
+          if (rh != NULL && rh->from_node_id == node->id) {
+              if (!stays_silent_on_payment(node, payment))
+                  payment->hop_settle_send_times[hi] = reported_time(node, payment, next_event_time, -1);
+              break;
+          }
+      }
+  }
 
   /* === シャドウ計測 (Phase 0): 報告はしない。各ノードの決済転送レイテンシを記録し、
    * 攻撃者(保持) vs 正常ノードの分離度(SNR) を実測する。CLOTH_GRIEF_SHADOW_LOG 時のみ。
@@ -1095,9 +1377,10 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
    * ※ 案A(CLOTH_HOLD_ROUNDTRIP, 既定ON)有効時はこの直接検定を無効化し、receive_success の
    *    往復走査に一本化する(同一ノードを二重報告しないため)。 */
   if (net_params.enable_reputation_system && get_detect_hold() && !get_hold_roundtrip()) {
+    int nh_b = (payment->route != NULL) ? array_len(payment->route->route_hops) : 0;
     int should_report = on_hold_hypothesis_test(
         node, (double)settle_delay, (long)simulation->processed_payments,
-        (double)net_params.average_payment_forward_interval);
+        (double)net_params.average_payment_forward_interval, nh_b);
     if (should_report && is_node_observed_by_judges(network, node->id)) {
       report_attacked_node_to_judges(
           network,
@@ -1141,7 +1424,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
       for (int i = 0; i < nh && i < payment->hop_settle_recv_capacity; i++) {
           struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, i);
           if (rh != NULL && rh->from_node_id == node->id) {
-              payment->hop_settle_recv_times[i] = simulation->current_time; break;
+              payment->hop_settle_recv_times[i] = reported_time(node, payment, simulation->current_time, +1); break;
           }
       }
       payment->num_attack_reporters = 0;   /* 試行ごとに初期化(dedup キー兼用) */
@@ -1156,9 +1439,33 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           if (i + 1 >= payment->hop_settle_recv_capacity) break;
           uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
           uint64_t rd = payment->hop_settle_recv_times[i + 1];  /* node i+1 が決済を受領した時刻 */
-          if (ru == 0 || rd == 0 || ru <= rd) continue;         /* 決済は i+1→i へ伝播(ru>rd) */
-          double settle_lat;
-          if (get_hold_rt_selftime()) {
+          /* 入れ子制約: 区間[send[i],recv[i]] は [send[i+1],recv[i+1]] を厳密に含むので
+           * 物理的に必ず ru > rd。破れている = どちらかの申告が嘘(または欠測)。
+           * 従来は黙って捨てていたが、嘘の痕跡として下流ノードに計上する。 */
+          if (ru != 0 && rd != 0 && ru <= rd) {
+              struct route_hop* hv = (struct route_hop*)array_get(payment->route->route_hops, i + 1);
+              if (hv != NULL) {
+                  struct node* vn = (struct node*)array_get(network->nodes, hv->from_node_id);
+                  if (vn != NULL) vn->nesting_violation_count++;
+              }
+          }
+          /* 欠測(黙秘)の扱い。被疑者(i+1)が記録を出していない場合、現行方式は
+           * Δ の計算に本人の記録が要るので成立せず逃がすしかない。相互証明モードは
+           * 帰属式が本人の記録を使わないので、ポリシー1なら帰属を続行できる。 */
+          /* 被疑者本人の記録が使えないケースを一括で扱う:
+           *   (a) 欠測(黙秘)       rd == 0
+           *   (b) 入れ子制約違反   ru <= rd  (本人が受領時刻を盛ると発生)
+           * どちらも「本人の申告が信用できない」だけであって、相互証明の帰属式
+           * hold[p]=recv[p-1]-send_back[p+1] は本人の申告を使わないので成立する。
+           * 従来はここで一律 continue して、**依存していない帰属まで捨てていた**。 */
+          int accused_unusable = (rd == 0) || (ru <= rd);
+          int bypass_ok = (get_report_attest() && get_attest_silence_policy());
+          if (ru == 0) continue;
+          if (accused_unusable && !bypass_ok) continue;
+          double settle_lat = 0.0;
+          if (accused_unusable) {
+              /* 本人の記録は使えない。相互証明の両隣帰属に委ねる。 */
+          } else if (get_hold_rt_selftime()) {
               /* fail対称版: 各ノードの自己観測 RT=recv-send の隣接差から resid を復元。
                * RT[i]-RT[i+1] = (recv[i]-recv[i+1]) + (send[i+1]-send[i]) なので、順方向
                * ホップ分を平均インターバルで差し引いて下流 i+1 の保持時間を推定する。 */
@@ -1178,6 +1485,56 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           struct node* dn_node = (struct node*)array_get(network->nodes, hop_dn->from_node_id);
           if (dn_node == NULL) continue;
           long cand = hop_dn->from_node_id;   /* 攻撃者候補 = 下流ノード本人(保持者) */
+
+          /* === 相互証明モード (CLOTH_REPORT_ATTEST=1) ===========================
+           * 被疑ノード p(=位置 i+1) 自身の申告を一切使わず、両隣の申告だけで
+           * 保持時間を構成する:
+           *     hold[p] = recv[p-1] (上流が「p から受け取った」と申告)
+           *             - send_back[p+1] (下流が「p へ送った」と申告)
+           * これにより p は自分の数字を盛って自己免罪することができない。
+           * さらに、同一イベントを二者が申告している2本のリンクを突き合わせ、
+           * 許容差を超えたらそのリンクからの帰属を破棄し、両端点に不一致を計上する
+           * (単独の嘘はここで「冤罪」ではなく「不一致」に変換される)。 */
+          if (get_report_attest()) {
+              /* i+2 == nh は受信者の送出申告スロット。受信者証明が無い(0)なら従来どおり判定不能。 */
+              if (i + 2 > nh || i + 2 > payment->hop_settle_recv_capacity) continue;
+              if (payment->hop_settle_send_times == NULL) continue;
+              uint64_t sb_p  = payment->hop_settle_send_times[i + 1]; /* p 自身の送信申告 */
+              uint64_t sb_dn = payment->hop_settle_send_times[i + 2]; /* 下流の送信申告 */
+              uint64_t rd2   = payment->hop_settle_recv_times[i + 1]; /* p 自身の受領申告 */
+              if (sb_dn == 0) continue;            /* 隣人(下流)の記録が無ければ帰属不能 */
+              int p_silent = (sb_p == 0 || rd2 == 0 || accused_unusable);
+              /* 本人の記録が無い/入れ子違反で信用できない = 突き合わせはできないが帰属は成立する */
+              if (p_silent && !get_attest_silence_policy()) continue;  /* 旧実装: 逃がす */
+              long tol = get_attest_tolerance_ms();
+              struct node* up_node = (struct node*)array_get(network->nodes, hop_up->from_node_id);
+              struct route_hop* hop_dn2 = (struct route_hop*)array_get(payment->route->route_hops, i + 2);
+              struct node* dn2_node = (hop_dn2 != NULL)
+                  ? (struct node*)array_get(network->nodes, hop_dn2->from_node_id) : NULL;
+              /* リンク(p-1,p): 上流の受領申告 vs p の送信申告 (同一イベント) */
+              long d1 = (long)ru - (long)sb_p;  if (d1 < 0) d1 = -d1;
+              /* リンク(p,p+1): p の受領申告 vs 下流の送信申告 (同一イベント) */
+              long d2 = (long)rd2 - (long)sb_dn; if (d2 < 0) d2 = -d2;
+              if (p_silent) {
+                  /* 突き合わせはできないが、両隣の記録だけで帰属は成立する。
+                   * 黙秘そのものを証拠として計上し、帰属は続行する。 */
+              } else if (d1 > tol && d2 > tol && get_attest_dispute_policy()) {
+                  /* 2本とも食い違う = 共通点である被疑者本人の申告が原因と断定できる。
+                   * 帰属式は本人の申告を使わないので、そのまま帰属を続行する。
+                   * (痕跡としては両端点に計上しておく) */
+                  if (up_node) up_node->attest_dispute_count++;
+                  dn_node->attest_dispute_count++;
+                  if (dn2_node) dn2_node->attest_dispute_count++;
+              } else if (d1 > tol || d2 > tol) {
+                  if (d1 > tol) { if (up_node) up_node->attest_dispute_count++;
+                                  dn_node->attest_dispute_count++; }
+                  if (d2 > tol) { dn_node->attest_dispute_count++;
+                                  if (dn2_node) dn2_node->attest_dispute_count++; }
+                  continue;   /* 不一致リンクからは帰属しない */
+              }
+              if (ru <= sb_dn) continue;
+              settle_lat = (double)(ru - sb_dn);   /* 両隣の申告のみで構成 */
+          }
           if (getenv("CLOTH_HOLD_RT_DEBUG") && payment->grief_hold_node_id >= 0) {
               FILE* _f = fopen("/tmp/holdrt_debug.csv", "a");
               if (_f) { fprintf(_f, "%llu,%d,%ld,%ld,%ld,%d,%.0f\n",
@@ -1187,7 +1544,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。 */
           int should_report = on_hold_hypothesis_test(
-              dn_node, settle_lat, (long)simulation->processed_payments, avg_iv);
+              dn_node, settle_lat, (long)simulation->processed_payments, avg_iv, nh);
           if (should_report && cand != payment->sender && cand != payment->receiver &&
               is_node_observed_by_judges(network, cand) &&
               !has_attack_reporter(payment, cand)) {   /* dedup: 同一決済で同一ノードは1回 */

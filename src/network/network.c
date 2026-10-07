@@ -41,6 +41,9 @@ struct node* new_node(long id) {
   /* === Stage ③ Initialize Reputation Fields === */
   node->reputation_score = 1.0;     // Start with full reputation
   node->malicious_reports = 0;      // No incidents yet
+  node->attest_dispute_count = 0;
+  node->nesting_violation_count = 0;
+  node->silence_count = 0;
   node->last_movement_time = 0;     // Not yet moved
   node->first_attack_time = 0;
   node->first_detection_time = 0;
@@ -1049,9 +1052,27 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
 
 /* See network.h. Mirrors the observation capability of
  * detect_and_record_htlc_observation() but as a stateless predicate. */
+/* === 判定対象スコープ (CLOTH_JUDGE_ALL_NODES, 既定 0) ===
+ * 1 にすると観測ゲートを無効化し、**すべての PCN ノード**を判定(=報告の受理)対象にする。
+ * 計測・報告は元々すべてのノードが行っており(report_attacked_node_to_judges は報告者の
+ * 次数も身元も検査しない)、実際に判定を制限しているのはこの観測ゲートだけである。
+ * ⚠️ このゲートは method1 と method2 を分ける唯一の差でもあるため、1 にすると両者の
+ *    挙動が同一になり監視手法比較の軸が消える。既定 0 のままなら従来と完全に同一。 */
+static int judge_all_nodes(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("CLOTH_JUDGE_ALL_NODES");
+        v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
 int is_node_observed_by_judges(struct network* network, long node_id) {
     if (network == NULL || network->num_judges == 0) {
         return 0;
+    }
+    if (judge_all_nodes()) {
+        return 1;   /* 観測ゲート無効: 全 PCN ノードが判定対象 */
     }
     for (int m = 0; m < network->num_judges; m++) {
         JudgeAgent* judge = &network->judges[m];

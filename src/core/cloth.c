@@ -617,7 +617,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
     
     FILE* csv_reputation = fopen(output_filename, "w");
     if (csv_reputation != NULL) {
-      fprintf(csv_reputation, "node_id,is_malicious,is_judge,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count,settle_anom_q,settle_baseline_mean\n");
+      fprintf(csv_reputation, "node_id,is_malicious,is_judge,reputation_score,malicious_reports,degree,first_attack_time,first_detection_time,detection_latency,hyp_test_count,hyp_anomaly_count,settle_test_count,settle_anomaly_count,settle_anom_q,settle_baseline_mean,attest_disputes,nesting_violations,silences\n");
       
       for (int i = 0; i < array_len(network->nodes); i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
@@ -628,7 +628,7 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
               node->first_detection_time >= node->first_attack_time) {
             detection_latency = (long)(node->first_detection_time - node->first_attack_time);
           }
-          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld,%ld,%ld,%.4f,%.4f\n",
+          fprintf(csv_reputation, "%ld,%d,%d,%.4f,%d,%d,%" PRIu64 ",%" PRIu64 ",%ld,%ld,%ld,%ld,%ld,%.4f,%.4f,%ld,%ld,%ld\n",
                   node->id,
                   node->is_malicious,
                   node->is_judge,
@@ -643,7 +643,10 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
                   node->settle_test_count,
                   node->settle_anomaly_count,
                   node->settle_anom_q,
-                  node->settle_baseline_mean);
+                  node->settle_baseline_mean,
+                  node->attest_dispute_count,
+                  node->nesting_violation_count,
+                  node->silence_count);
         }
       }
       fclose(csv_reputation);

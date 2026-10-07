@@ -87,6 +87,38 @@ static double get_hold_degree_sigma() {
     if (v < 0.0) return 0.0;
     return v;
 }
+/* === hold 検知器の 経路長σ膨張 (CLOTH_SETTLE_HOP_SIGMA=k_hop, 既定0=無効) ===
+ * 多重検定の露出を「ノードの次数」ではなく「その決済が通るノード数(経路ホップ数)」で
+ * 測る案。案A(round-trip)の検定は1決済あたり nh-1 ペアを検定するので、長い経路ほど
+ * その決済が生む検定回数が多く FP を踏みやすい。一方 hold の残差は隣接2ホップだけで
+ * 閉じるので信号側は経路長に依存しない。σ_eff = σ·(1 + k_deg·… + k_hop·ln(1+nh))。
+ * 既定 0 で従来と完全同一。 */
+static double get_hold_hop_sigma() {
+    char *env = getenv("CLOTH_SETTLE_HOP_SIGMA");
+    if (env == NULL) return 0.0;
+    double v = atof(env);
+    if (v < 0.0) return 0.0;
+    return v;
+}
+
+/* === 次数σ膨張のヒンジ化 (CLOTH_SETTLE_DEGREE_MIN=D, **既定 150**) ===
+ * 膨張項を k_deg·ln(1+deg) から k_deg·ln(1+max(0, deg-D)) に一般化する。次数 D 以下の
+ * ノードは膨張ゼロ(=生σ)になり、D を超えた分だけが膨張に効く。D=0 で従来式に厳密一致
+ * (旧挙動に戻すには env CLOTH_SETTLE_DEGREE_MIN=0)。
+ * 動機(実測, 2026-10-06): recall を失っているのは**低次数の攻撃者**(取りこぼし側の次数は
+ * 中央値8・最大84、degree>=300 は0件)で、FP を出すのは**多検定の正直ノード**(次数205-1227、
+ * 1ノードあたり600-1600回の検定)。両者の次数帯が完全に分離しているため、D をその間に
+ * 置くと「攻撃者には狭い null、多検定ノードには厚い保護」を同時に満たせる。
+ * 既定150の根拠: seed{42,7,123}×攻撃モデル{lognormal,fixed}で recall +5.3〜10.3pp・FP非増加。
+ * ⚠️ 挙動変更: この既定以前の hold 検知結果とは直接比較できない。 */
+static double get_hold_degree_min() {
+    char *env = getenv("CLOTH_SETTLE_DEGREE_MIN");
+    if (env == NULL) return 150.0;
+    double v = atof(env);
+    if (v < 0.0) return 0.0;
+    return v;
+}
+
 static double get_hold_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
     char *env = getenv("CLOTH_SETTLE_Q_STEP");
     if (env == NULL) return 0.05;
@@ -1119,7 +1151,8 @@ int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
     long payment_count_global,
-    double expected_settle_ms
+    double expected_settle_ms,
+    int n_hops
 ) {
     if (node == NULL || settle_latency_ms <= 0.0) return 0;
 
@@ -1170,14 +1203,25 @@ int on_hold_hypothesis_test(
         double q = (node->settle_anom_q > gauss) ? node->settle_anom_q : gauss;
         anomalous = (log_lat > q);
     } else {
-        /* z検定(分位点null OFF)。forward検知器と対称に次数σ膨張を適用し、
-         * 高次数=高トラフィックの busy ハブの FWER 膨張による FP を抑える。 */
+        /* z検定(分位点null OFF)。fail検知器と対称に次数σ膨張を適用し、
+         * 高次数=高トラフィックの busy ノードの FWER 膨張による FP を抑える。
+         * 次数項はヒンジ型 max(0, deg-D) で、D 以下のノードは膨張ゼロ=生σのまま。
+         * さらに経路長σ膨張 (k_hop, 既定0=無効) を加算できる。両者は「多重検定の
+         * 露出」を次数で測るか経路長(=1決済が生む検定回数)で測るかの違い。 */
         double sigma_eff = sd;
+        double inflate = 1.0;
         double k_deg = get_hold_degree_sigma();
         if (k_deg > 0.0) {
             long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
-            sigma_eff *= (1.0 + k_deg * log(1.0 + (double)deg));
+            double excess = (double)deg - get_hold_degree_min();
+            if (excess < 0.0) excess = 0.0;
+            inflate += k_deg * log(1.0 + excess);
         }
+        double k_hop = get_hold_hop_sigma();
+        if (k_hop > 0.0 && n_hops > 0) {
+            inflate += k_hop * log(1.0 + (double)n_hops);
+        }
+        sigma_eff *= inflate;
         double p_value = calculate_p_value_log_normal(
             settle_latency_ms, node->settle_baseline_mean, sigma_eff);
         anomalous = (p_value < p_threshold);
