@@ -8,8 +8,8 @@
 #include "data_structures/utils.h"
 #include "network/monitoring.h"
 
-// グローバル変数：実行時設定可能な監視ノード数上限
-int MONITOR_NODE_LIMIT = 300;
+// グローバル変数：実行時設定可能な判定ノード数上限
+int JUDGE_NODE_LIMIT = 300;
 
 /* Functions in this file generate a payment-channel network where to simulate the execution of payments */
 /* このファイルは LN 風の支払いチャネルネットワークを構築・管理する。
@@ -35,9 +35,9 @@ struct node* new_node(long id) {
   node->substitute_target_hub = -1;   /* 非代役/オラクル配置。検知トリガ配置時のみ clone元ハブID を入れる */
   node->substitute_activated = 0;
   node->attack_probability = 0.0;
-  /* === Stage ② Initialize Monitor Fields === */
-  node->is_monitor = 0;
-  node->monitor_id = -1;
+  /* === Stage ② Initialize Judge Fields === */
+  node->is_judge = 0;
+  node->judge_id = -1;
   /* === Stage ③ Initialize Reputation Fields === */
   node->reputation_score = 1.0;     // Start with full reputation
   node->malicious_reports = 0;      // No incidents yet
@@ -54,7 +54,7 @@ struct node* new_node(long id) {
   node->hyp_test_count = 0;
   node->hyp_anomaly_count = 0;
   node->anom_q = 0.0;
-  /* === Grief-hold detection (settlement baseline) === */
+  /* === hold 検知器 (settlement レグの baseline) === */
   node->settle_baseline_mean = 0.0;
   node->settle_baseline_var = 0.0;
   node->settle_anom_q = 0.0;
@@ -455,22 +455,22 @@ void initialize_malicious_nodes(struct network* network,
     printf("[Malicious Nodes] Initializing: %ld nodes out of %ld will be malicious\n",
            n_malicious, n_nodes);
 
-    /* Build candidate list: nodes with degree >= 3 (and not monitors if monitors present) */
+    /* Build candidate list: nodes with degree >= 3 (and not judges if judges present) */
     long* candidates = (long*)malloc(n_nodes * sizeof(long));
     long cand_count = 0;
     for (long i = 0; i < n_nodes; i++) {
         struct node* node = (struct node*)array_get(network->nodes, i);
         int degree = (int)array_len(node->open_edges);
-        if (degree >= 3 && !node->is_monitor) {
+        if (degree >= 3 && !node->is_judge) {
             candidates[cand_count++] = i;
         }
     }
 
-    /* Fallbacks: if no candidates (e.g., no monitors set), relax to non-monitor nodes, then to all nodes */
+    /* Fallbacks: if no candidates (e.g., no judges set), relax to non-judge nodes, then to all nodes */
     if (cand_count == 0) {
         for (long i = 0; i < n_nodes; i++) {
             struct node* node = (struct node*)array_get(network->nodes, i);
-            if (!node->is_monitor) candidates[cand_count++] = i;
+            if (!node->is_judge) candidates[cand_count++] = i;
         }
     }
     if (cand_count == 0) {
@@ -524,7 +524,7 @@ void add_substitute_hubs(struct network* network, long min_degree, int count, in
     /* 対象IDを先に収集(以後の配列 realloc に備えてポインタでなくIDで保持)。
      * オラクル配置(既定): is_malicious な高次数ハブのみ(地上真値使用)。
      * 検知トリガ配置(on_detection): 完全非オラクル=全高次数ハブ(is_malicious を一切見ない,
-     *   監視ノードは自陣なので除外)に inert で用意し、検知されたものだけ後で有効化する。
+     *   判定ノードは自陣なので除外)に inert で用意し、検知されたものだけ後で有効化する。
      *   誤検知された正直ハブにも代役が付く=真の反応的配置。 */
     long* target_ids = malloc(sizeof(long) * (orig_n_nodes > 0 ? orig_n_nodes : 1));
     int n_targets = 0;
@@ -533,7 +533,7 @@ void add_substitute_hubs(struct network* network, long min_degree, int count, in
         if (nd == NULL) continue;
         long deg = (nd->open_edges != NULL) ? array_len(nd->open_edges) : 0L;
         int is_target = on_detection
-            ? (deg >= min_degree && !nd->is_monitor)      /* 非オラクル: 全高次数ハブ */
+            ? (deg >= min_degree && !nd->is_judge)      /* 非オラクル: 全高次数ハブ */
             : (nd->is_malicious && deg >= min_degree);    /* オラクル: 悪意ハブのみ */
         if (is_target) target_ids[n_targets++] = i;
     }
@@ -704,7 +704,7 @@ void initialize_hub_info(struct network* network, int hub_threshold) {
 /* === Stage ② Leaf Neighbor Analysis ===
  *
  * For each hub, identifies neighbors with degree <= threshold (likely leaf nodes)
- * and stores them separately for monitor placement.
+ * and stores them separately for judge placement.
  */
 void analyze_leaf_neighbors(struct network* network, int leaf_threshold) {
     for (int h = 0; h < network->num_hubs; h++) {
@@ -741,47 +741,47 @@ void analyze_leaf_neighbors(struct network* network, int leaf_threshold) {
 }
 
 
-/* === Stage ② Method 1: Hub-Leaf Monitor Deployment ===
+/* === Stage ② Method 1: Hub-Leaf Judge Deployment ===
  *
- * Places monitoring agents on low-degree nodes connected to hubs.
+ * Places judging agents on low-degree nodes connected to hubs.
  * Expected coverage: ~70% of payment paths
  *
  * Algorithm:
  *   1. For each hub, identify low-degree neighbors (likely end-users)
- *   2. Deploy monitor on each leaf node, watching the hub
- *   3. Record monitoring relationship in MonitorAgent structure
+ *   2. Deploy judge on each leaf node, watching the hub
+ *   3. Record judging relationship in JudgeAgent structure
  */
-int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf_threshold) {
+int deploy_judges_method1(struct network* network, int hub_threshold, int leaf_threshold) {
     // Stage 1: Hub detection
     initialize_hub_info(network, hub_threshold);
     analyze_leaf_neighbors(network, leaf_threshold);
 
-    // Stage 2: Deploy monitors on leaf nodes
-    int total_monitors = 0;
-    network->monitors = NULL;
+    // Stage 2: Deploy judges on leaf nodes
+    int total_judges = 0;
+    network->judges = NULL;
 
     for (int h = 0; h < network->num_hubs; h++) {
         HubInfo* hub = &network->hubs[h];
 
         for (int l = 0; l < hub->num_leaf_neighbors; l++) {
-            if (total_monitors >= MONITOR_NODE_LIMIT) {
+            if (total_judges >= JUDGE_NODE_LIMIT) {
                 break;
             }
             int leaf_node_id = hub->leaf_neighbor_ids[l];
 
-            /* RNGストリーム分離: 悪性ノードは先に確定済み。監視と悪性の排他性を
-             * 保つため、悪性ノード上には監視を置かずスキップする。 */
+            /* RNGストリーム分離: 悪性ノードは先に確定済み。判定ノードと悪性の排他性を
+             * 保つため、悪性ノード上には判定ノードを置かずスキップする。 */
             struct node* cand_leaf = (struct node*)array_get(network->nodes, leaf_node_id);
             if (cand_leaf != NULL && cand_leaf->is_malicious) {
                 continue;
             }
 
-            // Allocate monitor
-            network->monitors = (MonitorAgent*)realloc(network->monitors,
-                (total_monitors + 1) * sizeof(MonitorAgent));
+            // Allocate judge
+            network->judges = (JudgeAgent*)realloc(network->judges,
+                (total_judges + 1) * sizeof(JudgeAgent));
 
-            MonitorAgent* m = &network->monitors[total_monitors];
-            m->monitor_id = total_monitors;
+            JudgeAgent* m = &network->judges[total_judges];
+            m->judge_id = total_judges;
             m->node_id = leaf_node_id;
             m->deployed_at_stage = 1;  // Method 1
             m->watching_hub_id = hub->hub_id;
@@ -793,26 +793,26 @@ int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf
             m->htlcs_with_correlated_pairs = 0;
             m->payments_captured = 0;
 
-            // Mark node as having a monitor
+            // Mark node as having a judge
             struct node* leaf_node = (struct node*)array_get(network->nodes, leaf_node_id);
-            leaf_node->is_monitor = 1;
-            leaf_node->monitor_id = total_monitors;
+            leaf_node->is_judge = 1;
+            leaf_node->judge_id = total_judges;
 
-            total_monitors++;
+            total_judges++;
         }
 
-        if (total_monitors >= MONITOR_NODE_LIMIT) {
+        if (total_judges >= JUDGE_NODE_LIMIT) {
             break;
         }
     }
 
-    network->num_monitors = total_monitors;
-    network->cumulative_monitor_assignments = total_monitors;
-    network->cumulative_monitor_relocations = 0;
-    printf("[Method1 Deployment] Placed %d monitors on leaf nodes\n", total_monitors);
+    network->num_judges = total_judges;
+    network->cumulative_judge_assignments = total_judges;
+    network->cumulative_judge_relocations = 0;
+    printf("[Method1 Deployment] Placed %d judges on leaf nodes\n", total_judges);
     fflush(stdout);
 
-    return total_monitors;
+    return total_judges;
 }
 
 
@@ -827,39 +827,48 @@ static int compare_node_degree_desc(const void* a, const void* b) {
     return nb->degree - na->degree;
 }
 
-/* Minimum node degree for a node to be an observation target under Method 2.
- * Every node with degree >= this value is watched by exactly one monitor. */
-#define METHOD2_OBSERVE_DEGREE_THRESHOLD 10
+/* Method 2 の観測対象になるための最小次数。既定 0 = 全ノードを観測対象にする。
+ * 旧実装は 10 固定で、次数 10 未満のノードは誰の担当にもならず、そこに居る攻撃者は
+ * 検定で異常を出しても報告ゲート (is_node_observed_by_judges) で落とされていた。
+ * env CLOTH_OBSERVE_DEGREE_MIN で旧挙動 (=10) や任意の閾値を復元できる。 */
+static long get_observe_degree_min(void) {
+    const char* e = getenv("CLOTH_OBSERVE_DEGREE_MIN");
+    if (e == NULL || e[0] == '\0') return 0;
+    long v = atol(e);
+    if (v < 0) return 0;
+    return v;
+}
 
-/* === Stage ② Method 2: Full degree-based coverage, partitioned across monitors ===
+/* === Stage ② Method 2: Full degree-based coverage, partitioned across judges ===
  *
- * Unlike the previous "top-K hubs watched by every monitor" design (which gave
+ * Unlike the previous "top-K hubs watched by every judge" design (which gave
  * heavy overlap and tiny coverage), Method 2 now watches EVERY node whose degree
- * is >= METHOD2_OBSERVE_DEGREE_THRESHOLD, and distributes those target nodes
- * across the deployed monitors round-robin so that no two monitors watch the
+ * is >= get_observe_degree_min() (既定 0 = 全ノード), and distributes those target
+ * nodes across the deployed judges round-robin so that no two judges watch the
  * same node (disjoint assignment).
  *
  * Algorithm:
- *   1. Deploy all Method 1 monitors (placed on leaf nodes).
+ *   1. Deploy all Method 1 judges (placed on leaf nodes).
  *   2. Collect every node with degree >= threshold as an observation target.
- *   3. Assign targets to monitors round-robin (target t -> monitor t % M),
- *      so each target is watched by exactly one monitor.
+ *   3. Assign targets to judges round-robin (target t -> judge t % M),
+ *      so each target is watched by exactly one judge.
  *
  * top_hub_count is retained in the signature for ABI compatibility but is no
  * longer used for target selection.
  */
-int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
+int deploy_judges_method2_enhanced(struct network* network, int hub_threshold,
                                       int leaf_threshold, int top_hub_count) {
     (void)top_hub_count; /* superseded by degree-threshold coverage */
 
     // Stage 1: Deploy Method 1
-    deploy_monitors_method1(network, hub_threshold, leaf_threshold);
-    int num_monitors = network->num_monitors;
-    if (num_monitors <= 0) {
-        return network->num_monitors;
+    deploy_judges_method1(network, hub_threshold, leaf_threshold);
+    int num_judges = network->num_judges;
+    if (num_judges <= 0) {
+        return network->num_judges;
     }
 
     // Stage 2: Collect every node with degree >= threshold as an observation target
+    long degree_min = get_observe_degree_min();
     int n_nodes = array_len(network->nodes);
     int* targets = (int*)malloc(sizeof(int) * (n_nodes > 0 ? n_nodes : 1));
     int num_targets = 0;
@@ -867,42 +876,43 @@ int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold,
         struct node* nd = (struct node*)array_get(network->nodes, i);
         if (nd == NULL) continue;
         long degree = (nd->open_edges != NULL) ? array_len(nd->open_edges) : 0L;
-        if (degree >= METHOD2_OBSERVE_DEGREE_THRESHOLD) {
+        if (degree >= degree_min) {
             targets[num_targets++] = (int)nd->id;
         }
     }
 
-    // Stage 3: Partition targets across monitors round-robin (disjoint assignment)
-    int* counts = (int*)calloc(num_monitors, sizeof(int));
+    // Stage 3: Partition targets across judges round-robin (disjoint assignment)
+    int* counts = (int*)calloc(num_judges, sizeof(int));
     for (int t = 0; t < num_targets; t++) {
-        counts[t % num_monitors]++;
+        counts[t % num_judges]++;
     }
-    for (int m = 0; m < num_monitors; m++) {
-        MonitorAgent* monitor = &network->monitors[m];
-        monitor->direct_hub_connections =
+    for (int m = 0; m < num_judges; m++) {
+        JudgeAgent* judge = &network->judges[m];
+        judge->direct_hub_connections =
             (counts[m] > 0) ? (int*)malloc(sizeof(int) * counts[m]) : NULL;
-        monitor->num_direct_hubs = 0;          /* filled in below */
-        monitor->deployed_at_stage = 2;        /* Mark as Method 2 */
+        judge->num_direct_hubs = 0;          /* filled in below */
+        judge->deployed_at_stage = 2;        /* Mark as Method 2 */
     }
     for (int t = 0; t < num_targets; t++) {
-        MonitorAgent* monitor = &network->monitors[t % num_monitors];
-        monitor->direct_hub_connections[monitor->num_direct_hubs++] = targets[t];
+        JudgeAgent* judge = &network->judges[t % num_judges];
+        judge->direct_hub_connections[judge->num_direct_hubs++] = targets[t];
     }
 
     free(counts);
     free(targets);
 
-    printf("[Method2] Watching %d nodes (degree>=%d) partitioned across %d monitors (no overlap)\n",
-           num_targets, METHOD2_OBSERVE_DEGREE_THRESHOLD, num_monitors);
+    printf("[Method2] Watching %d/%d nodes (degree>=%ld%s) partitioned across %d judges (no overlap)\n",
+           num_targets, n_nodes, degree_min,
+           (degree_min == 0) ? ", =all nodes" : "", num_judges);
 
-    return network->num_monitors;
+    return network->num_judges;
 }
 
 
 /* === Stage ② HTLC Observation and Correlation Detection ===
  *
- * When an HTLC passes through a monitor node, record the observation.
- * Multiple monitors observing the same payment enables information correlation.
+ * When an HTLC passes through a judge node, record the observation.
+ * Multiple judges observing the same payment enables information correlation.
  *
  * Method1: Single hub observation
  * Method2: Multiple hub sources via direct_hub_connections
@@ -912,7 +922,7 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                                         struct route* route) {
     int was_observed = 0;
 
-    if (!network || network->num_monitors == 0) {
+    if (!network || network->num_judges == 0) {
         return 0;
     }
 
@@ -925,28 +935,28 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
         return 0;
     }
 
-    // Check each monitor for observation capability
-    for (int m = 0; m < network->num_monitors; m++) {
-        MonitorAgent* monitor = &network->monitors[m];
+    // Check each judge for observation capability
+    for (int m = 0; m < network->num_judges; m++) {
+        JudgeAgent* judge = &network->judges[m];
         int can_observe = 0;
         struct route_hop* matched_hop = NULL;
 
-        // Method 1: Direct observation (payment passes through monitor's node)
-        if (node_id == monitor->node_id) {
+        // Method 1: Direct observation (payment passes through judge's node)
+        if (node_id == judge->node_id) {
             can_observe = 1;
         }
         // Method 2: Hub-based observation (payment route contains a hub from direct_hub_connections)
-        else if (monitor->num_direct_hubs > 0 && route != NULL) {
-            // Check if any node in the payment route is in monitor's direct_hub_connections
+        else if (judge->num_direct_hubs > 0 && route != NULL) {
+            // Check if any node in the payment route is in judge's direct_hub_connections
             if (route->route_hops && route->route_hops->size > 0) {
                 for (int h = 0; h < route->route_hops->size; h++) {
                     struct route_hop* hop = (struct route_hop*)array_get(route->route_hops, h);
                     if (hop) {
                         int hop_node_id = hop->to_node_id;
 
-                        // Check if this hop node is in monitor's direct_hub_connections
-                        for (int d = 0; d < monitor->num_direct_hubs; d++) {
-                            if (hop_node_id == monitor->direct_hub_connections[d]) {
+                        // Check if this hop node is in judge's direct_hub_connections
+                        for (int d = 0; d < judge->num_direct_hubs; d++) {
+                            if (hop_node_id == judge->direct_hub_connections[d]) {
                                 can_observe = 1;
                                 matched_hop = hop;
                                 break;
@@ -958,14 +968,14 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
             }
         }
 
-        // Record observation if monitor can observe this payment
+        // Record observation if judge can observe this payment
         if (can_observe) {
             was_observed = 1;
-            monitor->total_htlcs_observed++;
-            monitor->payments_captured++;
+            judge->total_htlcs_observed++;
+            judge->payments_captured++;
 
-            // If this is an indirect observation (monitor not colocated with node), record a detailed HTLC observation
-            if (node_id != monitor->node_id && matched_hop != NULL) {
+            // If this is an indirect observation (judge not colocated with node), record a detailed HTLC observation
+            if (node_id != judge->node_id && matched_hop != NULL) {
                 long prev_node = matched_hop->from_node_id;
                 long next_node = matched_hop->to_node_id;
                 uint64_t obs_amount = matched_hop->amount_to_forward;
@@ -978,8 +988,8 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                                          obs_amount,
                                          timestamp,
                                          timelock,
-                                         monitor->node_id,
-                                         monitor->monitor_id,
+                                         judge->node_id,
+                                         judge->judge_id,
                                          0.0,
                                          0.0,
                                          0);
@@ -1004,7 +1014,7 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                 payment_obs = (PaymentObservability*)malloc(sizeof(PaymentObservability));
                 payment_obs->payment_id = payment_id;
                 payment_obs->amount_observed = amount;
-                payment_obs->observers = (int*)malloc(sizeof(int) * network->num_monitors);
+                payment_obs->observers = (int*)malloc(sizeof(int) * network->num_judges);
                 payment_obs->num_observers = 0;
                 payment_obs->sender_proximity = -1;
                 payment_obs->receiver_proximity = -1;
@@ -1012,7 +1022,7 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
                 network->observed_payments = push(network->observed_payments, payment_obs);
             }
 
-            // Check if this monitor already observed this payment
+            // Check if this judge already observed this payment
             int already_observed = 0;
             for (int i = 0; i < payment_obs->num_observers; i++) {
                 if (payment_obs->observers[i] == m) {
@@ -1022,13 +1032,13 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
             }
 
             // Add observer if not already added
-            if (!already_observed && payment_obs->num_observers < network->num_monitors) {
+            if (!already_observed && payment_obs->num_observers < network->num_judges) {
                 payment_obs->observers[payment_obs->num_observers++] = m;
             }
 
-            // Correlation detection: Multiple monitors observing same payment
+            // Correlation detection: Multiple judges observing same payment
             if (payment_obs->num_observers > 1) {
-                monitor->htlcs_with_correlated_pairs++;
+                judge->htlcs_with_correlated_pairs++;
             }
         }
     }
@@ -1039,19 +1049,19 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
 
 /* See network.h. Mirrors the observation capability of
  * detect_and_record_htlc_observation() but as a stateless predicate. */
-int is_node_observed_by_monitors(struct network* network, long node_id) {
-    if (network == NULL || network->num_monitors == 0) {
+int is_node_observed_by_judges(struct network* network, long node_id) {
+    if (network == NULL || network->num_judges == 0) {
         return 0;
     }
-    for (int m = 0; m < network->num_monitors; m++) {
-        MonitorAgent* monitor = &network->monitors[m];
-        /* method1: monitor co-located with the node */
-        if ((long)monitor->node_id == node_id) {
+    for (int m = 0; m < network->num_judges; m++) {
+        JudgeAgent* judge = &network->judges[m];
+        /* method1: judge co-located with the node */
+        if ((long)judge->node_id == node_id) {
             return 1;
         }
-        /* method2: node is one of the monitor's directly-watched hubs */
-        for (int d = 0; d < monitor->num_direct_hubs; d++) {
-            if ((long)monitor->direct_hub_connections[d] == node_id) {
+        /* method2: node is one of the judge's directly-watched hubs */
+        for (int d = 0; d < judge->num_direct_hubs; d++) {
+            if ((long)judge->direct_hub_connections[d] == node_id) {
                 return 1;
             }
         }
@@ -1119,7 +1129,7 @@ void initialize_reputation_scores(struct network* network) {
 
 
 /* === Stage ③ Update Node Reputation on Detection ===
- * Called when a monitor detects malicious activity from a node
+ * Called when a judge detects malicious activity from a node
  * Reduces reputation by penalty amount.
  * Note: This function applies the penalty but DOES NOT increment the report counter.
  * Counting of independent reports is handled by the reporter side to enable
@@ -1178,13 +1188,13 @@ void apply_reputation_decay_all_nodes(struct network* network, double decay_rate
 }
 
 
-/* === Stage ③ Suggest Monitor Movement ===
- * Called periodically to determine if monitors should relocate
- * Monitors move to higher-degree hubs if current hub is poorly balanced
- * Returns number of monitors that relocated
+/* === Stage ③ Suggest Judge Movement ===
+ * Called periodically to determine if judges should relocate
+ * Judges move to higher-degree hubs if current hub is poorly balanced
+ * Returns number of judges that relocated
  */
-int suggest_monitor_movement(struct network* network, struct network_params params, uint64_t current_time) {
-    if (network == NULL || network->monitors == NULL || !params.enable_monitor_movement || network->num_monitors <= 0) {
+int suggest_judge_movement(struct network* network, struct network_params params, uint64_t current_time) {
+    if (network == NULL || network->judges == NULL || !params.enable_judge_movement || network->num_judges <= 0) {
         return 0;
     }
 
@@ -1193,9 +1203,9 @@ int suggest_monitor_movement(struct network* network, struct network_params para
         return 0;
     }
 
-    int monitor_count = network->num_monitors;
-    if (monitor_count > MONITOR_NODE_LIMIT) {
-        monitor_count = MONITOR_NODE_LIMIT;
+    int judge_count = network->num_judges;
+    if (judge_count > JUDGE_NODE_LIMIT) {
+        judge_count = JUDGE_NODE_LIMIT;
     }
 
     NodeDegree* candidates = (NodeDegree*)malloc(n_nodes * sizeof(NodeDegree));
@@ -1217,12 +1227,12 @@ int suggest_monitor_movement(struct network* network, struct network_params para
 
     qsort(candidates, candidate_count, sizeof(NodeDegree), compare_node_degree_desc);
 
-    int shift_base = (network->monitor_rotation_epoch * monitor_count) % candidate_count;
+    int shift_base = (network->judge_rotation_epoch * judge_count) % candidate_count;
     int relocations = 0;
 
-    for (int m = 0; m < monitor_count; m++) {
-        MonitorAgent* monitor = &network->monitors[m];
-        int old_node_id = monitor->node_id;
+    for (int m = 0; m < judge_count; m++) {
+        JudgeAgent* judge = &network->judges[m];
+        int old_node_id = judge->node_id;
         int new_node_id = candidates[(shift_base + m) % candidate_count].node_id;
 
         if (old_node_id == new_node_id) {
@@ -1230,25 +1240,25 @@ int suggest_monitor_movement(struct network* network, struct network_params para
         }
 
         struct node* old_node = (struct node*)array_get(network->nodes, old_node_id);
-        if (old_node != NULL && old_node->monitor_id == monitor->monitor_id) {
-            old_node->is_monitor = 0;
-            old_node->monitor_id = -1;
+        if (old_node != NULL && old_node->judge_id == judge->judge_id) {
+            old_node->is_judge = 0;
+            old_node->judge_id = -1;
         }
 
         struct node* new_node = (struct node*)array_get(network->nodes, new_node_id);
         if (new_node != NULL) {
-            new_node->is_monitor = 1;
-            new_node->monitor_id = monitor->monitor_id;
+            new_node->is_judge = 1;
+            new_node->judge_id = judge->judge_id;
             new_node->last_movement_time = (long)current_time;
         }
 
-        monitor->node_id = new_node_id;
+        judge->node_id = new_node_id;
         relocations++;
     }
 
-    network->cumulative_monitor_assignments += monitor_count;
-    network->cumulative_monitor_relocations += relocations;
-    network->monitor_rotation_epoch++;
+    network->cumulative_judge_assignments += judge_count;
+    network->cumulative_judge_relocations += relocations;
+    network->judge_rotation_epoch++;
     free(candidates);
     return relocations;
 }
@@ -1289,14 +1299,14 @@ struct network* initialize_network(struct network_params net_params, gsl_rng* ra
   /* node->results (ノードID索引の O(n^2) 結果キャッシュ) の確保は、代役ハブ注入
    * (add_substitute_hubs) の後に allocate_node_results() で行う。ここで確保すると
    * 注入で増えたノードに対応できず範囲外になるため遅延させる。results は
-   * シミュレーション時にのみ参照され、初期化段(malicious/monitor)では触れない。 */
+   * シミュレーション時にのみ参照され、初期化段(malicious/judge)では触れない。 */
 
   network->groups = array_initialize(1000);
-  network->cumulative_monitor_assignments = 0;
-  network->cumulative_monitor_relocations = 0;
-  network->monitor_rotation_epoch = 0;
+  network->cumulative_judge_assignments = 0;
+  network->cumulative_judge_relocations = 0;
+  network->judge_rotation_epoch = 0;
 
-  /* === Initialize multi-monitor correlation tracking === */
+  /* === Initialize multi-judge correlation tracking === */
   network->observed_payments = NULL;
 
   return  network;

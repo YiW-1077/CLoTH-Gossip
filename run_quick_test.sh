@@ -16,7 +16,7 @@ GRIEF_HOLD_RATIO=0.5    # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ============================================================
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
-[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で決済検知器を自動ON
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で hold 検知器を自動ON
 echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 BASE_TEMPLATE='generate_network_from_file=true
 nodes_filename=config/data/nodes_ln.csv
@@ -58,7 +58,7 @@ enable_simple_progress_window=false
 reputation_decay_rate=0.01
 reputation_penalty_on_detection=0.3
 reputation_recovery_rate=0.02
-enable_monitor_movement=false
+enable_judge_movement=false
 movement_credit_limit=5
 enable_pra=false
 enable_prt=true
@@ -67,7 +67,7 @@ prt_abort_wait_time=1000
 rbr_reputation_weight=20.0'
 
 test_scenario() {
-  local name=$1 malicious=$2 attack_success=$3 rbr=$4 rep=$5 monitoring=$6
+  local name=$1 malicious=$2 attack_success=$3 rbr=$4 rep=$5 judging=$6
   
   echo ""
   echo "========================================="
@@ -79,7 +79,7 @@ malicious_node_ratio=$malicious
 malicious_failure_probability=$attack_success
 enable_reputation_system=$rep
 enable_rbr=$rbr
-monitoring_strategy=$monitoring"
+judging_strategy=$judging"
   
   echo "$config" > "$BASE_CONFIG"
   

@@ -42,17 +42,19 @@ struct node {
   long substitute_target_hub;       // (代役ノード用) clone元の悪意ハブID。検知トリガ配置(CLOTH_SUBSTITUTE_ON_DETECTION)で使用。非代役/オラクル配置は -1
   unsigned int substitute_activated;// (代役ノード用) 検知トリガで有効化済みなら1 (冪等ガード)
   double attack_probability;        // probability of HTLC failure when forwarding
-  /* === Stage ② Research: Monitor Node Fields === */
-  unsigned int is_monitor;          // 1 if this node hosts a monitoring agent
-  int monitor_id;                   // ID of the monitor agent on this node
+  /* === Stage ② Research: Judge Node Fields === */
+  unsigned int is_judge;          // 1 if this node hosts a judging agent
+  int judge_id;                   // ID of the judge agent on this node
   /* === Stage ③ Research: Reputation System Fields === */
   double reputation_score;          // [0.0, 1.0] - 1.0=trusted, 0.0=malicious
   int malicious_reports;            // count of detection incidents
-  long last_movement_time;          // last time this monitor relocated (for movement tracking)
+  long last_movement_time;          // last time this judge relocated (for movement tracking)
   uint64_t first_attack_time;       // first simulation time this malicious node triggered attack
   uint64_t first_detection_time;    // first simulation time this node was detected
   
-  /* === Stage ④ Research: Hypothesis Testing (p-value) Fields === */
+  /* === Stage ④ Research: Hypothesis Testing (p-value) Fields ===
+   * fail 検知器 (forward leg のホップ間レイテンシ) 用。用語は monitoring.h の
+   * 「検知器の用語」ブロック参照。hold 検知器用は下の settle_* 系。 */
   double baseline_mean;             // log-normal baseline mean (μ)
   double baseline_std;              // log-normal baseline std dev (σ) = sqrt(baseline_var)
   double baseline_var;              // log-normal baseline variance (σ²): EMA of squared deviation
@@ -66,15 +68,15 @@ struct node {
   long hyp_anomaly_count;           // そのうち p<α だった回数
   double anom_q;                    // per-node 経験的 (1-α)分位点 null 閾値 (CLOTH_NULL_QUANTILE)
 
-  /* === Grief-hold 検知: 決済(backward)経路の処理レイテンシ baseline (Phase 1) ===
-   * フォワードの baseline_* とは別系統。各ノードが success を上流へ release する
+  /* === hold 検知器: settlement (backward) レグの処理レイテンシ baseline (Phase 1) ===
+   * fail 検知器の baseline_* とは別系統。各ノードが success を上流へ release する
    * までの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。 */
   double settle_baseline_mean;      // log-normal μ of settlement-forward latency
   double settle_baseline_var;       // σ² (squared-deviation EMA)
   double settle_anom_q;             // per-node heavy-tail null: warmup で学習する log-settle-latency の(1-α)分位点。CLOTH_SETTLE_NULL_QUANTILE 時に使用(post-warmupは凍結)。0=未学習
-  int    settle_suspicion;          // 異常ランダムウォーク (>=2 で報告)
+  int    settle_suspicion;          // 異常ランダムウォーク (CLOTH_SETTLE_REPORT_STRIKES 以上で報告。既定1)
   long   settle_learn_count;        // baseline 学習に使ったサンプル数(per-node warmup用)
-  long   settle_test_count;         // 診断: post-warmup の決済検定総数
+  long   settle_test_count;         // 診断: post-warmup の settlement レグ検定総数
   long   settle_anomaly_count;      // 診断: そのうち異常だった回数
 };
 
@@ -156,14 +158,14 @@ struct graph_channel {
   long node2_id;
 };
 
-/* === Stage ② Monitor Agent Definition === */
+/* === Stage ② Judge Agent Definition === */
 typedef struct {
-    int monitor_id;                    // Global monitor ID (0..num_monitors-1)
-    int node_id;                       // Physical node ID where this monitor is deployed
+    int judge_id;                    // Global judge ID (0..num_judges-1)
+    int node_id;                       // Physical node ID where this judge is deployed
     int deployed_at_stage;             // 1=method1, 2=method2
     
     // Method 1 specific
-    int watching_hub_id;               // Hub this monitor is watching
+    int watching_hub_id;               // Hub this judge is watching
     
     // Method 2 specific  
     int* direct_hub_connections;       // Array of hub IDs for direct connections
@@ -173,7 +175,7 @@ typedef struct {
     long total_htlcs_observed;
     long htlcs_with_correlated_pairs;
     long payments_captured;
-} MonitorAgent;
+} JudgeAgent;
 
 /* === Stage ② Hub Information Structure === */
 typedef struct {
@@ -190,8 +192,8 @@ typedef struct {
 /* === Stage ② Payment Observability Tracking === */
 typedef struct {
     long payment_id;
-    int num_monitors_on_path;          // Count of monitors observing this payment
-    int* observers;                    // Array of monitor IDs
+    int num_judges_on_path;          // Count of judges observing this payment
+    int* observers;                    // Array of judge IDs
     int num_observers;
     
     // Correlation metadata
@@ -200,9 +202,9 @@ typedef struct {
     int receiver_proximity;
 } PaymentObservability;
 
-// MONITOR_NODE_LIMIT は実行時に設定される（デフォルト300）
-extern int MONITOR_NODE_LIMIT;
-#define MONITOR_SWITCH_INTERVAL_PAYMENTS 100
+// JUDGE_NODE_LIMIT は実行時に設定される（デフォルト300）
+extern int JUDGE_NODE_LIMIT;
+#define JUDGE_SWITCH_INTERVAL_PAYMENTS 100
 
 
 struct network {
@@ -212,16 +214,16 @@ struct network {
   struct array* groups;
   gsl_ran_discrete_t* faulty_node_prob;
   
-  /* === Stage ② Monitor Tracking === */
-  MonitorAgent* monitors;              // Array of deployed monitors
-  int num_monitors;
-  long cumulative_monitor_assignments; // sum of active monitor slots over all placements
-  long cumulative_monitor_relocations; // number of monitor moves that changed node
-  int monitor_rotation_epoch;          // incremented each relocation cycle
+  /* === Stage ② Judge Tracking === */
+  JudgeAgent* judges;              // Array of deployed judges
+  int num_judges;
+  long cumulative_judge_assignments; // sum of active judge slots over all placements
+  long cumulative_judge_relocations; // number of judge moves that changed node
+  int judge_rotation_epoch;          // incremented each relocation cycle
   HubInfo* hubs;                       // Array of hub information
   int num_hubs;
   
-  /* === Stage ② Multi-Monitor Correlation === */
+  /* === Stage ② Multi-Judge Correlation === */
   struct element* observed_payments;      // List of PaymentObservability structures
 };
 
@@ -247,7 +249,7 @@ void initialize_malicious_nodes(struct network* network,
  * コピーしたチャネルを張る。回避で消える悪意ハブの連結性を正直ノードで補い NOPATH を抑える。
  * 新規 gsl 乱数は引かない(baseline の RNG ストリームを乱さない)。
  * inert!=0 のとき残高0=ルーティング不能で作成(=baseline完全再現の対照)。
- * 監視配置の後・results確保の前に呼ぶこと(node->results は呼び出し後に全ノード分確保する)。
+ * 判定ノード配置の後・results確保の前に呼ぶこと(node->results は呼び出し後に全ノード分確保する)。
  * env CLOTH_SUBSTITUTE_ON_DETECTION=1 のときは init 時は inert(不可視)で作り、対象ハブが
  * 検知された時点で activate_substitute_for_hub() が容量/残高を注入して経路可能化する
  * (反応的配置=オラクルでなく検知トリガ)。 */
@@ -261,20 +263,20 @@ void activate_substitute_for_hub(struct network* network, long hub_id);
  * add_substitute_hubs の後に呼ぶ(注入で増えたノード分も含めて確保)。 */
 void allocate_node_results(struct network* network);
 
-/* === Stage ② Monitor Placement Functions === */
+/* === Stage ② Judge Placement Functions === */
 void initialize_hub_info(struct network* network, int hub_threshold);
 void analyze_leaf_neighbors(struct network* network, int leaf_threshold);
-int deploy_monitors_method1(struct network* network, int hub_threshold, int leaf_threshold);
-int deploy_monitors_method2_enhanced(struct network* network, int hub_threshold, int leaf_threshold, int top_hub_count);
+int deploy_judges_method1(struct network* network, int hub_threshold, int leaf_threshold);
+int deploy_judges_method2_enhanced(struct network* network, int hub_threshold, int leaf_threshold, int top_hub_count);
 int detect_and_record_htlc_observation(struct network* network, long payment_id, uint64_t amount, int node_id, int direction, uint64_t timestamp, struct route* route);
 
-/* Returns 1 if any deployed monitor can observe the given node, using the same
+/* Returns 1 if any deployed judge can observe the given node, using the same
  * capability model as detect_and_record_htlc_observation():
- *   - method1: a monitor co-located with the node (monitor->node_id == node_id)
- *   - method2: a monitor watching the node as one of its direct hubs
- * Used to gate attack reporting so only monitor-observable nodes can be flagged.
- * This is what makes monitoring method1 and method2 produce different results. */
-int is_node_observed_by_monitors(struct network* network, long node_id);
+ *   - method1: a judge co-located with the node (judge->node_id == node_id)
+ *   - method2: a judge watching the node as one of its direct hubs
+ * Used to gate attack reporting so only judge-observable nodes can be flagged.
+ * This is what makes judging method1 and method2 produce different results. */
+int is_node_observed_by_judges(struct network* network, long node_id);
 
 /* Debug logging toggle: returns nonzero when the CLOTH_DEBUG env var is set.
  * Used to gate hot-path diagnostic output (per-payment / per-detection logs)
@@ -292,7 +294,7 @@ int boost_suppressed_for(struct node* node);
 void initialize_reputation_scores(struct network* network);
 void update_node_reputation_on_detection(struct node* node, double penalty, uint64_t detection_time);
 void apply_reputation_decay_all_nodes(struct network* network, double decay_rate);
-int suggest_monitor_movement(struct network* network, struct network_params params, uint64_t current_time);
+int suggest_judge_movement(struct network* network, struct network_params params, uint64_t current_time);
 
 int update_group(struct group* group, struct network_params net_params, uint64_t current_time, gsl_rng* random_generator, int enable_fake_balance_update, struct edge* triggered_edge);
 

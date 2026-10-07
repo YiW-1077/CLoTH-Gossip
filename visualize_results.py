@@ -11,19 +11,51 @@ import numpy as np
 import sys
 from pathlib import Path
 
+# 旧列名 -> 新列名。「監視ノード」を「判定ノード」に改称した際に列名も変えたため、
+# 改称前に生成された results_summary.csv を読めるようロード時に正規化する。
+LEGACY_COLUMN_MAP = {
+    'monitor_percentage': 'judge_percentage',
+    'monitor_count': 'judge_count',
+    'monitor_method': 'judge_method',
+    'monitor_pct': 'judge_pct',
+    'num_monitors': 'num_judges',
+    'is_monitor': 'is_judge',
+    'monitor_id': 'judge_id',
+    'monitoring_strategy': 'judging_strategy',
+    'monitoring_coverage_rate_percent': 'judging_coverage_rate_percent',
+    'avg_htlcs_observed_per_monitor': 'avg_htlcs_observed_per_judge',
+    'avg_fee_change_vs_nomonitor_pct': 'avg_fee_change_vs_nojudge_pct',
+    'cumulative_monitors': 'cumulative_judges',
+    'cumulative_monitor_assignments': 'cumulative_judge_assignments',
+    'monitors_deployed': 'judges_deployed',
+    'detection_by_monitor': 'detection_by_judge',
+}
+
+
+def normalize_legacy_columns(df):
+    """改称前の列名を持つ CSV を新列名に揃える (新列が既にあれば旧列は無視)。"""
+    renames = {old: new for old, new in LEGACY_COLUMN_MAP.items()
+               if old in df.columns and new not in df.columns}
+    if renames:
+        print(f"  [compat] 旧列名を検出し変換: {', '.join(f'{o}->{n}' for o, n in renames.items())}")
+        df = df.rename(columns=renames)
+    return df
+
+
 def load_results(csv_path):
     """結果CSVを読み込む"""
     df = pd.read_csv(csv_path)
+    df = normalize_legacy_columns(df)
     # メトリクスをfloatに変換（N/Aは0に置き換え）
     for col in ['success_rate', 'detection_rate', 'avg_delay', 'malicious_ratio']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     return df
 
-def plot_monitor_percentage_effect(df, output_dir):
-    """監視割合の効果を可視化"""
+def plot_judge_percentage_effect(df, output_dir):
+    """判定ノード割合の効果を可視化"""
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('監視割合の効果（支払額別・ノード数別）', fontsize=16, fontweight='bold')
+    fig.suptitle('判定ノード割合の効果（支払額別・ノード数別）', fontsize=16, fontweight='bold')
     
     payment_amounts = sorted(df['payment_amount_msat'].unique())
     node_counts = sorted(df['node_count'].unique())
@@ -34,13 +66,13 @@ def plot_monitor_percentage_effect(df, output_dir):
         
         for nodes in node_counts:
             subset = df[(df['payment_amount_msat'] == payment_amt) & 
-                       (df['node_count'] == nodes)].sort_values('monitor_percentage')
+                       (df['node_count'] == nodes)].sort_values('judge_percentage')
             
             if len(subset) > 0:
-                ax.plot(subset['monitor_percentage'], subset['success_rate'], 
+                ax.plot(subset['judge_percentage'], subset['success_rate'], 
                        marker='o', label=f'{nodes} nodes', linewidth=2)
         
-        ax.set_xlabel('Monitor Percentage (%)', fontsize=11)
+        ax.set_xlabel('Judge Percentage (%)', fontsize=11)
         ax.set_ylabel('Success Rate', fontsize=11)
         ax.set_title(f'Payment Amount: {payment_amt} msat', fontsize=12, fontweight='bold')
         ax.legend()
@@ -51,13 +83,13 @@ def plot_monitor_percentage_effect(df, output_dir):
     ax = axes.flatten()[3]
     for nodes in node_counts:
         subset = df[(df['payment_amount_msat'] == payment_amounts[0]) & 
-                   (df['node_count'] == nodes)].sort_values('monitor_percentage')
+                   (df['node_count'] == nodes)].sort_values('judge_percentage')
         
         if len(subset) > 0:
-            ax.plot(subset['monitor_percentage'], subset['detection_rate'], 
+            ax.plot(subset['judge_percentage'], subset['detection_rate'], 
                    marker='s', label=f'{nodes} nodes', linewidth=2)
     
-    ax.set_xlabel('Monitor Percentage (%)', fontsize=11)
+    ax.set_xlabel('Judge Percentage (%)', fontsize=11)
     ax.set_ylabel('Detection Rate', fontsize=11)
     ax.set_title(f'Detection Rate (Payment: {payment_amounts[0]} msat)', fontsize=12, fontweight='bold')
     ax.legend()
@@ -65,7 +97,7 @@ def plot_monitor_percentage_effect(df, output_dir):
     ax.set_ylim([0, 1.0])
     
     plt.tight_layout()
-    output_path = Path(output_dir) / 'monitor_percentage_effect.png'
+    output_path = Path(output_dir) / 'judge_percentage_effect.png'
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"✓ Saved: {output_path}")
     plt.close()
@@ -73,21 +105,21 @@ def plot_monitor_percentage_effect(df, output_dir):
 def plot_payment_amount_effect(df, output_dir):
     """支払額の効果を可視化"""
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('支払額の効果（ノード数別・監視割合別）', fontsize=16, fontweight='bold')
+    fig.suptitle('支払額の効果（ノード数別・判定ノード割合別）', fontsize=16, fontweight='bold')
     
     node_counts = sorted(df['node_count'].unique())
-    monitor_pcts = [5, 15, 25, 35]  # 代表的な監視割合
+    judge_pcts = [5, 15, 25, 35]  # 代表的な判定ノード割合
     
     for idx, nodes in enumerate(node_counts):
         ax = axes.flatten()[idx]
         
-        for monitor_pct in monitor_pcts:
+        for judge_pct in judge_pcts:
             subset = df[(df['node_count'] == nodes) & 
-                       (df['monitor_percentage'] == monitor_pct)].sort_values('payment_amount_msat')
+                       (df['judge_percentage'] == judge_pct)].sort_values('payment_amount_msat')
             
             if len(subset) > 0:
                 ax.plot(subset['payment_amount_msat'], subset['success_rate'], 
-                       marker='o', label=f'{monitor_pct}% monitors', linewidth=2)
+                       marker='o', label=f'{judge_pct}% judges', linewidth=2)
         
         ax.set_xlabel('Payment Amount (msat)', fontsize=11)
         ax.set_ylabel('Success Rate', fontsize=11)
@@ -106,20 +138,20 @@ def plot_payment_amount_effect(df, output_dir):
 def plot_node_scale_effect(df, output_dir):
     """ノード規模の効果を可視化"""
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('ノード規模の効果（監視割合別・支払額別）', fontsize=16, fontweight='bold')
+    fig.suptitle('ノード規模の効果（判定ノード割合別・支払額別）', fontsize=16, fontweight='bold')
     
     payment_amounts = sorted(df['payment_amount_msat'].unique())
     
     for idx, payment_amt in enumerate(payment_amounts):
         ax = axes[idx]
         
-        for monitor_pct in [5, 20, 35, 50]:
+        for judge_pct in [5, 20, 35, 50]:
             subset = df[(df['payment_amount_msat'] == payment_amt) & 
-                       (df['monitor_percentage'] == monitor_pct)].sort_values('node_count')
+                       (df['judge_percentage'] == judge_pct)].sort_values('node_count')
             
             if len(subset) > 0:
                 ax.plot(subset['node_count'], subset['success_rate'], 
-                       marker='o', label=f'{monitor_pct}% monitors', linewidth=2)
+                       marker='o', label=f'{judge_pct}% judges', linewidth=2)
         
         ax.set_xlabel('Number of Nodes', fontsize=11)
         ax.set_ylabel('Success Rate', fontsize=11)
@@ -135,9 +167,9 @@ def plot_node_scale_effect(df, output_dir):
     plt.close()
 
 def plot_heatmap(df, output_dir):
-    """監視割合 vs ノード数のヒートマップ"""
+    """判定ノード割合 vs ノード数のヒートマップ"""
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('成功率 - 監視割合 vs ノード数（支払額別）', fontsize=16, fontweight='bold')
+    fig.suptitle('成功率 - 判定ノード割合 vs ノード数（支払額別）', fontsize=16, fontweight='bold')
     
     payment_amounts = sorted(df['payment_amount_msat'].unique())
     
@@ -148,12 +180,12 @@ def plot_heatmap(df, output_dir):
         subset = df[df['payment_amount_msat'] == payment_amt]
         pivot = subset.pivot_table(values='success_rate', 
                                    index='node_count', 
-                                   columns='monitor_percentage')
+                                   columns='judge_percentage')
         
         # ヒートマップ描画
         im = ax.imshow(pivot.values, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
         
-        ax.set_xlabel('Monitor Percentage (%)', fontsize=11)
+        ax.set_xlabel('Judge Percentage (%)', fontsize=11)
         ax.set_ylabel('Number of Nodes', fontsize=11)
         ax.set_title(f'Payment Amount: {payment_amt} msat', fontsize=12, fontweight='bold')
         
@@ -200,27 +232,27 @@ def plot_summary_stats(df, output_dir):
     ax.set_ylim([0, 1.0])
     ax.grid(True, alpha=0.3, axis='y')
     
-    # 監視割合ごとの平均成功率
+    # 判定ノード割合ごとの平均成功率
     ax = axes[1, 0]
-    monitor_stats = df.groupby('monitor_percentage')['success_rate'].mean()
-    ax.plot(monitor_stats.index, monitor_stats.values, marker='o', 
+    judge_stats = df.groupby('judge_percentage')['success_rate'].mean()
+    ax.plot(judge_stats.index, judge_stats.values, marker='o', 
            linewidth=2, markersize=4, color='green')
-    ax.fill_between(monitor_stats.index, monitor_stats.values, alpha=0.3, color='green')
-    ax.set_xlabel('Monitor Percentage (%)', fontsize=11)
+    ax.fill_between(judge_stats.index, judge_stats.values, alpha=0.3, color='green')
+    ax.set_xlabel('Judge Percentage (%)', fontsize=11)
     ax.set_ylabel('Mean Success Rate', fontsize=11)
-    ax.set_title('Success Rate by Monitor Percentage', fontsize=12, fontweight='bold')
+    ax.set_title('Success Rate by Judge Percentage', fontsize=12, fontweight='bold')
     ax.set_ylim([0, 1.0])
     ax.grid(True, alpha=0.3)
     
     # 検出率の分布
     ax = axes[1, 1]
-    detection_by_monitor = df.groupby('monitor_percentage')['detection_rate'].mean()
-    ax.plot(detection_by_monitor.index, detection_by_monitor.values, marker='s', 
+    detection_by_judge = df.groupby('judge_percentage')['detection_rate'].mean()
+    ax.plot(detection_by_judge.index, detection_by_judge.values, marker='s', 
            linewidth=2, markersize=4, color='purple')
-    ax.fill_between(detection_by_monitor.index, detection_by_monitor.values, alpha=0.3, color='purple')
-    ax.set_xlabel('Monitor Percentage (%)', fontsize=11)
+    ax.fill_between(detection_by_judge.index, detection_by_judge.values, alpha=0.3, color='purple')
+    ax.set_xlabel('Judge Percentage (%)', fontsize=11)
     ax.set_ylabel('Mean Detection Rate', fontsize=11)
-    ax.set_title('Detection Rate by Monitor Percentage', fontsize=12, fontweight='bold')
+    ax.set_title('Detection Rate by Judge Percentage', fontsize=12, fontweight='bold')
     ax.set_ylim([0, 1.0])
     ax.grid(True, alpha=0.3)
     
@@ -253,13 +285,13 @@ def main():
     print(f"\nDataset statistics:")
     print(f"  Nodes: {sorted(df['node_count'].unique())}")
     print(f"  Payment amounts: {sorted(df['payment_amount_msat'].unique())}")
-    print(f"  Monitor percentages: {df['monitor_percentage'].min()}~{df['monitor_percentage'].max()}%")
+    print(f"  Judge percentages: {df['judge_percentage'].min()}~{df['judge_percentage'].max()}%")
     print(f"  Status: {df['status'].value_counts().to_dict()}")
     
     print(f"\nGenerating visualizations...")
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    plot_monitor_percentage_effect(df, output_dir)
+    plot_judge_percentage_effect(df, output_dir)
     plot_payment_amount_effect(df, output_dir)
     plot_node_scale_effect(df, output_dir)
     plot_heatmap(df, output_dir)

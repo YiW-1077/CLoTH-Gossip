@@ -29,9 +29,9 @@ struct network_params {
     double attack_delay_intensity;            // delay multiplier during attack window (>=1.0)
     double attack_delay_jitter;               // additive gaussian jitter to multiplier
 
-    /* === Stage ② Research: Monitor Placement Parameters === */
+    /* === Stage ② Research: Judge Placement Parameters === */
     int hub_degree_threshold;              // minimum degree to be considered a hub (e.g., 50)
-    int monitoring_strategy;               // 1=method1, 2=method2
+    int judging_strategy;               // 1=method1, 2=method2
     int top_hub_count;                     // for method2: number of top hubs to connect
     unsigned int enable_simple_progress_mode; // 1 to print colorized in-terminal progress
     unsigned int enable_simple_progress_window; // 1 to show live graph in a separate window
@@ -41,8 +41,8 @@ struct network_params {
     double reputation_decay_rate;           // per-event decay of reputation score (0.0 to 1.0)
     double reputation_penalty_on_detection; // points deducted when node detected as malicious
     double reputation_recovery_rate;        // points restored per honest interval
-    unsigned int enable_monitor_movement;   // 1 to enable monitors relocating to better hubs
-    int movement_credit_limit;              // max movements per monitor (e.g., 5)
+    unsigned int enable_judge_movement;   // 1 to enable judges relocating to better hubs
+    int movement_credit_limit;              // max movements per judge (e.g., 5)
 
     /* === Stage ④ Research: DoS Mitigation Parameters === */
     unsigned int enable_pra;                // 1 to enable Path Reconstruction Attempt

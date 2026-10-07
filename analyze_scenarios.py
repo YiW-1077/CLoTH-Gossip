@@ -58,9 +58,9 @@ def analyze_payments(payments_csv):
         'avg_attempts': avg_attempts
     }
 
-def analyze_monitoring(monitoring_csv):
+def analyze_judging(judging_csv):
     """Analyze payment_information_estimation.csv"""
-    data = parse_csv(monitoring_csv)
+    data = parse_csv(judging_csv)
     if not data:
         return {'observations': 0, 'estimated_payments': 0}
     
@@ -69,13 +69,22 @@ def analyze_monitoring(monitoring_csv):
         'estimated_payments': sum(1 for d in data if d.get('num_observations', '0') != '0')
     }
 
-def analyze_monitors(monitor_csv):
-    """Analyze monitor placement"""
-    data = parse_csv(monitor_csv)
+def analyze_judges(judge_csv):
+    """Analyze judge placement.
+
+    judge_placement.csv は改称後の名前。旧 run では monitor_placement.csv なので、
+    新ファイルが無ければ同ディレクトリの旧ファイルにフォールバックする。
+    """
+    if not os.path.exists(judge_csv):
+        legacy = os.path.join(os.path.dirname(judge_csv), 'monitor_placement.csv')
+        if os.path.exists(legacy):
+            print(f"  [compat] {os.path.basename(legacy)} (旧名) を使用")
+            judge_csv = legacy
+    data = parse_csv(judge_csv)
     if not data:
-        return {'monitors_deployed': 0}
-    
-    return {'monitors_deployed': len(data)}
+        return {'judges_deployed': 0}
+
+    return {'judges_deployed': len(data)}
 
 def main():
     if len(sys.argv) < 2:
@@ -117,23 +126,23 @@ def main():
             print(f"  Success Rate: {payment_stats['success_rate']:.2f}%")
             print(f"  Avg Attempts: {payment_stats['avg_attempts']:.2f}")
         
-        # Analyze monitoring
-        monitoring_csv = os.path.join(scenario_path, 'payment_information_estimation.csv')
-        monitor_stats = analyze_monitoring(monitoring_csv)
-        print(f"\nMonitoring Statistics:")
-        print(f"  Observations: {monitor_stats['observations']}")
-        print(f"  Estimated Payments: {monitor_stats['estimated_payments']}")
+        # Analyze judging
+        judging_csv = os.path.join(scenario_path, 'payment_information_estimation.csv')
+        judge_stats = analyze_judging(judging_csv)
+        print(f"\nJudging Statistics:")
+        print(f"  Observations: {judge_stats['observations']}")
+        print(f"  Estimated Payments: {judge_stats['estimated_payments']}")
         
-        # Analyze monitor placement
-        monitor_csv = os.path.join(scenario_path, 'monitor_placement.csv')
-        placement_stats = analyze_monitors(monitor_csv)
-        print(f"\nMonitor Placement:")
-        print(f"  Monitors Deployed: {placement_stats['monitors_deployed']}")
+        # Analyze judge placement
+        judge_csv = os.path.join(scenario_path, 'judge_placement.csv')
+        placement_stats = analyze_judges(judge_csv)
+        print(f"\nJudge Placement:")
+        print(f"  Judges Deployed: {placement_stats['judges_deployed']}")
         
         # Store results
         results[scenario_name] = {
             'payments': payment_stats,
-            'monitoring': monitor_stats,
+            'judging': judge_stats,
             'placement': placement_stats
         }
     

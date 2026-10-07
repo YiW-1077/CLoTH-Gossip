@@ -17,15 +17,17 @@ def wait_for_file(path, timeout_sec=60):
 def load_nodes(nodes_path):
     node_ids = []
     is_malicious = {}
-    is_monitor = {}
+    is_judge = {}
     with open(nodes_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             nid = int(row["id"])
             node_ids.append(nid)
             is_malicious[nid] = int(row["is_malicious"]) == 1
-            is_monitor[nid] = int(row["is_monitor"]) == 1
-    return node_ids, is_malicious, is_monitor
+            # is_monitor は改称前の列名。旧 run の CSV も読めるようフォールバックする。
+            judge_col = row.get("is_judge", row.get("is_monitor", "0"))
+            is_judge[nid] = int(judge_col) == 1
+    return node_ids, is_malicious, is_judge
 
 
 def load_edges(edges_path):
@@ -117,7 +119,7 @@ def main():
     if not wait_for_file(nodes_path) or not wait_for_file(edges_path):
         return 0
 
-    node_ids, is_malicious, is_monitor = load_nodes(nodes_path)
+    node_ids, is_malicious, is_judge = load_nodes(nodes_path)
     edges = load_edges(edges_path)
     coords = build_circle_layout(node_ids)
     node_to_idx = {nid: i for i, nid in enumerate(node_ids)}
@@ -128,7 +130,7 @@ def main():
     for nid in node_ids:
         if is_malicious.get(nid, False):
             colors.append("red")
-        elif is_monitor.get(nid, False):
+        elif is_judge.get(nid, False):
             colors.append("blue")
         else:
             colors.append("black")

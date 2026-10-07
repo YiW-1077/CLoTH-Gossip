@@ -132,9 +132,9 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=0.0 \
         malicious_failure_probability=0.0 \
-        monitoring_strategy=disabled \
+        judging_strategy=disabled \
         enable_reputation_system=false \
-        enable_monitor_movement=false \
+        enable_judge_movement=false \
         movement_credit_limit=0 \
         enable_pra=false \
         enable_prt=false \
@@ -147,10 +147,10 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$MALICIOUS_RATIO \
         malicious_failure_probability=$ATTACK_SUCCESS_RATE \
-        monitoring_strategy=method2 \
+        judging_strategy=method2 \
         top_hub_count=$TOP_HUB_COUNT \
         enable_reputation_system=true \
-        enable_monitor_movement=false \
+        enable_judge_movement=false \
         movement_credit_limit=0 \
         enable_pra=false \
         enable_prt=false \
@@ -163,10 +163,10 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$MALICIOUS_RATIO \
         malicious_failure_probability=$ATTACK_SUCCESS_RATE \
-        monitoring_strategy=method2 \
+        judging_strategy=method2 \
         top_hub_count=$TOP_HUB_COUNT \
         enable_reputation_system=true \
-        enable_monitor_movement=true \
+        enable_judge_movement=true \
         movement_credit_limit=5 \
         enable_pra=true \
         enable_prt=true \
@@ -181,9 +181,9 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$EXT_MALICIOUS_RATIO \
         malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE \
-        monitoring_strategy=disabled \
+        judging_strategy=disabled \
         enable_reputation_system=false \
-        enable_monitor_movement=false \
+        enable_judge_movement=false \
         movement_credit_limit=0 \
         enable_pra=false \
         enable_prt=false \
@@ -196,10 +196,10 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$EXT_MALICIOUS_RATIO \
         malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE \
-        monitoring_strategy=method2 \
+        judging_strategy=method2 \
         top_hub_count=$TOP_HUB_COUNT \
         enable_reputation_system=true \
-        enable_monitor_movement=false \
+        enable_judge_movement=false \
         movement_credit_limit=0 \
         enable_pra=false \
         enable_prt=false \
@@ -212,10 +212,10 @@ for s in $(seq "$seed_start" $((seed_start + n_seeds - 1))); do
         payment_timeout=$PAYMENT_TIMEOUT_MS \
         malicious_node_ratio=$EXT_MALICIOUS_RATIO \
         malicious_failure_probability=$EXT_ATTACK_SUCCESS_RATE \
-        monitoring_strategy=method2 \
+        judging_strategy=method2 \
         top_hub_count=$TOP_HUB_COUNT \
         enable_reputation_system=true \
-        enable_monitor_movement=true \
+        enable_judge_movement=true \
         movement_credit_limit=5 \
         enable_pra=true \
         enable_prt=true \
@@ -253,15 +253,15 @@ for baseline in glob.glob(os.path.join(root, "seed=*", "*", "baseline_metrics.cs
     with open(baseline, newline="") as f:
         b = next(csv.DictReader(f))
 
-    # Monitor metrics
-    monitor_metrics = os.path.join(scenario_dir, "monitor_metrics.csv")
-    active_monitors = 0
-    cumulative_monitors = 0
-    if os.path.exists(monitor_metrics):
-        with open(monitor_metrics, newline="") as f:
+    # Judge metrics
+    judge_metrics = os.path.join(scenario_dir, "judge_metrics.csv")
+    active_judges = 0
+    cumulative_judges = 0
+    if os.path.exists(judge_metrics):
+        with open(judge_metrics, newline="") as f:
             m = next(csv.DictReader(f))
-            active_monitors = int(m.get("num_monitors", 0))
-            cumulative_monitors = int(m.get("cumulative_monitor_assignments", active_monitors))
+            active_judges = int(m.get("num_judges", 0))
+            cumulative_judges = int(m.get("cumulative_judge_assignments", active_judges))
 
     # Per-payment delay breakdown (success without attack vs success after attack)
     payments_path = os.path.join(scenario_dir, "payments_output.csv")
@@ -310,8 +310,8 @@ for baseline in glob.glob(os.path.join(root, "seed=*", "*", "baseline_metrics.cs
         "avg_delay": b["avg_delay"],
         "n_failed": b["n_failed"],
         "total_attacks_triggered": b["total_attacks_triggered"],
-        "active_monitors": active_monitors,
-        "cumulative_monitors": cumulative_monitors,
+        "active_judges": active_judges,
+        "cumulative_judges": cumulative_judges,
         "top_hub_count_used": top_hub_count,
         "top_hub_ids_used": top_hub_ids,
         "clean_success_delay_avg": clean_avg,
@@ -326,7 +326,7 @@ with open(out, "w", newline="") as f:
         f,
         fieldnames=[
             "seed", "scenario", "success_rate", "avg_delay", "n_failed",
-            "total_attacks_triggered", "active_monitors", "cumulative_monitors",
+            "total_attacks_triggered", "active_judges", "cumulative_judges",
             "top_hub_count_used", "top_hub_ids_used",
             "clean_success_delay_avg", "attacked_success_delay_avg",
             "n_clean_success", "n_attacked_success",

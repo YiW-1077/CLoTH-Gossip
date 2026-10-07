@@ -62,17 +62,18 @@ struct payment {
   uint64_t* hop_settle_recv_times;  // array of preimage-return receive timestamps per hop
   int hop_settle_recv_capacity;     // allocated size (= hop_send_times_capacity)
 
-  /* === Grief-hold attack (backward settlement delay, no fail) ===
-   * 混在モードで、ある悪意ノードが「フォワードで失敗させず、決済(backward)経路で
-   * preimage を保持して遅延させる」と決めた場合、そのノード id を記録する(-1=なし)。
+  /* === hold 型攻撃 (settlement レグでの保持遅延。支払いは失敗させない) ===
+   * 混在モードで、ある悪意ノードが「forward leg では失敗させず、settlement
+   * (backward) レグで preimage を保持して遅延させる」と決めた場合、そのノード id を
+   * 記録する(-1=なし)。この値は攻撃注入側の内部状態で、検知器には渡らない。
    * 1経路につき1ノード(最後に hold を選んだノード)を保持。計測フェーズには十分。 */
   long grief_hold_node_id;
   
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments
   
-  /* === Monitoring: Observation tracking === */
-  unsigned int is_observed;         // 1 if at least one monitor observed this payment
+  /* === Judging: Observation tracking === */
+  unsigned int is_observed;         // 1 if at least one judge observed this payment
 
   /* === Attack Report Tracking (per payment) === */
   long* attack_reporters;          // node IDs that filed an attack report for this payment

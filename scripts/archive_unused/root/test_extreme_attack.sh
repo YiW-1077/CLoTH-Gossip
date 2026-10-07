@@ -48,13 +48,13 @@ mpp=1
 malicious_node_ratio=0.25
 malicious_failure_probability=0.95
 hub_degree_threshold=50
-monitoring_strategy=method1
+judging_strategy=method1
 top_hub_count=30
 enable_reputation_system=false
 reputation_decay_rate=0.0
 reputation_penalty_on_detection=0.0
 reputation_recovery_rate=0.0
-enable_monitor_movement=false
+enable_judge_movement=false
 movement_credit_limit=0
 enable_pra=false
 enable_prt=false
@@ -69,7 +69,7 @@ GSL_RNG_SEED=42 timeout 180 ./CLoTH_Gossip ./result_extreme_attack/ 2>&1 | grep 
 
 # Test 2: PRT防御のみ
 echo ""
-echo "【Test 2】Extreme Attack + PRT Defense (No monitoring)"
+echo "【Test 2】Extreme Attack + PRT Defense (No judging)"
 cat > cloth_input.txt << 'CONF'
 generate_network_from_file=true
 nodes_filename=nodes_ln.csv
@@ -102,13 +102,13 @@ mpp=1
 malicious_node_ratio=0.25
 malicious_failure_probability=0.95
 hub_degree_threshold=50
-monitoring_strategy=method1
+judging_strategy=method1
 top_hub_count=30
 enable_reputation_system=false
 reputation_decay_rate=0.0
 reputation_penalty_on_detection=0.0
 reputation_recovery_rate=0.0
-enable_monitor_movement=false
+enable_judge_movement=false
 movement_credit_limit=0
 enable_pra=true
 enable_prt=true

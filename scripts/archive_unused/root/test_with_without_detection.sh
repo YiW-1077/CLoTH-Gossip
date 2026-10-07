@@ -53,9 +53,9 @@ mkdir -p "$TEST_A_DIR"
     n_payments=$N_PAYMENTS \
     malicious_node_ratio=$MALICIOUS_RATIO_A \
     malicious_failure_probability=$ATTACK_SUCCESS_RATE_A \
-    monitoring_strategy=disabled \
+    judging_strategy=disabled \
     enable_reputation_system=false \
-    enable_monitor_movement=false \
+    enable_judge_movement=false \
     movement_credit_limit=0 \
     enable_pra=false \
     enable_prt=false \
@@ -99,9 +99,9 @@ mkdir -p "$TEST_B_DIR"
     n_payments=$N_PAYMENTS \
     malicious_node_ratio=$MALICIOUS_RATIO_BC \
     malicious_failure_probability=$ATTACK_SUCCESS_RATE_BC \
-    monitoring_strategy=method2 \
+    judging_strategy=method2 \
     enable_reputation_system=true \
-    enable_monitor_movement=false \
+    enable_judge_movement=false \
     movement_credit_limit=0 \
     enable_pra=false \
     enable_prt=false \
@@ -145,9 +145,9 @@ mkdir -p "$TEST_C_DIR"
     n_payments=$N_PAYMENTS \
     malicious_node_ratio=$MALICIOUS_RATIO_BC \
     malicious_failure_probability=$ATTACK_SUCCESS_RATE_BC \
-    monitoring_strategy=method2 \
+    judging_strategy=method2 \
     enable_reputation_system=true \
-    enable_monitor_movement=true \
+    enable_judge_movement=true \
     movement_credit_limit=5 \
     enable_pra=true \
     enable_prt=true \
@@ -240,8 +240,8 @@ def read_payments(path):
     with open(f, newline="") as fp:
         return list(csv.DictReader(fp))
 
-def read_monitor_metrics(path):
-    f = os.path.join(path, "monitor_metrics.csv")
+def read_judge_metrics(path):
+    f = os.path.join(path, "judge_metrics.csv")
     if not os.path.exists(f):
         return None
     with open(f, newline="") as fp:
@@ -266,7 +266,7 @@ for name, path in scenarios.items():
     baseline = read_baseline(path)
     reputation = read_reputation(path)
     payments = read_payments(path)
-    monitor = read_monitor_metrics(path)
+    judge = read_judge_metrics(path)
     cfg = read_config(path)
 
     if baseline is None or payments is None:
@@ -280,7 +280,7 @@ for name, path in scenarios.items():
 
     detection_enabled = (
         cfg.get("enable_reputation_system", "false") == "true"
-        and cfg.get("monitoring_strategy", "disabled") != "disabled"
+        and cfg.get("judging_strategy", "disabled") != "disabled"
     )
 
     malicious_total = None
@@ -305,10 +305,10 @@ for name, path in scenarios.items():
             detection_latency_ms = sum(latencies) / len(latencies)
 
     avg_amount_msat = sum(int(p["amount"]) for p in payments) / len(payments) if payments else 0
-    num_monitors = int(monitor["num_monitors"]) if monitor else 0
-    cumulative_monitors = int(monitor.get("cumulative_monitor_assignments", monitor["num_monitors"])) if monitor else 0
+    num_judges = int(judge["num_judges"]) if judge else 0
+    cumulative_judges = int(judge.get("cumulative_judge_assignments", judge["num_judges"])) if judge else 0
     movement_credit_limit = int(cfg.get("movement_credit_limit", "0") or "0")
-    movement_budget_credits = cumulative_monitors * movement_credit_limit
+    movement_budget_credits = cumulative_judges * movement_credit_limit
 
     metrics[name] = {
         "scenario": name,
@@ -320,8 +320,8 @@ for name, path in scenarios.items():
         "malicious_total": malicious_total,
         "malicious_detected": malicious_detected,
         "detection_coverage": detection_coverage,
-        "num_monitors": num_monitors,
-        "cumulative_monitors": cumulative_monitors,
+        "num_judges": num_judges,
+        "cumulative_judges": cumulative_judges,
         "movement_credit_limit": movement_credit_limit,
         "movement_budget_credits": movement_budget_credits,
         "avg_amount_msat": avg_amount_msat,
@@ -375,7 +375,7 @@ for key in ("B_detection_only", "C_full_defense"):
     ce = m.get("cost_efficiency_msat_per_credit")
     ce_text = "N/A" if ce is None else f"{ce:.2f} msat/credit"
     print(
-        f"  {key}: monitors(active={m['num_monitors']}, cumulative={m['cumulative_monitors']}), movement_budget={m['movement_budget_credits']} credits, "
+        f"  {key}: judges(active={m['num_judges']}, cumulative={m['cumulative_judges']}), movement_budget={m['movement_budget_credits']} credits, "
         f"prevented_failures={pf}, prevented_damage={pd:.2f} msat, efficiency={ce_text}"
     )
 
@@ -383,7 +383,7 @@ out_csv = os.path.join(output_base, "evaluation_metrics.csv")
 fieldnames = [
     "scenario", "success_rate", "avg_delay_ms", "n_failed", "total_attacks_triggered",
     "detection_latency_ms", "malicious_detected", "malicious_total", "detection_coverage",
-    "num_monitors", "cumulative_monitors", "movement_credit_limit", "movement_budget_credits",
+    "num_judges", "cumulative_judges", "movement_credit_limit", "movement_budget_credits",
     "prevented_failures_vs_a", "prevented_damage_msat_vs_a", "cost_efficiency_msat_per_credit"
 ]
 with open(out_csv, "w", newline="") as fp:
@@ -403,8 +403,8 @@ with open(out_csv, "w", newline="") as fp:
             "malicious_detected": m.get("malicious_detected"),
             "malicious_total": m.get("malicious_total"),
             "detection_coverage": m.get("detection_coverage"),
-            "num_monitors": m.get("num_monitors"),
-            "cumulative_monitors": m.get("cumulative_monitors"),
+            "num_judges": m.get("num_judges"),
+            "cumulative_judges": m.get("cumulative_judges"),
             "movement_credit_limit": m.get("movement_credit_limit"),
             "movement_budget_credits": m.get("movement_budget_credits"),
             "prevented_failures_vs_a": m.get("prevented_failures_vs_a"),

@@ -11,8 +11,8 @@ echo ""
 echo "Payment count: 1000 (より統計的に有意な結果)"
 echo ""
 
-# Test 1: 攻撃のみ（監視なし、回避なし）
-echo "【シナリオ 1】Attack Only (No monitoring, no avoidance)"
+# Test 1: 攻撃のみ（判定ノードなし、回避なし）
+echo "【シナリオ 1】Attack Only (No judging, no avoidance)"
 echo "攻撃: 15% malicious, 80% failure rate"
 echo "防御: なし"
 echo ""
@@ -49,13 +49,13 @@ mpp=1
 malicious_node_ratio=0.15
 malicious_failure_probability=0.8
 hub_degree_threshold=50
-monitoring_strategy=method1
+judging_strategy=method1
 top_hub_count=30
 enable_reputation_system=false
 reputation_decay_rate=0.0
 reputation_penalty_on_detection=0.0
 reputation_recovery_rate=0.0
-enable_monitor_movement=false
+enable_judge_movement=false
 movement_credit_limit=0
 enable_pra=false
 enable_prt=false
@@ -72,10 +72,10 @@ echo ""
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
-# Test 2: 検知のみ（監視+レピュテーション、ただしルーティングは無視）
-echo "【シナリオ 2】Detection Only (Monitoring + reputation, no avoidance in routing)"
+# Test 2: 検知のみ（判定ノード+レピュテーション、ただしルーティングは無視）
+echo "【シナリオ 2】Detection Only (Judging + reputation, no avoidance in routing)"
 echo "攻撃: 15% malicious, 80% failure rate"
-echo "防御: 監視+レピュテーション追跡（ルーティングには使わない）"
+echo "防御: 判定ノード+レピュテーション追跡（ルーティングには使わない）"
 echo ""
 
 cat > cloth_input.txt << 'CONF'
@@ -110,13 +110,13 @@ mpp=1
 malicious_node_ratio=0.15
 malicious_failure_probability=0.8
 hub_degree_threshold=50
-monitoring_strategy=method2
+judging_strategy=method2
 top_hub_count=30
 enable_reputation_system=true
 reputation_decay_rate=0.01
 reputation_penalty_on_detection=0.3
 reputation_recovery_rate=0.01
-enable_monitor_movement=true
+enable_judge_movement=true
 movement_credit_limit=5
 enable_pra=false
 enable_prt=false
@@ -136,7 +136,7 @@ echo ""
 # Test 3: 検知+回避（完全防御）
 echo "【シナリオ 3】Detection + Avoidance (Complete defense)"
 echo "攻撃: 15% malicious, 80% failure rate"
-echo "防御: 監視+レピュテーション+RBRルーティング回避"
+echo "防御: 判定ノード+レピュテーション+RBRルーティング回避"
 echo ""
 
 cat > cloth_input.txt << 'CONF'
@@ -171,13 +171,13 @@ mpp=1
 malicious_node_ratio=0.15
 malicious_failure_probability=0.8
 hub_degree_threshold=50
-monitoring_strategy=method2
+judging_strategy=method2
 top_hub_count=30
 enable_reputation_system=true
 reputation_decay_rate=0.01
 reputation_penalty_on_detection=0.3
 reputation_recovery_rate=0.01
-enable_monitor_movement=true
+enable_judge_movement=true
 movement_credit_limit=5
 enable_pra=true
 enable_prt=true
