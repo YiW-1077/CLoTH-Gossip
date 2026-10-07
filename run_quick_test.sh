@@ -7,17 +7,17 @@ BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
 
 # ============================================================
 # === 攻撃手法の選択（この値を直接編集して切り替える）===
-#   ATTACK_MODE=1 : fail 型のみ（従来の HTLC 失敗攻撃）
+#   ATTACK_MODE=1 : hold-to-timeout 型のみ（HTLCを保持してタイムアウト失敗させる; 旧称 fail型/forward型）
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
-#   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
+#   ATTACK_MODE=3 : 混在（hold-to-timeout + hold; 割合は下の GRIEF_HOLD_RATIO）
 # (sweep 側 run_monitor_sweep.sh と同期: hold(2)。変える場合は両方揃えること)
 ATTACK_MODE=2
 GRIEF_HOLD_RATIO=0.5    # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ============================================================
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
-[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で hold 検知器を自動ON
-echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で決済検知器を自動ON
+echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=hold-to-timeout 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 BASE_TEMPLATE='generate_network_from_file=true
 nodes_filename=config/data/nodes_ln.csv
 channels_filename=config/data/channels_ln.csv
@@ -67,7 +67,7 @@ prt_abort_wait_time=1000
 rbr_reputation_weight=20.0'
 
 test_scenario() {
-  local name=$1 malicious=$2 attack_success=$3 rbr=$4 rep=$5 judging=$6
+  local name=$1 malicious=$2 attack_success=$3 rbr=$4 rep=$5 monitoring=$6
   
   echo ""
   echo "========================================="
@@ -79,7 +79,7 @@ malicious_node_ratio=$malicious
 malicious_failure_probability=$attack_success
 enable_reputation_system=$rep
 enable_rbr=$rbr
-judging_strategy=$judging"
+judging_strategy=$monitoring"
   
   echo "$config" > "$BASE_CONFIG"
   

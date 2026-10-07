@@ -14,6 +14,96 @@ if [ $# -lt 2 ]; then
     exit 1
 fi
 
+# ############################################################################
+# ##                                                                        ##
+# ##   設 定 ブ ロ ッ ク  —  条件を変えるときはここだけを編集する              ##
+# ##                                                                        ##
+# ##   ここ以外に設定値は散らばっていない。環境変数は見ないので、ユーザの      ##
+# ##   シェルに export CLOTH_* が残っていても結果は化けない。                ##
+# ##   (例外: 第4引数以降の judging_strategy= / p_list= は従来どおり有効)  ##
+# ############################################################################
+
+# --- [1] スイープの軸 -------------------------------------------------------
+N_PAYMENTS=(50 100 200 400 800 1600 3200 6400 12800)   # 取引数
+PAYMENT_AMOUNTS=(100 500 1000)                          # 送金額[sat]
+P_VALUES=(0.01 0.005 0.001)                             # 検定の有意水準
+JUDGING_METHODS=(judge_disable judge_method1 judge_method2)
+JUDGE_NODE_COUNTS=(10)        # 判定ノード数
+NODE_SCALES=6000                # 追加ノード数
+TOP_HUB_COUNT=10
+
+# --- [2] 攻撃の種別 ---------------------------------------------------------
+#   1 = hold-to-timeout 型のみ（HTLCを保持してタイムアウト失敗させる; 旧称 fail型/forward型）
+#   2 = hold 型のみ（決済保持グリーフィング）← 本研究の主対象
+#   3 = 混在（hold-to-timeout + hold; 割合は GRIEF_HOLD_RATIO）
+ATTACK_MODE=2
+GRIEF_HOLD_RATIO=1.0            # ATTACK_MODE=3 のときの hold 割合 [0,1]
+MALICIOUS_RATIO=0.15            # 悪意ノードの割合
+ATTACK_SUCCESS_RATE=1.0         # 悪意ノードを通った決済が攻撃される確率
+
+# --- [3] 攻撃モデルの詳細（偽報告・黙秘・時計ずれ・遅延分布）----------------
+# ⚠️ これらは「防御の設定」ではなく「環境」なので no_defense を含む全モードに掛かる
+#    (防御モードだけに掛けると対照条件が攻撃を受けず比較が壊れる)。
+#   FALSE_REPORT_MS    攻撃者が自分の申告時刻を偽る量[ms]。0 = 嘘なし。
+#                      受領時刻 +X / 送出時刻 -X と偽り見かけの保持を 2X 縮める。
+#                      目安: 50 = 冤罪を出せる最小値、100超で入れ子制約が破れ始める
+#   FALSE_REPORT_PROB  嘘をつく確率 [0,1]。1.0 = 攻撃のたびに毎回
+#   SILENT_REPORT_PROB 攻撃者が自分の時刻記録を提出しない(黙秘)確率 [0,1]
+#   CLOCK_SKEW_MS      各ノードの固定時計オフセット幅[ms] (-E..+E)
+#   ATTACK_DELAY_DIST  注入遅延の分布 fixed(一律) / lognormal / exponential / pareto / uniform
+#                      いずれも平均保存＝平均注入遅延は fixed と同一で分散だけ変わる
+#   ATTACK_DELAY_SIGMA lognormal の log-σ
+# 代表的な条件: 既定=報告者は全員正直 / 偽報告=FALSE_REPORT_MS=100 /
+#               黙秘=SILENT_REPORT_PROB=1.0 / 現実寄り=ATTACK_DELAY_DIST=lognormal
+FALSE_REPORT_MS=0
+FALSE_REPORT_PROB=1.0
+SILENT_REPORT_PROB=0
+CLOCK_SKEW_MS=0
+ATTACK_DELAY_DIST=fixed
+ATTACK_DELAY_SIGMA=1.0
+# 攻撃遅延の基本パラメータ(config へ渡す key=value)。倍率は attack_delay_intensity。
+ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_time=3000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
+
+# --- [4] 検知方式 -----------------------------------------------------------
+#   REPORT_ATTEST  1 = 相互証明（既定）。帰属に被疑ノード自身の申告を使わず
+#                      hold[p] = recv[p-1] - send_back[p+1] と両隣の申告だけで構成する。
+#                      偽報告(嘘・黙秘)に不感。
+#                  0 = 旧方式(被疑者の申告 RT を使う)。⚠️偽報告に破綻する
+#                      (嘘100msで冤罪152件・precision42%、黙秘100%で recall16%)。
+#                      過去結果の再現時のみ 0 にすること。
+#   ATTEST_SILENCE_POLICY 1 = 欠測(黙秘)・入れ子違反を「被疑者の記録が使えない」扱いにして帰属続行
+#   ATTEST_DISPUTE_POLICY 1 = 被疑者の2本のリンクが両方食い違えば原因を被疑者と断定して帰属続行
+#                             (片方だけの食い違いは冤罪防止のため破棄)
+#   SETTLE_DEGREE_SIGMA / SETTLE_DEGREE_MIN
+#       hold検知の次数σ膨張（ヒンジ型） σ_eff = σ·(1 + k·ln(1 + max(0, d−D)))
+#       次数 D 以下は膨張ゼロ。D=0 でヒンジ導入前の連続な ln(1+d) に戻る。
+#   SETTLE_VAR_INIT  null の初期分散。空 = コード既定(0.01, σ=0.10)。0.0009 で σ=0.03
+#       (σ=0.03 は recall を1ノード拾う代わりに代表条件で誤検知を出すため不採用)
+#   SETTLE_QUANTILE_NULL 1 で旧 per-node 分位点 null に切替
+#   NULL_DEGREE_SIGMA / RATE_GATE_TAU  forward検知側の FWER 対策 (k / τ)
+REPORT_ATTEST=1
+ATTEST_SILENCE_POLICY=1
+ATTEST_DISPUTE_POLICY=1
+SETTLE_DEGREE_SIGMA=0.20
+SETTLE_DEGREE_MIN=150
+SETTLE_VAR_INIT=
+SETTLE_QUANTILE_NULL=0
+NULL_DEGREE_SIGMA=0.04
+RATE_GATE_TAU=0.001
+
+# --- [5] 代役ハブ（トポロジ what-if・防御モードのみ）------------------------
+# 悪意ハブ(次数>=MIN_DEGREE)ごとに正直な代役ノードを注入し、回避で失われる連結性を補う。
+# ⚠️「現実網では作れない正直容量」の上限measurement であり配備可能策ではない。
+# baseline(no_defense) には注入せず対照を現実のまま保つ。
+SUBSTITUTE_COUNT=1              # 0 で無効(全モード realistic)
+SUBSTITUTE_MIN_DEGREE=100
+SUBSTITUTE_MAX_LINKS=400
+SUBSTITUTE_ON_DETECTION=0       # 0=オラクル配置(既定) / 1=検知トリガ(非オラクル)
+
+# ############################################################################
+# ##   設定ブロックここまで。以降はロジック（通常は編集不要）                ##
+# ############################################################################
+
 # --- 複数シード対応 ---------------------------------------------------------
 # $1 にカンマ/空白区切りで複数シードを指定すると、各シードで本スクリプトを
 # 順番に自己再実行する(各シードは独立した timestamp 出力dir + results_summary.csv)。
@@ -45,9 +135,6 @@ project_root="$(cd "$(dirname "$0")" && pwd)"
 
 # Process additional keyword arguments for judging_strategy override and p_list
 JUDGING_METHODS_OVERRIDE=""
-# P_VALUES are specified here inside the script (override args/env)
-# Edit this list to change which p-value thresholds are tested.
-P_VALUES=(0.01 0.005 0.001)
 
 for ((i=4; i<=$#; i++)); do
     arg="${!i}"
@@ -92,62 +179,36 @@ fi
 # Create timestamped output directory (always local)
 timestamp=$(date "+%Y%m%d%H%M%S")
 
-# ---------------------------------------------------------------------------
-# Fixed parameters
-# ---------------------------------------------------------------------------
-N_PAYMENTS=(50 100 200 400 800 1600 3200 6400 12800)
-MALICIOUS_RATIO=0.15
-ATTACK_SUCCESS_RATE=1.0
-TOP_HUB_COUNT=10
-
-ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_time=3000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
-
-# ---------------------------------------------------------------------------
-# FWER対策 (攻撃者検知 precision の n 依存低下の緩和) を全 sim で有効化。
-#   CLOTH_NULL_DEGREE_SIGMA : fail 検知器の degree-σ null。高次数ノードの仮説検定
-#                             null を広げて誤報告(FP源)を走行中に抑える (Axis-3)。
-#                             hold 検知器には適用されない (次数非依存のため)。
-#   CLOTH_RATE_GATE_TAU     : report-rate gate。低レポートレートの flag を実行末に
-#                             取り消す測定専用フィルタ (経路・評判には不干渉)。
+# FWER対策(forward検知)を全 sim へ継承。値は設定ブロック[4]。
 # 検証値: k=0.04 + τ=1e-3 で FP 6->0 / precision 100% / recall 無損失。
-# export なので各 sim (run-simulation.sh -> CLoTH_Gossip) に継承される。
-# 外部で指定があればそれを優先 (空文字を export すれば無効化)。
-# ---------------------------------------------------------------------------
-export CLOTH_NULL_DEGREE_SIGMA="${CLOTH_NULL_DEGREE_SIGMA-0.04}"
-export CLOTH_RATE_GATE_TAU="${CLOTH_RATE_GATE_TAU-0.001}"
-echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA CLOTH_RATE_GATE_TAU=$CLOTH_RATE_GATE_TAU"
+export CLOTH_NULL_DEGREE_SIGMA="$NULL_DEGREE_SIGMA"
+export CLOTH_RATE_GATE_TAU="$RATE_GATE_TAU"
+echo "[Config] FWER対策: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA CLOTH_RATE_GATE_TAU=$CLOTH_RATE_GATE_TAU"
 
-# ---------------------------------------------------------------------------
-# === 攻撃手法の選択（この値を直接編集して切り替える）===
-#   ATTACK_MODE=1 : fail 型のみ（従来の HTLC 失敗攻撃）
-#   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
-#   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
-# (8ce7590 で hold(2) に設定後、cb27298 で意図せず 3 に戻っていたのを再修正)
-ATTACK_MODE=2
-GRIEF_HOLD_RATIO=1.0   # ATTACK_MODE=3 のときの hold 割合 [0,1]
-# ---------------------------------------------------------------------------
+# 攻撃種別を全 sim へ継承。値は設定ブロック[2]。
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
-[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で hold 検知器を自動ON
-echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF=1   # mode2/3で決済検知器を自動ON
+echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=hold-to-timeout 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 
-# ---------------------------------------------------------------------------
-# === 代役ハブ(トポロジ what-if) — 防御2モードで既定ON ===
-# 悪意ハブ(次数>=SUBSTITUTE_MIN_DEGREE)ごとに正直な代役ノードを注入し、回避で失われる
-# 連結性を補う。baseline(no_defense/judge_disable)には注入せず対照を現実のまま保ち、
-# 防御2モード(method1/method2)にのみ注入して、RBR回避を使う防御側が正直な代替を活用できる形にする。
-# ⚠️注意: 代役は「現実網では作れない正直容量」の上限measurement。method1/2 の成績には配備不能な
-#   代役容量分が含まれる(hub-soft/boost抑制のような配備可能ポリシーとは別クラス)。結果解釈時に留意。
-# 既定ON(=1)。全モードrealisticにしたい場合は SUBSTITUTE_COUNT=0 を env で指定して無効化。
-# 配置モード SUBSTITUTE_ON_DETECTION: 0=オラクル配置(既定, init時から有効, what-if上限) /
-#   1=検知トリガ(非オラクル, 対象ハブが検知された時点で有効化, 配備現実寄り)。防御モードの
-#   env に明示的に固定するので、ユーザシェルにグローバル export があっても化けない(遮蔽)。
-# env をグローバル export せず、手法別に per-run コマンドへプレフィックスする(下の method ループ参照)。
-SUBSTITUTE_COUNT="${SUBSTITUTE_COUNT:-1}"
-SUBSTITUTE_ON_DETECTION="${SUBSTITUTE_ON_DETECTION:-0}"   # 0=オラクル(既定) / 1=検知トリガ(非オラクル)
+# 攻撃モデル(偽報告・黙秘・時計ずれ・遅延分布)を全モードへ継承。値は設定ブロック[3]。
+export CLOTH_FALSE_REPORT_MS="$FALSE_REPORT_MS"
+export CLOTH_FALSE_REPORT_PROB="$FALSE_REPORT_PROB"
+export CLOTH_SILENT_REPORT_PROB="$SILENT_REPORT_PROB"
+export CLOTH_CLOCK_SKEW_MS="$CLOCK_SKEW_MS"
+export CLOTH_ATTACK_DELAY_DIST="$ATTACK_DELAY_DIST"
+export CLOTH_ATTACK_DELAY_SIGMA="$ATTACK_DELAY_SIGMA"
+if [ "$FALSE_REPORT_MS" != "0" ] || [ "$SILENT_REPORT_PROB" != "0" ] || \
+   [ "$CLOCK_SKEW_MS" != "0" ] || [ "$ATTACK_DELAY_DIST" != "fixed" ]; then
+    echo "[Config] ⚠️攻撃モデル拡張ON: 嘘=${FALSE_REPORT_MS}ms(確率${FALSE_REPORT_PROB}) 黙秘=${SILENT_REPORT_PROB} 時計ずれ=${CLOCK_SKEW_MS}ms 遅延分布=${ATTACK_DELAY_DIST}(σ=${ATTACK_DELAY_SIGMA})"
+else
+    echo "[Config] 攻撃モデル: 偽報告なし/黙秘なし/時計ずれなし/遅延は一律(fixed) ※既定"
+fi
+
+# 代役ハブ。値は設定ブロック[5]。防御モード(method1/2)にだけ per-run env として付ける。
 SUB_ENV_DEFENSE=""   # 防御モード(method1/2)にだけ付けるenv。disableには付けない。
 if [ "$SUBSTITUTE_COUNT" -gt 0 ] 2>/dev/null; then
-    SUB_ENV_DEFENSE="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=${SUBSTITUTE_MIN_DEGREE:-100} CLOTH_SUBSTITUTE_MAX_LINKS=${SUBSTITUTE_MAX_LINKS:-400} CLOTH_SUBSTITUTE_ON_DETECTION=$SUBSTITUTE_ON_DETECTION"
+    SUB_ENV_DEFENSE="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=$SUBSTITUTE_MIN_DEGREE CLOTH_SUBSTITUTE_MAX_LINKS=$SUBSTITUTE_MAX_LINKS CLOTH_SUBSTITUTE_ON_DETECTION=$SUBSTITUTE_ON_DETECTION"
     if [ "$SUBSTITUTE_ON_DETECTION" = "1" ]; then sub_mode_lbl="検知トリガ(非オラクル)"; else sub_mode_lbl="オラクル配置(init時から有効)"; fi
     echo "[Config] 代役ハブ 既定ON(防御モードのみ・baselineは対照, what-if上限): $SUB_ENV_DEFENSE  配置=$sub_mode_lbl ※配備可能策ではない"
 else
@@ -159,24 +220,30 @@ fi
 # 大きい k が必要で、n=12800 で k≈0.12-0.20 のとき per-node 分位点null と precision/recall が
 # 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2)のみに適用。
 # 旧 per-node 分位点null に戻したい場合は env SETTLE_QUANTILE_NULL=1。
-SETTLE_QUANTILE_NULL="${SETTLE_QUANTILE_NULL:-0}"
+# hold検知の null と帰属方式。値は設定ブロック[4]。防御モードにだけ per-run env として付ける。
 if [ "$SETTLE_QUANTILE_NULL" = "1" ]; then
     DETECT_ENV_DEFENSE="CLOTH_SETTLE_NULL_QUANTILE=true"
     echo "[Config] hold検知=per-node 分位点null (防御モードのみ): $DETECT_ENV_DEFENSE"
 else
-    DETECT_ENV_DEFENSE="CLOTH_SETTLE_DEGREE_SIGMA=${CLOTH_SETTLE_DEGREE_SIGMA:-0.20}"
-    echo "[Config] hold検知=対数正規z検定+次数σ膨張 (防御モードのみ): $DETECT_ENV_DEFENSE"
+    # 次数σ膨張はヒンジ型 σ_eff=σ(1+k·ln(1+max(0,deg-D)))。D=CLOTH_SETTLE_DEGREE_MIN (既定150)
+    # 以下のノードは膨張ゼロ=生σ。取りこぼし攻撃者(次数<=84)には狭い null、多検定ノード
+    # (次数>=150)には厚い保護を同時に与える。D=0 でヒンジ導入前の挙動に戻る。
+    DETECT_ENV_DEFENSE="CLOTH_SETTLE_DEGREE_SIGMA=$SETTLE_DEGREE_SIGMA CLOTH_SETTLE_DEGREE_MIN=$SETTLE_DEGREE_MIN"
+    # 2026-10-06: 報告の帰属は既定で**相互証明**(被疑者自身の申告を使わない)。
+    # 偽報告(嘘・黙秘)に不感。旧方式に戻すには env CLOTH_REPORT_ATTEST=0。
+    DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_REPORT_ATTEST=$REPORT_ATTEST"
+    # 相互証明の2ポリシー(いずれも既定1)。コード側の既定に任せるとログに残らず、
+    # 後から「どの版で回したか」が追えないので明示的に渡して記録する。
+    #   SILENCE_POLICY: 欠測(黙秘)・入れ子違反を「被疑者の記録が使えない」扱いにして帰属続行
+    #   DISPUTE_POLICY: 2本のリンクが両方食い違えば共通点=被疑者と断定して帰属続行
+    DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_SILENCE_POLICY=$ATTEST_SILENCE_POLICY CLOTH_ATTEST_DISPUTE_POLICY=$ATTEST_DISPUTE_POLICY"
+    [ -n "$SETTLE_VAR_INIT" ] && DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_SETTLE_VAR_INIT=$SETTLE_VAR_INIT"
+    echo "[Config] hold検知=対数正規z検定+次数σ膨張(ヒンジ型)+相互証明帰属 (防御モードのみ): $DETECT_ENV_DEFENSE"
 fi
 
 # ---------------------------------------------------------------------------
 # Sweep parameters
 # ---------------------------------------------------------------------------
-NODE_SCALES=6000
-PAYMENT_AMOUNTS=(100 500 1000)
-
-# 判定ノード数の絶対数リスト
-JUDGE_NODE_COUNTS=(10)
-JUDGING_METHODS=(judge_disable judge_method1 judge_method2)
 
 # 防御モードは method に固定対応 (enqueue ループ内 defense_modes_iter):
 #   judge_disable → no_defense / judge_method1・method2 → avoid_low_reputation
@@ -208,6 +275,7 @@ fi
 # 行は n→amount→p→method でソート (同一条件の disable/method1/method2 が隣接=改善を縦読み)。
 # ===========================================================================
 
+# summary.csv から指定キーの値を取り出すヘルパー
 # summary.csv から指定キーの値を取り出すヘルパー。
 # 「監視ノード」→「判定ノード」改称でキー名が変わったものは、新キーが無ければ旧キーに
 # フォールバックし、改称前に生成された summary.csv も読めるようにする。
@@ -244,6 +312,7 @@ resolve_sim_dir() {
     fi
     return 1
 }
+
 
 # payments_output.csv から成功決済(is_success==1, warmup 非除外)の手数料平均を返す
 # 出力: "avg_fee_msat avg_fee_rate_pct" を空白区切り
@@ -291,7 +360,6 @@ generate_summary_csv() {
                             fi
                             [[ -n "$pdir" ]] && rel_path="$rel_path/$pdir"
 
-                            # 新ディレクトリ名 → 見つからなければ改称前の名前を試す
                             sim_dir=""
                             if [[ -n "$remote_output_base" ]]; then
                                 sim_dir=$(resolve_sim_dir "$remote_output_base" "$rel_path") || sim_dir=""
@@ -674,7 +742,7 @@ echo "スイープパラメータ:"
 echo "  取引回数       : ${N_PAYMENTS[*]}"
 echo "  平均支払額（msat） : ${PAYMENT_AMOUNTS[*]}"
 echo "  判定ノード数   : ${JUDGE_NODE_COUNTS[*]}"
-echo "  判定方法       : ${JUDGING_METHODS[*]}"
+echo "  監視方法       : ${JUDGING_METHODS[*]}"
 echo "  防御モード     : method固定対応 (disable→no_defense, method1/2→avoid_low_reputation)"
 echo "  p値（閾値）    : ${P_VALUES[*]}"
 echo ""
@@ -693,8 +761,8 @@ n_disable_combos=$(( disable_method_count * 1 * p_combo_count ))
 n_method_combos=$(( enabled_method_count * ${#JUDGE_NODE_COUNTS[@]} * 1 * p_combo_count ))
 n_combinations=$(( ${#N_PAYMENTS[@]} * ${#PAYMENT_AMOUNTS[@]} * (n_disable_combos + n_method_combos) ))
 n_total_sims=$n_combinations
-echo "  判定無効パターン        : $n_disable_combos"
-echo "  判定有効パターン        : $n_method_combos"
+echo "  監視無効パターン        : $n_disable_combos"
+echo "  監視有効パターン        : $n_method_combos"
 echo "  計測パターン合計         :$(( n_disable_combos + n_method_combos ))"
 echo ""
 echo "  組み合わせ数            : $n_combinations"
@@ -715,7 +783,7 @@ for n_payment in "${N_PAYMENTS[@]}"; do
         var_pmt=$((avg_pmt / 10))
             for method in "${JUDGING_METHODS[@]}"; do
 
-                # Pair no_defense with judging disabled, and defense with judging enabled
+                # Pair no_defense with monitoring disabled, and defense with monitoring enabled
                 # 代役ハブenv: baseline(disable)には付けず、防御2モード(method1/2)にのみ付ける。
                 sub_env=""
                 case "$method" in
@@ -741,7 +809,7 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                         sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
                         ;;
                     *)
-                        echo "ERROR: Unknown judging method: $method"
+                        echo "ERROR: Unknown monitoring method: $method"
                         exit 1
                     ;;
             esac
