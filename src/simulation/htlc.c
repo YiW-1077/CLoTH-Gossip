@@ -107,8 +107,8 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
 
 /* === 攻撃手法セレクタ (CLOTH_ATTACK_MODE) ===
  * 悪意ノードが行う攻撃の種別をスクリプトから選択する:
- *   1 = fail 型のみ        (従来の HTLC 失敗攻撃; hold 割合 0.0)
- *   2 = hold 型のみ        (決済 backward 経路での preimage 保持グリーフィング単独; 割合 1.0)
+ *   1 = fail 型のみ        (forward leg で遅延させ HTLC を失敗させる; hold 割合 0.0)
+ *   2 = hold 型のみ        (settlement=backward レグでの preimage 保持グリーフィング単独; 割合 1.0)
  *   3 = 混在 (fail + hold) (hold 割合は CLOTH_GRIEF_HOLD_RATIO、既定 0.5)
  * 未設定/範囲外のときは 0 を返し、get_grief_hold_ratio() は後方互換のため
  * CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0 = 従来どおり全て fail 型)。 */
@@ -120,12 +120,13 @@ static int get_attack_mode(void) {
   return m;
 }
 
-/* === Grief-hold 攻撃 (決済=backward 経路での preimage 保持遅延) ===
+/* === hold 型攻撃 (settlement=backward レグでの preimage 保持遅延) ===
  * 悪意ノードが行う攻撃のうち「保持(hold)型」にする割合 [0,1] を返す。
  * CLOTH_ATTACK_MODE が設定されていればそれを優先 (1→0.0, 2→1.0, 3→混在割合)、
  * 未設定なら後方互換のため env CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0)。
- * hold 型に当たった攻撃は、フォワードで失敗させず通常転送し、backward 経路で
- * そのノードが preimage の release を遅延させる(失敗なし=支払いは成功)。 */
+ * hold 型に当たった攻撃は、forward leg では失敗させず通常転送し、settlement レグで
+ * そのノードが preimage の release を遅延させる(失敗なし=支払いは成功)。よって
+ * fail 検知器には映らず hold 検知器だけが拾える (monitoring.h の用語ブロック参照)。 */
 static double get_grief_hold_ratio(void) {
   int mode = get_attack_mode();
   if (mode == 1) return 0.0;   /* fail 型のみ */
@@ -147,15 +148,17 @@ static double get_grief_hold_ratio(void) {
 }
 
 /* シャドウ計測(報告はせず CSV 出力のみ)の有効化。CLOTH_GRIEF_SHADOW_LOG が
- * 設定されているときだけ /tmp/cloth_grief_shadow.csv に決済転送レイテンシを記録。 */
-static int grief_shadow_log_enabled(void) {
+ * 設定されているときだけ /tmp/cloth_grief_shadow.csv に settlement レグの転送
+ * レイテンシを記録。 */
+static int hold_shadow_log_enabled(void) {
   return getenv("CLOTH_GRIEF_SHADOW_LOG") != NULL;
 }
 
-/* Grief-hold 検知器 (Phase 1) の有効化。CLOTH_DETECT_GRIEF が設定されているとき、
- * forward_success() で各ノードの決済転送レイテンシを仮説検定し、保持攻撃者を
- * 直接特定して report_attacked_node_to_monitors() に報告する。既定 OFF。 */
-static int get_detect_grief(void) {
+/* hold 検知器 (Phase 1) の有効化。CLOTH_DETECT_GRIEF が設定されているとき、
+ * forward_success() で各ノードの settlement レグ転送レイテンシを仮説検定し、保持
+ * 攻撃者を直接特定して report_attacked_node_to_judges() に報告する。既定 OFF。
+ * (env 名の "GRIEF" は過去 run の再現性のため旧称のまま = hold 検知器のこと) */
+static int get_detect_hold(void) {
   return getenv("CLOTH_DETECT_GRIEF") != NULL;
 }
 
@@ -394,8 +397,8 @@ void find_path(struct event *event, struct simulation* simulation, struct networ
                                                  network, simulation->current_time, 0, &error,
                                                  net_params.routing_method, NULL, payment->max_fee_limit,
                                                  net_params);
-          } else if (net_params.monitoring_strategy > 0 && net_params.enable_reputation_system) {
-              // === Retry: Use reputation-weighted dijkstra when monitoring is active ===
+          } else if (net_params.judging_strategy > 0 && net_params.enable_reputation_system) {
+              // === Retry: Use reputation-weighted dijkstra when judging is active ===
               path = dijkstra_with_reputation(payment->sender, payment->receiver, payment->amount,
                                              network, simulation->current_time, 0, &error,
                                              net_params.routing_method, net_params.rbr_reputation_weight);
@@ -570,15 +573,15 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
     return;
   }
 
-  /* Stage ②: record incoming observation at the current node if it is a monitor. */
+  /* Stage ②: record incoming observation at the current node if it is a judge. */
   if (detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route)) {
     payment->is_observed = 1;
   }
   
-  /* === Stage ② Payment Information Monitoring (Sender) ===
-   * If sender is a monitor, record the initial HTLC.
+  /* === Stage ② Payment Information Judging (Sender) ===
+   * If sender is a judge, record the initial HTLC.
    */
-  if (node->is_monitor) {
+  if (node->is_judge) {
       record_htlc_observation(
           network,
           payment->id,
@@ -588,7 +591,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
           simulation->current_time,
           first_route_hop->timelock,
           node->id,
-          node->monitor_id,
+          node->judge_id,
           0.0,    // channel_balance_before (not applicable for sender)
           0.0,    // channel_balance_after (not applicable for sender)
           0       // is_balance_adjustment (false)
@@ -785,15 +788,15 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
       }
   }
 
-  /* Stage ②: record incoming observation at this hop if it is a monitor. */
+  /* Stage ②: record incoming observation at this hop if it is a judge. */
   if (detect_and_record_htlc_observation(network, payment->id, payment->amount, node->id, 0, simulation->current_time, route)) {
     payment->is_observed = 1;
   }
   
-  /* === Stage ② Payment Information Monitoring ===
-   * If current node is a monitor, record detailed HTLC observation
+  /* === Stage ② Payment Information Judging ===
+   * If current node is a judge, record detailed HTLC observation
    * for later information integration and payment tracking. */
-  if (node->is_monitor) {
+  if (node->is_judge) {
       record_htlc_observation(
           network,
           payment->id,                    // payment_id
@@ -802,8 +805,8 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
           next_route_hop->amount_to_forward,  // amount
           simulation->current_time,       // timestamp
           next_route_hop->timelock,       // timelock
-          node->id,                       // current_node (this monitor)
-          node->monitor_id,               // monitor_id
+          node->id,                       // current_node (this judge)
+          node->judge_id,               // judge_id
           0.0,    // channel_balance_before (not currently tracked)
           0.0,    // channel_balance_after (not currently tracked)
           0       // is_balance_adjustment (false for normal payments)
@@ -1043,11 +1046,13 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
   prev_node_id = prev_hop->from_node_id;
   event_type = prev_node_id == payment->sender ? RECEIVESUCCESS : FORWARDSUCCESS;
 
-  /* === backward(決済)経路の保持時間 ===
-   * 通常はランダムな転送インターバル。このノードが grief-hold 攻撃者として
-   * 予約 (payment->grief_hold_node_id) されている場合は、フォワードの攻撃遅延
+  /* === settlement (backward) レグの保持時間 ===
+   * 通常はランダムな転送インターバル。このノードが hold 型攻撃者として予約
+   * (payment->grief_hold_node_id) されている場合は、forward leg の攻撃遅延
    * モデル(×attack_delay_intensity)を流用して preimage の release を遅延させる。
-   * 失敗はさせない (= 支払いは成功する)。保持しない場合は従来と同一値。 */
+   * 失敗はさせない (= 支払いは成功する)。保持しない場合は従来と同一値。
+   * この settle_base は forward leg のレイテンシとは独立にサンプリングされるので、
+   * forward leg 側の遅延は hold 検知器の入力には一切入らない。 */
   uint64_t settle_base = net_params.average_payment_forward_interval +
       (long)(fabs(net_params.variance_payment_forward_interval * gsl_ran_ugaussian(simulation->random_generator)));
   uint64_t settle_delay = settle_base;
@@ -1068,7 +1073,7 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
   /* === シャドウ計測 (Phase 0): 報告はしない。各ノードの決済転送レイテンシを記録し、
    * 攻撃者(保持) vs 正常ノードの分離度(SNR) を実測する。CLOTH_GRIEF_SHADOW_LOG 時のみ。
    * 列: pid,node_id,is_malicious,degree,settle_delay_ms,settle_base_ms,held === */
-  if (grief_shadow_log_enabled()) {
+  if (hold_shadow_log_enabled()) {
     long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
     FILE* fh = fopen("/tmp/cloth_grief_shadow.csv", "a");
     if (fh) {
@@ -1080,19 +1085,21 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
     }
   }
 
-  /* === Grief-hold 検知 (Phase 1) ===
-   * 各ノードの決済転送レイテンシ settle_delay を per-node 仮説検定し、異常(=保持)を
-   * 出したノード本人を攻撃者として報告する。保持ノードは自分で release を転送するので
-   * 直接帰属でよい(下流帰属トリック不要)。報告者は上流ノード(prev_node_id)。
-   * 観測ゲート(method1/method2)はフォワード検知と共通。既定 OFF (CLOTH_DETECT_GRIEF)。
-   * ※ 案A(CLOTH_HOLD_ROUNDTRIP)有効時はこの直接検定を無効化し、receive_success の
+  /* === hold 検知器 (Phase 1): settlement レグの直接検定 (案B) ===
+   * 各ノードの settlement レグ転送レイテンシ settle_delay を per-node 仮説検定し、
+   * 異常(=保持)を出したノード本人を攻撃者として報告する。保持ノードは自分で release を
+   * 転送するので直接帰属でよい(下流帰属トリック不要)。計測・報告者は上流ノード(prev_node_id)。
+   * 観測ゲート(method1/method2)は fail 検知器と共通。既定 OFF (CLOTH_DETECT_GRIEF)。
+   * 検知器に渡すのは (ノード, 観測レイテンシ, 支払い数, seed) だけで、grief_hold_node_id
+   * や is_malicious は渡さない = 攻撃型の事前ラベルなしで判定する。
+   * ※ 案A(CLOTH_HOLD_ROUNDTRIP, 既定ON)有効時はこの直接検定を無効化し、receive_success の
    *    往復走査に一本化する(同一ノードを二重報告しないため)。 */
-  if (net_params.enable_reputation_system && get_detect_grief() && !get_hold_roundtrip()) {
-    int should_report = on_settlement_result_hypothesis_test(
+  if (net_params.enable_reputation_system && get_detect_hold() && !get_hold_roundtrip()) {
+    int should_report = on_hold_hypothesis_test(
         node, (double)settle_delay, (long)simulation->processed_payments,
         (double)net_params.average_payment_forward_interval);
-    if (should_report && is_node_observed_by_monitors(network, node->id)) {
-      report_attacked_node_to_monitors(
+    if (should_report && is_node_observed_by_judges(network, node->id)) {
+      report_attacked_node_to_judges(
           network,
           prev_node_id,   /* reporter = 決済を受け取る上流ノード(保持を観測) */
           node->id,       /* attacker = 保持したノード本人(直接帰属) */
@@ -1179,23 +1186,24 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                   fclose(_f); }
           }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。 */
-          int should_report = on_settlement_result_hypothesis_test(
+          int should_report = on_hold_hypothesis_test(
               dn_node, settle_lat, (long)simulation->processed_payments, avg_iv);
           if (should_report && cand != payment->sender && cand != payment->receiver &&
-              is_node_observed_by_monitors(network, cand) &&
+              is_node_observed_by_judges(network, cand) &&
               !has_attack_reporter(payment, cand)) {   /* dedup: 同一決済で同一ノードは1回 */
               register_attack_reporter(payment, cand); /* dedup キーとして保持者を記録 */
-              report_attacked_node_to_monitors(network, hop_up->from_node_id, cand,
+              report_attacked_node_to_judges(network, hop_up->from_node_id, cand,
                   payment->id, simulation->current_time, net_params);
           }
       }
   }
 
-  /* === Stage ④ Hypothesis Testing: ホップ間レイテンシで各ノードを個別検定 ===
+  /* === Stage ④ fail 検知器: forward leg のホップ間レイテンシで各ノードを個別検定 ===
    * hop_send_times[i]     : ホップ i の送信時刻
    * hop_send_times[i+1]   : ホップ i+1 の送信時刻（= ホップ i の処理+転送完了時刻）
    * 最終ホップは result_time（= receive_success の現在時刻）を終端とする。
-   * これにより監視ノードの有無に関係なく各ノードの処理遅延を独立に検定できる。 */
+   * これにより判定ノードの有無に関係なく各ノードの処理遅延を独立に検定できる。
+   * ここは成功経路なので is_fail=0 で呼ぶ = 報告はしない (下のコメント参照)。 */
   if (net_params.enable_reputation_system && payment->route != NULL && payment->hop_send_times != NULL) {
       int n_hops = array_len(payment->route->route_hops);
       for (int hop_idx = 0; hop_idx < n_hops; hop_idx++) {
@@ -1226,13 +1234,15 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
 
           /* 成功経路の検定はベースライン更新と Axis-2 用カウンタ
            * (hyp_test_count/hyp_anomaly_count) の蓄積のみが目的。
-           * on_payment_result_hypothesis_test は is_fail=1 のときしか
+           * on_fail_hypothesis_test (fail 検知器) は is_fail=1 のときしか
            * should_report を立てない (monitoring.c の k-of-m / 1-strike 両分岐)
            * ため、ここでの報告は構造的に発生しない。以前ここにあった報告ブロックは
-           * 到達不能なデッドコードだったので除去した。フォワード方向の報告は
-           * receive_fail 側、hold 型の報告は forward_success の settle 検定
-           * (CLOTH_DETECT_GRIEF) が担う。 */
-          (void) on_payment_result_hypothesis_test(
+           * 到達不能なデッドコードだったので除去した。fail 型の報告は receive_fail 側、
+           * hold 型の報告は forward_success の hold 検知器 (CLOTH_DETECT_GRIEF) が担う。
+           * ⚠️ したがって「forward leg で遅延させるが失敗させない」攻撃 (slow-forward)
+           *    はどちらの検知器も報告しない。異常自体は上の hyp_anomaly_count に
+           *    載るので、拾えるのは Axis-2 BH-FDR モード (CLOTH_FLAG_MODE=bh) のみ。 */
+          (void) on_fail_hypothesis_test(
               hop_node,
               t_start,
               t_end,
@@ -1244,7 +1254,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
 
   // === Dynamic Reputation Update: Success Path ===
   // When payment succeeds, increase reputation of nodes in successful path
-  if (net_params.monitoring_strategy > 0 && net_params.enable_reputation_system && payment->route != NULL) {
+  if (net_params.judging_strategy > 0 && net_params.enable_reputation_system && payment->route != NULL) {
     double reputation_boost = 0.05;  // Increase reputation by 5% on success
     for (int i = 0; i < array_len(payment->route->route_hops); i++) {
       struct route_hop* hop = (struct route_hop*)array_get(payment->route->route_hops, i);
@@ -1369,9 +1379,9 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
 
   /* === Stage ④ Hypothesis Testing + Path-Walk Attacker Attribution (失敗時) ===
    * Phase 1: 各ホップで仮説検定を走らせ、異常を検出したノードを payment の
-   *          報告者リスト (attack_reporters) に登録する。
+   *          計測・報告者リスト (attack_reporters) に登録する。
    *          攻撃者は HTLC を転送しないため hop_send_times が 0 となり検定がスキップされ、
-   *          自然に報告者リストに入らない。
+   *          自然に計測・報告者リストに入らない。
    * Phase 2: 経路を送信者→受信者方向に走査し、最初に報告していないノードを
    *          攻撃者と判定してペナルティを与える。 */
   if (net_params.enable_reputation_system && payment->route != NULL && payment->hop_send_times != NULL) {
@@ -1384,7 +1394,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
        * 各ホップで仮説検定を行い、異常レイテンシを観測したホップの「送り先 (to_node)」
        * を攻撃者とする。攻撃遅延は攻撃者の直前ノードが攻撃者へ HTLC を送信する区間
        * (hop_send_times[i+1]-hop_send_times[i]) のレイテンシに現れ、攻撃者自身は
-       * HTLC を転送しない (hop_send_times が 0 のまま) ため報告者にならない。よって
+       * HTLC を転送しない (hop_send_times が 0 のまま) ため計測・報告者にならない。よって
        * 「異常を報告したホップの直後のノード」が攻撃者である。従来の Phase 2
        * 「最初の未報告ノード」走査は攻撃者手前の正常ノード (特に高次数ハブ) を
        * 誤特定し大量の false positive を生んでいたが、これを構造的に解消する。 */
@@ -1393,7 +1403,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
       double attacker_latency = 0; /* DEBUG: 報告を誘発したホップのレイテンシ */
       int attacker_hopidx = -1;    /* DEBUG: 攻撃者を確定したホップ index */
       int attacker_tend_fallthrough = 0; /* DEBUG: t_end が current_time に落ちたか(=to_node未転送) */
-      /* Phase 1: 各ホップで検定 → 報告者登録 + 攻撃者候補(直後ノード)を記録 */
+      /* Phase 1: 各ホップで検定 → 計測・報告者登録 + 攻撃者候補(直後ノード)を記録 */
       for (int hop_idx = 0; hop_idx < n_hops; hop_idx++) {
           struct route_hop* hop = (struct route_hop*)array_get(
                                       payment->route->route_hops, hop_idx);
@@ -1419,7 +1429,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
           }
           if (t_end <= t_start) continue;
 
-          int should_report = on_payment_result_hypothesis_test(
+          int should_report = on_fail_hypothesis_test(
               hop_node,
               t_start,
               t_end,
@@ -1456,7 +1466,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
           if (node_id == payment->sender) continue; /* 送信者は攻撃者になり得ない */
           if (attacker_id < 0 && !has_attack_reporter(payment, node_id)) {
               attacker_id = node_id;
-              /* 直前ホップの from_node を報告者とする */
+              /* 直前ホップの from_node を計測・報告者とする */
               if (i > 0) {
                   struct route_hop* prev = (struct route_hop*)array_get(
                                               payment->route->route_hops, i - 1);
@@ -1471,11 +1481,11 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
        *      an abnormal hop latency (num_attack_reporters > 0). Without it the
        *      failure is an ordinary one (no balance, timeout, route exhaustion)
        *      and blaming the first intermediary would be a false positive.
-       *  (2) A monitor must actually be able to observe the attacker. This is
+       *  (2) A judge must actually be able to observe the attacker. This is
        *      the gate that differentiates method1 (co-located only) from method2
        *      (also watches its assigned high-degree nodes). */
       if (attacker_id >= 0 && payment->num_attack_reporters > 0 &&
-          is_node_observed_by_monitors(network, attacker_id)) {
+          is_node_observed_by_judges(network, attacker_id)) {
           /* 診断計装: 報告された攻撃者の TP/FP 内訳を /tmp/cloth_attribution.csv に記録。
            * 専用 env CLOTH_ATTRIBUTION_LOG 設定時のみ有効 (cloth_debug_enabled() の重い
            * ログ群とは独立)。本番では env 未設定でこのブロック全体 (経路文脈ループ +
@@ -1514,7 +1524,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
                   fclose(fh);
               }
           }
-          report_attacked_node_to_monitors(
+          report_attacked_node_to_judges(
               network,
               reporter_id,
               attacker_id,

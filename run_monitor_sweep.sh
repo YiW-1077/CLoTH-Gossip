@@ -1,15 +1,15 @@
 #!/opt/homebrew/bin/bash
-# 監視手法スイープシミュレーション（並列実行）
-# 3手法 (monitor_disable=no_defense baseline / monitor_method1 / monitor_method2) を
+# 判定手法スイープシミュレーション（並列実行）
+# 3手法 (judge_disable=no_defense baseline / judge_method1 / judge_method2) を
 # 取引数 N_PAYMENTS × 支払額 PAYMENT_AMOUNTS × p値 P_VALUES の全組み合わせで実行する。
 # 防御は method に固定対応: disable→no_defense(PRT/RBR off), method1/2→avoid_low_reputation(PRT/RBR on)。
 # 防御2モードには代役ハブ(what-if)を既定で注入する(下の SUBSTITUTE_COUNT 参照)。
 # Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]
-# Example: ./run_monitor_sweep.sh 42 /output/dir monitoring_strategy=method1
+# Example: ./run_monitor_sweep.sh 42 /output/dir judging_strategy=method1
 
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <seed[,seed...]> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]"
-    echo "Example: $0 42 /output/dir monitoring_strategy=method1"
+    echo "Example: $0 42 /output/dir judging_strategy=method1"
     echo "Example(複数シード): $0 42,123 /output/dir <remote> ...   # 42→123 の順に実行"
     exit 1
 fi
@@ -43,40 +43,40 @@ output_base_arg="$2"
 remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
 project_root="$(cd "$(dirname "$0")" && pwd)"
 
-# Process additional keyword arguments for monitoring_strategy override and p_list
-MONITORING_METHODS_OVERRIDE=""
+# Process additional keyword arguments for judging_strategy override and p_list
+JUDGING_METHODS_OVERRIDE=""
 # P_VALUES are specified here inside the script (override args/env)
 # Edit this list to change which p-value thresholds are tested.
 P_VALUES=(0.01 0.005 0.001)
 
 for ((i=4; i<=$#; i++)); do
     arg="${!i}"
-    if [[ "$arg" == monitoring_strategy=* ]]; then
-        strategy_value="${arg#monitoring_strategy=}"
+    if [[ "$arg" == judging_strategy=* ]]; then
+        strategy_value="${arg#judging_strategy=}"
         case "$strategy_value" in
             disabled|disable)
-                MONITORING_METHODS_OVERRIDE="monitor_disable"
+                JUDGING_METHODS_OVERRIDE="judge_disable"
                 ;;
             method1)
-                MONITORING_METHODS_OVERRIDE="monitor_method1"
+                JUDGING_METHODS_OVERRIDE="judge_method1"
                 ;;
             method2)
-                MONITORING_METHODS_OVERRIDE="monitor_method2"
+                JUDGING_METHODS_OVERRIDE="judge_method2"
                 ;;
             all)
-                MONITORING_METHODS_OVERRIDE="monitor_disable monitor_method1 monitor_method2"
+                JUDGING_METHODS_OVERRIDE="judge_disable judge_method1 judge_method2"
                 ;;
             *)
-                echo "ERROR: Invalid monitoring_strategy: $strategy_value"
+                echo "ERROR: Invalid judging_strategy: $strategy_value"
                 echo "Valid options: disabled, method1, method2, all"
                 exit 1
                 ;;
         esac
-        echo "[Config] Override MONITORING_METHODS: $MONITORING_METHODS_OVERRIDE"
+        echo "[Config] Override JUDGING_METHODS: $JUDGING_METHODS_OVERRIDE"
     fi
     # NOTE: 旧 defense_mode=... オプションは削除した。パースはされるが enqueue ループは
     # method ごとに defense_modes_iter を固定でハードコードしており、一度も効いていない
-    # 死んだノブだった (防御の実体は monitoring_strategy と enable_rbr/enable_prt の対で切替)。
+    # 死んだノブだった (防御の実体は judging_strategy と enable_rbr/enable_prt の対で切替)。
     if [[ "$arg" == p_list=* ]]; then
         p_list_val="${arg#p_list=}"
         IFS=',' read -r -a P_VALUES <<< "$p_list_val"
@@ -95,7 +95,7 @@ timestamp=$(date "+%Y%m%d%H%M%S")
 # ---------------------------------------------------------------------------
 # Fixed parameters
 # ---------------------------------------------------------------------------
-N_PAYMENTS=(200 400 800 1600 3200 6400 12800 25600 51200 102400)
+N_PAYMENTS=(50 100 200 400 800 1600 3200 6400 12800)
 MALICIOUS_RATIO=0.15
 ATTACK_SUCCESS_RATE=1.0
 TOP_HUB_COUNT=10
@@ -104,8 +104,9 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 
 # ---------------------------------------------------------------------------
 # FWER対策 (攻撃者検知 precision の n 依存低下の緩和) を全 sim で有効化。
-#   CLOTH_NULL_DEGREE_SIGMA : degree-σ null。高次数ノードの仮説検定 null を
-#                             広げて誤報告(FP源)を走行中に抑える (Axis-3)。
+#   CLOTH_NULL_DEGREE_SIGMA : fail 検知器の degree-σ null。高次数ノードの仮説検定
+#                             null を広げて誤報告(FP源)を走行中に抑える (Axis-3)。
+#                             hold 検知器には適用されない (次数非依存のため)。
 #   CLOTH_RATE_GATE_TAU     : report-rate gate。低レポートレートの flag を実行末に
 #                             取り消す測定専用フィルタ (経路・評判には不干渉)。
 # 検証値: k=0.04 + τ=1e-3 で FP 6->0 / precision 100% / recall 無損失。
@@ -122,18 +123,18 @@ echo "[Config] FWER対策 env: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA 
 #   ATTACK_MODE=2 : hold 型のみ（決済保持グリーフィング）
 #   ATTACK_MODE=3 : 混在（fail + hold; 割合は下の GRIEF_HOLD_RATIO）
 # (8ce7590 で hold(2) に設定後、cb27298 で意図せず 3 に戻っていたのを再修正)
-ATTACK_MODE=3
-GRIEF_HOLD_RATIO=0.5   # ATTACK_MODE=3 のときの hold 割合 [0,1]
+ATTACK_MODE=2
+GRIEF_HOLD_RATIO=1.0   # ATTACK_MODE=3 のときの hold 割合 [0,1]
 # ---------------------------------------------------------------------------
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
-[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で決済検知器を自動ON
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF="${CLOTH_DETECT_GRIEF:-1}"  # mode2/3で hold 検知器を自動ON
 echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=fail 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 
 # ---------------------------------------------------------------------------
 # === 代役ハブ(トポロジ what-if) — 防御2モードで既定ON ===
 # 悪意ハブ(次数>=SUBSTITUTE_MIN_DEGREE)ごとに正直な代役ノードを注入し、回避で失われる
-# 連結性を補う。baseline(no_defense/monitor_disable)には注入せず対照を現実のまま保ち、
+# 連結性を補う。baseline(no_defense/judge_disable)には注入せず対照を現実のまま保ち、
 # 防御2モード(method1/method2)にのみ注入して、RBR回避を使う防御側が正直な代替を活用できる形にする。
 # ⚠️注意: 代役は「現実網では作れない正直容量」の上限measurement。method1/2 の成績には配備不能な
 #   代役容量分が含まれる(hub-soft/boost抑制のような配備可能ポリシーとは別クラス)。結果解釈時に留意。
@@ -153,18 +154,18 @@ else
     echo "[Config] 代役ハブ OFF (SUBSTITUTE_COUNT=0 指定・全モードrealistic baseline)。"
 fi
 
-# 決済(hold)検知の per-node heavy-tail null。既定ON。各ノードが warmup 中に自分の
-# (1-α)決済レイテンシ分位点 settle_anom_q を学習し post-warmup 凍結→多忙ハブの重い裾を
-# 自ノード baseline で吸収し、高nの誤検知(FP)を潰す(precision 87%→99.6% @ n=25600-102400,
-# seed7で確認)。代役ハブとは独立。防御モード(method1/2)のみに適用(no_defenseは検知OFFで
-# 無関係)。旧グローバル lognormal null に戻したい場合は env SETTLE_QUANTILE_NULL=0。
-SETTLE_QUANTILE_NULL="${SETTLE_QUANTILE_NULL:-1}"
+# 決済(hold)検知の null 模型。既定は hold も対数正規 z検定＋次数σ膨張(k=0.20)で fail検知と
+# 統一(FWER対策=次数σ膨張でbusyハブのFPを抑制)。settleは次数非依存なので fail の k=0.04 より
+# 大きい k が必要で、n=12800 で k≈0.12-0.20 のとき per-node 分位点null と precision/recall が
+# 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2)のみに適用。
+# 旧 per-node 分位点null に戻したい場合は env SETTLE_QUANTILE_NULL=1。
+SETTLE_QUANTILE_NULL="${SETTLE_QUANTILE_NULL:-0}"
 if [ "$SETTLE_QUANTILE_NULL" = "1" ]; then
     DETECT_ENV_DEFENSE="CLOTH_SETTLE_NULL_QUANTILE=true"
-    echo "[Config] per-node heavy-tail null 既定ON(防御モードのみ): $DETECT_ENV_DEFENSE"
+    echo "[Config] hold検知=per-node 分位点null (防御モードのみ): $DETECT_ENV_DEFENSE"
 else
-    DETECT_ENV_DEFENSE=""
-    echo "[Config] per-node heavy-tail null OFF (SETTLE_QUANTILE_NULL=0)。旧lognormal nullにフォールバック。"
+    DETECT_ENV_DEFENSE="CLOTH_SETTLE_DEGREE_SIGMA=${CLOTH_SETTLE_DEGREE_SIGMA:-0.20}"
+    echo "[Config] hold検知=対数正規z検定+次数σ膨張 (防御モードのみ): $DETECT_ENV_DEFENSE"
 fi
 
 # ---------------------------------------------------------------------------
@@ -173,27 +174,27 @@ fi
 NODE_SCALES=6000
 PAYMENT_AMOUNTS=(100 500 1000)
 
-# 監視ノード数の絶対数リスト
-MONITOR_NODE_COUNTS=(10)
-MONITORING_METHODS=(monitor_disable monitor_method1 monitor_method2)
+# 判定ノード数の絶対数リスト
+JUDGE_NODE_COUNTS=(10)
+JUDGING_METHODS=(judge_disable judge_method1 judge_method2)
 
 # 防御モードは method に固定対応 (enqueue ループ内 defense_modes_iter):
-#   monitor_disable → no_defense / monitor_method1・method2 → avoid_low_reputation
+#   judge_disable → no_defense / judge_method1・method2 → avoid_low_reputation
 
-# Apply MONITORING_METHODS override if specified
-if [[ -n "$MONITORING_METHODS_OVERRIDE" ]]; then
-    MONITORING_METHODS=($MONITORING_METHODS_OVERRIDE)
+# Apply JUDGING_METHODS override if specified
+if [[ -n "$JUDGING_METHODS_OVERRIDE" ]]; then
+    JUDGING_METHODS=($JUDGING_METHODS_OVERRIDE)
 fi
 
 # ===========================================================================
 # results_summary.csv 生成 (改善版・改善デルタ列付き / 純 bash+awk, 追加スクリプト無し)
 # ---------------------------------------------------------------------------
 # 出力列(論理グループ順):
-#   [条件]     n_transactions, payment_amount_sat, defense_strategy, monitor_method, p_value, monitor_count
+#   [条件]     n_transactions, payment_amount_sat, defense_strategy, judge_method, p_value, judge_count
 #   [攻撃/grief] attacks_triggered, payments_griefed, grief_delay_total_ms, grief_delay_change_vs_nodef_pct ★hold主指標
 #   [決済結果] n_successful, n_failed, success_rate_pct, success_change_vs_nodef_pp, avg_delay_ms, avg_delay_change_vs_nodef_pct
 #   [検知]     detection_rate_pct, detected_attackers, observable_attacked, rbr_penalized_nodes, detection_precision_pct
-#   [手数料]   avg_fee_msat, avg_fee_rate_pct, avg_fee_change_vs_nomonitor_pct
+#   [手数料]   avg_fee_msat, avg_fee_rate_pct, avg_fee_change_vs_nojudge_pct
 #   [冗長]     payment_amount_msat (=sat*1000, 互換のため末尾)
 # 改善デルタは同一 (payment_amount_sat, n_transactions) の no_defense を基準にした変化。
 #   grief/delay/fee = %変化 (負=削減=改善)、success = ポイント差 (正=向上=改善)。
@@ -207,10 +208,41 @@ fi
 # 行は n→amount→p→method でソート (同一条件の disable/method1/method2 が隣接=改善を縦読み)。
 # ===========================================================================
 
-# summary.csv から指定キーの値を取り出すヘルパー
+# summary.csv から指定キーの値を取り出すヘルパー。
+# 「監視ノード」→「判定ノード」改称でキー名が変わったものは、新キーが無ければ旧キーに
+# フォールバックし、改称前に生成された summary.csv も読めるようにする。
+legacy_summary_key() {
+    case "$1" in
+        num_judges)                        echo "num_monitors" ;;
+        judging_strategy)                  echo "monitoring_strategy" ;;
+        judging_coverage_rate_percent)     echo "monitoring_coverage_rate_percent" ;;
+        avg_htlcs_observed_per_judge)      echo "avg_htlcs_observed_per_monitor" ;;
+        cumulative_judge_assignments)      echo "cumulative_monitor_assignments" ;;
+        *)                                 echo "" ;;
+    esac
+}
 get_summary_value() {
-    local file="$1" key="$2"
-    grep "^${key}," "$file" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]' || echo "N/A"
+    local file="$1" key="$2" val legacy
+    val=$(grep "^${key}," "$file" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]')
+    if [[ -z "$val" ]]; then
+        legacy=$(legacy_summary_key "$key")
+        [[ -n "$legacy" ]] && val=$(grep "^${legacy}," "$file" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]')
+    fi
+    echo "${val:-N/A}"
+}
+
+# 改称前の run では出力ディレクトリ名が monitor_disable / monitor_method1 /
+# monitor_method2 / monitor_count=N だった。新名で見つからなければ旧名を試す。
+resolve_sim_dir() {
+    local base="$1" rel="$2" legacy_rel
+    if [[ -d "$base/$rel" ]]; then echo "$base/$rel"; return 0; fi
+    legacy_rel="${rel//judge_disable/monitor_disable}"
+    legacy_rel="${legacy_rel//judge_method/monitor_method}"
+    legacy_rel="${legacy_rel//judge_count=/monitor_count=}"
+    if [[ "$legacy_rel" != "$rel" && -d "$base/$legacy_rel" ]]; then
+        echo "$base/$legacy_rel"; return 0
+    fi
+    return 1
 }
 
 # payments_output.csv から成功決済(is_success==1, warmup 非除外)の手数料平均を返す
@@ -236,41 +268,42 @@ generate_summary_csv() {
 
     {
         # RAW ヘッダ (21列: 従来18 + 生3列)。並べ替え・デルタは後段 awk。
-        echo "defense_strategy,monitor_method,p_value,payment_amount_sat,payment_amount_msat,monitor_count,n_transactions,n_successful,n_failed,success_rate_pct,avg_delay_ms,attacks_triggered,detection_rate_pct,detected_attackers,observable_attacked,detection_precision_pct,avg_fee_msat,avg_fee_rate_pct,grief_delay_total_ms,payments_griefed,rbr_penalized_nodes"
+        echo "defense_strategy,judge_method,p_value,payment_amount_sat,payment_amount_msat,judge_count,n_transactions,n_successful,n_failed,success_rate_pct,avg_delay_ms,attacks_triggered,detection_rate_pct,detected_attackers,observable_attacked,detection_precision_pct,avg_fee_msat,avg_fee_rate_pct,grief_delay_total_ms,payments_griefed,rbr_penalized_nodes"
 
         for n_payment in "${N_PAYMENTS[@]}"; do
           for avg_pmt in "${PAYMENT_AMOUNTS[@]}"; do
             payment_msat=$((avg_pmt * 1000))
-            for method in "${MONITORING_METHODS[@]}"; do
-                if [[ "$method" == "monitor_disable" ]]; then
-                    monitor_counts_csv=(0); def_options=(no_defense)
+            for method in "${JUDGING_METHODS[@]}"; do
+                if [[ "$method" == "judge_disable" ]]; then
+                    judge_counts_csv=(0); def_options=(no_defense)
                 else
-                    monitor_counts_csv=("${MONITOR_NODE_COUNTS[@]}"); def_options=(avoid_low_reputation)
+                    judge_counts_csv=("${JUDGE_NODE_COUNTS[@]}"); def_options=(avoid_low_reputation)
                 fi
-                for monitor_count in "${monitor_counts_csv[@]}"; do
+                for judge_count in "${judge_counts_csv[@]}"; do
                     if [ ${#P_VALUES[@]} -gt 0 ]; then p_iter=("${P_VALUES[@]}"); else p_iter=("N/A"); fi
                     for p in "${p_iter[@]}"; do
                         if [[ "$p" == "N/A" ]]; then pdir=""; else pdir="p_${p//./_}"; fi
                         for defense in "${def_options[@]}"; do
-                            if [[ "$method" == "monitor_disable" ]]; then
+                            if [[ "$method" == "judge_disable" ]]; then
                                 rel_path="$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
                             else
-                                rel_path="$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                                rel_path="$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/judge_count=$judge_count"
                             fi
                             [[ -n "$pdir" ]] && rel_path="$rel_path/$pdir"
 
+                            # 新ディレクトリ名 → 見つからなければ改称前の名前を試す
                             sim_dir=""
-                            if [[ -n "$remote_output_base" && -d "$remote_output_base/$rel_path" ]]; then
-                                sim_dir="$remote_output_base/$rel_path"
+                            if [[ -n "$remote_output_base" ]]; then
+                                sim_dir=$(resolve_sim_dir "$remote_output_base" "$rel_path") || sim_dir=""
                             fi
-                            [[ -z "$sim_dir" && -d "$output_base/$rel_path" ]] && sim_dir="$output_base/$rel_path"
+                            [[ -z "$sim_dir" ]] && { sim_dir=$(resolve_sim_dir "$output_base" "$rel_path") || sim_dir=""; }
                             [[ -z "$sim_dir" ]] && continue
 
                             defense_strategy="no_defense"
                             [[ "$defense" == "avoid_low_reputation" ]] && defense_strategy="avoid_low_reputation"
-                            monitor_method_short="disable"
-                            [[ "$method" == "monitor_method1" ]] && monitor_method_short="method1"
-                            [[ "$method" == "monitor_method2" ]] && monitor_method_short="method2"
+                            judge_method_short="disable"
+                            [[ "$method" == "judge_method1" ]] && judge_method_short="method1"
+                            [[ "$method" == "judge_method2" ]] && judge_method_short="method2"
 
                             n_transactions="N/A"; n_successful="N/A"; n_failed="N/A"
                             success_rate_pct="N/A"; avg_delay_ms="N/A"; attacks_triggered="0"
@@ -323,7 +356,7 @@ generate_summary_csv() {
                             [ -f "$payments_file" ] && read -r avg_fee_msat avg_fee_rate_pct <<< "$(calc_fee_stats "$payments_file")"
 
                             printf '%s,%s,%s,%d,%d,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-                                "$defense_strategy" "$monitor_method_short" "$p" "$avg_pmt" "$payment_msat" "$monitor_count" \
+                                "$defense_strategy" "$judge_method_short" "$p" "$avg_pmt" "$payment_msat" "$judge_count" \
                                 "$n_transactions" "$n_successful" "$n_failed" "$success_rate_pct" "$avg_delay_ms" "$attacks_triggered" \
                                 "$detection_rate_pct" "$detected_attackers" "$observable_attacked" "$detection_precision_pct" \
                                 "$avg_fee_msat" "$avg_fee_rate_pct" "$grief_delay_total_ms" "$payments_griefed" "$rbr_penalized_nodes"
@@ -341,7 +374,7 @@ generate_summary_csv() {
       function pp(cur,base){ if(base==""||base=="N/A"||cur==""||cur=="N/A") return "N/A"; return sprintf("%.2f",cur-base) }
       NR==FNR{
         if(FNR==1){ for(i=1;i<=NF;i++) c[$i]=i; next }
-        if($c["defense_strategy"]=="no_defense" || $c["monitor_method"]=="disable"){
+        if($c["defense_strategy"]=="no_defense" || $c["judge_method"]=="disable"){
           k=$c["payment_amount_sat"] SUBSEP $c["n_transactions"];
           bg[k]=$c["grief_delay_total_ms"]; bd[k]=$c["avg_delay_ms"];
           bs[k]=$c["success_rate_pct"]; bf[k]=$c["avg_fee_msat"];
@@ -349,7 +382,7 @@ generate_summary_csv() {
         next
       }
       FNR==1{
-        print "n_transactions","payment_amount_sat","defense_strategy","monitor_method","p_value","monitor_count","attacks_triggered","payments_griefed","grief_delay_total_ms","grief_delay_change_vs_nodef_pct","n_successful","n_failed","success_rate_pct","success_change_vs_nodef_pp","avg_delay_ms","avg_delay_change_vs_nodef_pct","detection_rate_pct","detected_attackers","observable_attacked","rbr_penalized_nodes","detection_precision_pct","avg_fee_msat","avg_fee_rate_pct","avg_fee_change_vs_nomonitor_pct","payment_amount_msat";
+        print "n_transactions","payment_amount_sat","defense_strategy","judge_method","p_value","judge_count","attacks_triggered","payments_griefed","grief_delay_total_ms","grief_delay_change_vs_nodef_pct","n_successful","n_failed","success_rate_pct","success_change_vs_nodef_pp","avg_delay_ms","avg_delay_change_vs_nodef_pct","detection_rate_pct","detected_attackers","observable_attacked","rbr_penalized_nodes","detection_precision_pct","avg_fee_msat","avg_fee_rate_pct","avg_fee_change_vs_nojudge_pct","payment_amount_msat";
         next
       }
       {
@@ -358,7 +391,7 @@ generate_summary_csv() {
         dchg = pc($c["avg_delay_ms"], bd[k]);
         schg = pp($c["success_rate_pct"], bs[k]);
         fchg = pc($c["avg_fee_msat"], bf[k]);
-        print $c["n_transactions"],$c["payment_amount_sat"],$c["defense_strategy"],$c["monitor_method"],$c["p_value"],$c["monitor_count"],$c["attacks_triggered"],$c["payments_griefed"],$c["grief_delay_total_ms"],gchg,$c["n_successful"],$c["n_failed"],$c["success_rate_pct"],schg,$c["avg_delay_ms"],dchg,$c["detection_rate_pct"],$c["detected_attackers"],$c["observable_attacked"],$c["rbr_penalized_nodes"],$c["detection_precision_pct"],$c["avg_fee_msat"],$c["avg_fee_rate_pct"],fchg,$c["payment_amount_msat"];
+        print $c["n_transactions"],$c["payment_amount_sat"],$c["defense_strategy"],$c["judge_method"],$c["p_value"],$c["judge_count"],$c["attacks_triggered"],$c["payments_griefed"],$c["grief_delay_total_ms"],gchg,$c["n_successful"],$c["n_failed"],$c["success_rate_pct"],schg,$c["avg_delay_ms"],dchg,$c["detection_rate_pct"],$c["detected_attackers"],$c["observable_attacked"],$c["rbr_penalized_nodes"],$c["detection_precision_pct"],$c["avg_fee_msat"],$c["avg_fee_rate_pct"],fchg,$c["payment_amount_msat"];
       }' "$raw_tmp" "$raw_tmp" > "$reord_tmp"; then
         # 行ソート: n(数値)→amount(数値)→p(数値)→method(disable<method1<method2)
         { head -1 "$reord_tmp"; tail -n +2 "$reord_tmp" | sort -t, -k1,1n -k2,2n -k5,5n -k4,4; } > "$csv_output"
@@ -630,7 +663,7 @@ function display_progress() {
 # Display configuration
 # ---------------------------------------------------------------------------
 echo "=========================================="
-echo "監視ノード数スイープシミュレーション（並列実行）"
+echo "判定ノード数スイープシミュレーション（並列実行）"
 echo "=========================================="
 echo ""
 echo "固定パラメータ:"
@@ -640,8 +673,8 @@ echo ""
 echo "スイープパラメータ:"
 echo "  取引回数       : ${N_PAYMENTS[*]}"
 echo "  平均支払額（msat） : ${PAYMENT_AMOUNTS[*]}"
-echo "  監視ノード数   : ${MONITOR_NODE_COUNTS[*]}"
-echo "  監視方法       : ${MONITORING_METHODS[*]}"
+echo "  判定ノード数   : ${JUDGE_NODE_COUNTS[*]}"
+echo "  判定方法       : ${JUDGING_METHODS[*]}"
 echo "  防御モード     : method固定対応 (disable→no_defense, method1/2→avoid_low_reputation)"
 echo "  p値（閾値）    : ${P_VALUES[*]}"
 echo ""
@@ -649,19 +682,19 @@ p_combo_count=$(( ${#P_VALUES[@]} > 0 ? ${#P_VALUES[@]} : 1 ))
 echo ""
 disable_method_count=0
 enabled_method_count=0
-for method in "${MONITORING_METHODS[@]}"; do
-    if [[ "$method" == "monitor_disable" ]]; then
+for method in "${JUDGING_METHODS[@]}"; do
+    if [[ "$method" == "judge_disable" ]]; then
         ((disable_method_count++))
     else
         ((enabled_method_count++))
     fi
 done
 n_disable_combos=$(( disable_method_count * 1 * p_combo_count ))
-n_method_combos=$(( enabled_method_count * ${#MONITOR_NODE_COUNTS[@]} * 1 * p_combo_count ))
+n_method_combos=$(( enabled_method_count * ${#JUDGE_NODE_COUNTS[@]} * 1 * p_combo_count ))
 n_combinations=$(( ${#N_PAYMENTS[@]} * ${#PAYMENT_AMOUNTS[@]} * (n_disable_combos + n_method_combos) ))
 n_total_sims=$n_combinations
-echo "  監視無効パターン        : $n_disable_combos"
-echo "  監視有効パターン        : $n_method_combos"
+echo "  判定無効パターン        : $n_disable_combos"
+echo "  判定有効パターン        : $n_method_combos"
 echo "  計測パターン合計         :$(( n_disable_combos + n_method_combos ))"
 echo ""
 echo "  組み合わせ数            : $n_combinations"
@@ -680,35 +713,35 @@ echo ""
 for n_payment in "${N_PAYMENTS[@]}"; do
     for avg_pmt in "${PAYMENT_AMOUNTS[@]}"; do
         var_pmt=$((avg_pmt / 10))
-            for method in "${MONITORING_METHODS[@]}"; do
+            for method in "${JUDGING_METHODS[@]}"; do
 
-                # Pair no_defense with monitoring disabled, and defense with monitoring enabled
+                # Pair no_defense with judging disabled, and defense with judging enabled
                 # 代役ハブenv: baseline(disable)には付けず、防御2モード(method1/2)にのみ付ける。
                 sub_env=""
                 case "$method" in
-                    monitor_disable)
+                    judge_disable)
                         strategy_val="disabled"
-                        monitor_counts_iter=(0)
+                        judge_counts_iter=(0)
                         defense_modes_iter=(no_defense)
                         # baseline=対照。代役なし。空代入 CLOTH_SUBSTITUTE_COUNT= で、
                         # ユーザシェルが誤ってグローバル export していても遮蔽する
                         # (cloth.c は空文字列を 0=OFF として扱う)。
                         sub_env="CLOTH_SUBSTITUTE_COUNT="
                         ;;
-                    monitor_method1)
+                    judge_method1)
                         strategy_val="method1"
-                        monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
+                        judge_counts_iter=("${JUDGE_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
                         sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
                         ;;
-                    monitor_method2)
+                    judge_method2)
                         strategy_val="method2"
-                        monitor_counts_iter=("${MONITOR_NODE_COUNTS[@]}")
+                        judge_counts_iter=("${JUDGE_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
                         sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
                         ;;
                     *)
-                        echo "ERROR: Unknown monitoring method: $method"
+                        echo "ERROR: Unknown judging method: $method"
                         exit 1
                     ;;
             esac
@@ -716,8 +749,8 @@ for n_payment in "${N_PAYMENTS[@]}"; do
             for defense in "${defense_modes_iter[@]}"; do
                 # NOTE: 旧 avoid_low_reputation=/enable_reputation_system= 引数は削除した。
                 # 前者は C 側に消費者が存在しない完全な no-op、後者は cloth.c が
-                # monitoring_strategy から正規化するため必ず上書きされる死んだノブだった。
-                # 防御切替の実体は monitoring_strategy + enable_rbr + enable_prt の3つ。
+                # judging_strategy から正規化するため必ず上書きされる死んだノブだった。
+                # 防御切替の実体は judging_strategy + enable_rbr + enable_prt の3つ。
                 if [[ "$defense" == "no_defense" ]]; then
                     enable_rbr_val="false"
                     enable_prt_val="false"   # 対照(no_defense)は素のタイムアウト挙動=PRT-off
@@ -726,11 +759,11 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                     enable_prt_val="true"    # 防御は早期打ち切り(PRT)を含む
                 fi
 
-                for monitor_count in "${monitor_counts_iter[@]}"; do
-                    if [[ "$method" == "monitor_disable" ]]; then
+                for judge_count in "${judge_counts_iter[@]}"; do
+                    if [[ "$method" == "judge_disable" ]]; then
                         output_dir="$output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt"
                     else
-                        output_dir="$output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/monitor_count=$monitor_count"
+                        output_dir="$output_base/$defense/$method/n_payment$n_payment/avg_pmt_amt=$avg_pmt/judge_count=$judge_count"
                     fi
 
                     # Build base command for this configuration (per-p variation handled below)
@@ -738,10 +771,10 @@ base_cmd_args="n_additional_nodes=$NODE_SCALES \
                         n_payments=$n_payment \
                         mpp=0 payment_timeout=200000 \
                         malicious_node_ratio=$MALICIOUS_RATIO malicious_failure_probability=$ATTACK_SUCCESS_RATE \
-                        monitoring_strategy=$strategy_val \
+                        judging_strategy=$strategy_val \
                         top_hub_count=$TOP_HUB_COUNT \
-                        monitor_node_limit=$monitor_count \
-                        enable_monitor_movement=false movement_credit_limit=0 \
+                        judge_node_limit=$judge_count \
+                        enable_judge_movement=false movement_credit_limit=0 \
                         enable_pra=false enable_prt=$enable_prt_val enable_rbr=$enable_rbr_val \
                         average_payment_amount=$avg_pmt variance_payment_amount=$var_pmt \
                         $ATTACK_DELAY_PARAMS_ON"

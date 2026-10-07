@@ -9,8 +9,13 @@
 #include "network/network.h"
 #include "core/payments.h"
 
-/* Runtime-configurable detection parameters (via env vars):
- * CLOTH_PVALUE_THRESHOLD - p-value threshold for anomaly (default 0.005)
+/* 検知器の呼称は「fail 検知器」(forward leg 測定 / fail 型を報告) と
+ * 「hold 検知器」(settlement レグ測定 / hold 型を報告) で統一する。定義と env 名の
+ * 対応表は monitoring.h 冒頭の「検知器の用語」ブロックを参照。
+ *
+ * Runtime-configurable detection parameters (via env vars):
+ * CLOTH_PVALUE_THRESHOLD - p-value threshold for anomaly (default 0.005)。α は
+ *                          fail / hold 両検知器で共有。
  * CLOTH_TIME_WINDOW_MS  - time window for chaining observations in ms (default 10000)
  */
 static double get_pvalue_threshold() {
@@ -21,14 +26,17 @@ static double get_pvalue_threshold() {
     return v;
 }
 
-/* === Axis-3: 次数依存の null σ 膨張 ===
+/* === Axis-3: 次数依存の null σ 膨張 (fail 検知器のみ) ===
  * 多忙ハブは本物の輻輳で log-latency の裾が重く、単一対数正規 null では異常率が
  * α を超える(=null誤特定→ハブ底上げ)。σ_eff = σ·(1 + k·log(1+degree)) で次数が
  * 高いノードほど null を広げ、honest hub の異常率を α に戻す。
- * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.04 = ON)。n 増に伴う forward 検知器の FWER
+ * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.04 = ON)。n 増に伴う fail 検知器の FWER
  * (高次数ハブの誤報告) を抑え precision を保つ。n=12800 で precision 90->96% を実測。
- * env で上書き可、0 を明示すると無効=従来の単一対数正規 null。 */
-static double get_null_degree_sigma() {
+ * env で上書き可、0 を明示すると無効=従来の単一対数正規 null。
+ * ⚠️ hold 検知器はこの σ 膨張を使わない: settlement レグのレイテンシは次数非依存
+ *    (Phase0 実測) なので degree を説明変数にする根拠がなく、代わりに per-node
+ *    経験分位点 null (下の hold 版) を用いる。 */
+static double get_fail_null_degree_sigma() {
     char *env = getenv("CLOTH_NULL_DEGREE_SIGMA");
     if (env == NULL) return 0.04;
     double v = atof(env);
@@ -36,16 +44,16 @@ static double get_null_degree_sigma() {
     return v;
 }
 
-/* === Axis-3(forward検知の実験レバー, 既定OFF, CLOTH_NULL_QUANTILE=true): per-node 経験的 heavy-tail null ===
+/* === Axis-3(fail 検知器の実験レバー, 既定OFF, CLOTH_NULL_QUANTILE=true): per-node 経験的 heavy-tail null ===
  * 各ノードが自分の log-latency の (1-α) 分位点 anom_q を Robbins-Monro で学習し、
  * anomalous = (log_lat > anom_q) と判定する。これにより per-node の異常率が α に
  * 収束 → 多忙ハブも自分の本物の裾に合わせた高い閾値を学び FP が消える(degree不使用)。
- * 静かなノードは低い閾値のまま感度を保つ。採用済みの決済(hold)版は下記 settle 版を参照。 */
-static int get_null_quantile_mode() {
+ * 静かなノードは低い閾値のまま感度を保つ。hold 検知器では同方式を採用済み(下の hold 版)。 */
+static int get_fail_null_quantile_mode() {
     char *env = getenv("CLOTH_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
 }
-static double get_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
+static double get_fail_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
     char *env = getenv("CLOTH_NULL_Q_STEP");
     if (env == NULL) return 0.05;
     double v = atof(env);
@@ -53,33 +61,33 @@ static double get_null_q_step() {  /* Robbins-Monro 学習率 γ (σ単位) */
     return v;
 }
 
-/* === 決済(hold)検知器の per-node heavy-tail null (CLOTH_SETTLE_NULL_QUANTILE=true) ===
+/* === hold 検知器の per-node heavy-tail null (CLOTH_SETTLE_NULL_QUANTILE=true) ===
  * 各ノードが warmup 中(=攻撃非アクティブ=クリーン)に自分の log-settle-latency の
  * (1-α)分位点 settle_anom_q を Robbins-Monro で学習し、post-warmup は凍結してその
  * per-node 閾値で判定する。多忙な正直ハブは自分の重い裾を学習するので過剰発火せず
  * (hub-bottom-drag の FP を抑制)、保持(≈2x)はどのノードの裾も超えるので検出は残る。
  * 汚染回避のため学習は warmup 限定(post-warmup の保持サンプルは裾に混ぜない)。
  * step は絶対値(σで割らない)=低トラフィックノード固着(旧試作の不安定②)を回避。 */
-static int get_settle_null_quantile_mode() {
+static int get_hold_null_quantile_mode() {
     char *env = getenv("CLOTH_SETTLE_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
 }
 
-/* === settle(hold) z検定用の次数σ膨張 (CLOTH_SETTLE_DEGREE_SIGMA=k, 既定0.20) ===
- * hold検知は既定で対数正規z検定(分位点null OFF)。forward検知器と同じ次数σ膨張
- * σ_eff = σ·(1+k·ln(1+deg)) を settle 側にも適用する。settle レイテンシ自体は次数非依存
+/* === hold 検知器の z検定用 次数σ膨張 (CLOTH_SETTLE_DEGREE_SIGMA=k, 既定0.20) ===
+ * hold検知は既定で対数正規z検定(分位点null OFF)。fail検知器と同じ次数σ膨張
+ * σ_eff = σ·(1+k·ln(1+deg)) を hold 側にも適用する。hold レイテンシ自体は次数非依存
  * だが、高次数=高トラフィック=多重検定の露出が大きい(FWER膨張でFPを踏みやすい)ため、
  * 次数を露出の代理として閾値を広げ、busy な正直ハブの誤検知を抑える。0 で無効(生σ)。
- * 既定 k=0.20: settleは次数非依存ゆえ forward の k=0.04 より大きい k が必要で、n=12800 で
+ * 既定 k=0.20: hold は次数非依存ゆえ fail の k=0.04 より大きい k が必要で、n=12800 で
  * k≈0.12-0.20 のとき per-node 分位点null と precision/recall が一致することを確認(2026-08-02)。 */
-static double get_settle_degree_sigma() {
+static double get_hold_degree_sigma() {
     char *env = getenv("CLOTH_SETTLE_DEGREE_SIGMA");
     if (env == NULL) return 0.20;
     double v = atof(env);
     if (v < 0.0) return 0.0;
     return v;
 }
-static double get_settle_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
+static double get_hold_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
     char *env = getenv("CLOTH_SETTLE_Q_STEP");
     if (env == NULL) return 0.05;
     double v = atof(env);
@@ -146,15 +154,15 @@ static int get_detect_k() {      /* k: 窓内の異常回数しきい値 */
     if (v < 1) return 3;
     return v;
 }
-/* === lever②: 報告 strike を「報告者(上流)」から「攻撃者(帰属先)」へ移す ===
- * fail 検知の既定を per-hop 1-strike にする。従来は報告者ノードの suspicion_score>=2
- * を要求していた(報告者ごとの2-strike)が、低 n では1攻撃者あたりの異常が希少かつ
+/* === lever②: 報告 strike を「計測・報告者(上流)」から「攻撃者(帰属先)」へ移す ===
+ * fail 検知器の既定を per-hop 1-strike にする。従来は計測・報告者ノードの suspicion_score>=2
+ * を要求していた(計測・報告者ごとの2-strike)が、低 n では1攻撃者あたりの異常が希少かつ
  * 別ルート=別上流に断片化し、どの上流も2に届かず攻撃者が取り残されていた
  * ([[recall_low_n_observation_gap]])。per-hop は各異常ホップで即時 1-strike 報告し、
  * 多重証拠ガードを攻撃者側の報告累計(CLOTH_FLAG_MIN_REPORTS, cloth.c, 既定1)に委ねる
- * (=settle検知器と同じ設計)。frozen-denominator 実測(method2/mix, seed42)で
+ * (=hold 検知器と同じ設計)。frozen-denominator 実測(method2/mix, seed42)で
  * recall +3.5〜+11.4pp(低nほど大), precision 不変(FP増なし)を確認。
- * **既定 ON**。CLOTH_ATTRIB_PER_HOP=0 (または false) で従来の報告者2-strikeに戻せる
+ * **既定 ON**。CLOTH_ATTRIB_PER_HOP=0 (または false) で従来の計測・報告者2-strikeに戻せる
  * (過去 run との比較再現用)。 */
 static int get_attrib_per_hop() {
     char *env = getenv("CLOTH_ATTRIB_PER_HOP");
@@ -163,13 +171,13 @@ static int get_attrib_per_hop() {
 }
 /* === Global observation storage === */
 struct array* g_htlc_observations = NULL;
-int g_monitoring_enabled = 1;
+int g_judging_enabled = 1;
 
 
 
-/* === Global monitor trust scores === */
-static struct monitor_trust_score* g_monitor_trust_scores = NULL;
-static int g_num_monitors_with_scores = 0;
+/* === Global judge trust scores === */
+static struct judge_trust_score* g_judge_trust_scores = NULL;
+static int g_num_judges_with_scores = 0;
 
 /* === Helper function to compare observation pointers by timestamp === */
 static int obs_compare_by_timestamp(const void* a, const void* b) {
@@ -198,12 +206,12 @@ void record_htlc_observation(
     uint64_t timestamp,
     uint32_t timelock,
     long current_node_id,
-    long monitor_id,
+    long judge_id,
     double channel_balance_before,
     double channel_balance_after,
     int is_balance_adjustment
 ) {
-    if (!g_monitoring_enabled) {
+    if (!g_judging_enabled) {
         return;
     }
 
@@ -223,7 +231,7 @@ void record_htlc_observation(
     obs->amount = amount;
     obs->timestamp = timestamp;
     obs->timelock = timelock;
-    obs->monitor_id = monitor_id;
+    obs->judge_id = judge_id;
     obs->current_node_id = current_node_id;
     obs->channel_balance_before = channel_balance_before;
     obs->channel_balance_after = channel_balance_after;
@@ -301,21 +309,21 @@ long* reconstruct_payment_path_from_chain(
 }
 
 /* === Integrate observations to estimate payment paths === */
-struct array* integrate_observations_from_monitors(struct network* network, struct array* payments) {
+struct array* integrate_observations_from_judges(struct network* network, struct array* payments) {
     struct array* estimated_payments = array_initialize(100);
 
     if (g_htlc_observations == NULL || array_len(g_htlc_observations) == 0) {
-        if (cloth_debug_enabled()) printf("[Monitoring] No observations recorded\n");
+        if (cloth_debug_enabled()) printf("[Judging] No observations recorded\n");
         return estimated_payments;
     }
 
     // Ensure trust scores are initialized
-    if (g_num_monitors_with_scores == 0) {
-        initialize_monitor_trust_scores(network);
+    if (g_num_judges_with_scores == 0) {
+        initialize_judge_trust_scores(network);
     }
 
     int num_obs = array_len(g_htlc_observations);
-    if (cloth_debug_enabled()) printf("[Monitoring] Processing %d observations\n", num_obs);
+    if (cloth_debug_enabled()) printf("[Judging] Processing %d observations\n", num_obs);
 
     // Group observations by payment_id
     struct array** observation_groups = (struct array**)malloc(num_obs * sizeof(struct array*));
@@ -343,7 +351,7 @@ struct array* integrate_observations_from_monitors(struct network* network, stru
         observation_groups[target_group] = array_insert(observation_groups[target_group], obs_i);
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Formed %d observation groups\n", num_groups);
+    if (cloth_debug_enabled()) printf("[Judging] Formed %d observation groups\n", num_groups);
 
     // Convert groups to estimated payments
     // Use route-consistent chaining within each payment_id group.
@@ -473,32 +481,32 @@ void free_all_observations() {
     g_htlc_observations = NULL;
 }
 
-/* === Initialize monitor trust scores === */
-void initialize_monitor_trust_scores(struct network* network) {
-    if (network == NULL || network->num_monitors == 0) {
+/* === Initialize judge trust scores === */
+void initialize_judge_trust_scores(struct network* network) {
+    if (network == NULL || network->num_judges == 0) {
         return;
     }
 
-    g_monitor_trust_scores = (struct monitor_trust_score*)malloc(
-        network->num_monitors * sizeof(struct monitor_trust_score));
+    g_judge_trust_scores = (struct judge_trust_score*)malloc(
+        network->num_judges * sizeof(struct judge_trust_score));
 
-    for (int i = 0; i < network->num_monitors; i++) {
-        g_monitor_trust_scores[i].monitor_id = i;
-        g_monitor_trust_scores[i].trust_score = 0.8;  // Initial trust
-        g_monitor_trust_scores[i].correct_observations = 0;
-        g_monitor_trust_scores[i].contradicted_observations = 0;
+    for (int i = 0; i < network->num_judges; i++) {
+        g_judge_trust_scores[i].judge_id = i;
+        g_judge_trust_scores[i].trust_score = 0.8;  // Initial trust
+        g_judge_trust_scores[i].correct_observations = 0;
+        g_judge_trust_scores[i].contradicted_observations = 0;
     }
 
-    g_num_monitors_with_scores = network->num_monitors;
+    g_num_judges_with_scores = network->num_judges;
 }
 
-/* === Update monitor trust score === */
-void update_monitor_trust_score(long monitor_id, int is_correct) {
-    if (monitor_id < 0 || monitor_id >= g_num_monitors_with_scores) {
+/* === Update judge trust score === */
+void update_judge_trust_score(long judge_id, int is_correct) {
+    if (judge_id < 0 || judge_id >= g_num_judges_with_scores) {
         return;
     }
 
-    struct monitor_trust_score* score = &g_monitor_trust_scores[monitor_id];
+    struct judge_trust_score* score = &g_judge_trust_scores[judge_id];
 
     if (is_correct) {
         score->trust_score += 0.1;
@@ -524,32 +532,32 @@ struct array* generate_balance_adjustment_payments(
 ) {
     struct array* balance_payments = array_initialize(100);
 
-    if (network == NULL || network->num_monitors == 0) {
+    if (network == NULL || network->num_judges == 0) {
         return balance_payments;
     }
 
     uint64_t payment_id_base = 1000000;  // High base to avoid collision with normal payments
     uint64_t current_time = start_time;
 
-    // For each monitor, generate balance adjustment payments to other monitors
-    // Strategy: Create payments to equalize balances across monitor network
-    for (int src = 0; src < network->num_monitors; src++) {
-        MonitorAgent* src_monitor = &network->monitors[src];
-        struct node* src_node = (struct node*)array_get(network->nodes, src_monitor->node_id);
+    // For each judge, generate balance adjustment payments to other judges
+    // Strategy: Create payments to equalize balances across judge network
+    for (int src = 0; src < network->num_judges; src++) {
+        JudgeAgent* src_judge = &network->judges[src];
+        struct node* src_node = (struct node*)array_get(network->nodes, src_judge->node_id);
 
         if (src_node == NULL) {
             continue;
         }
 
-        // Find nearby monitors to send balance adjustments
-        // For simplicity, pair monitors sequentially
-        int dst = (src + 1) % network->num_monitors;
+        // Find nearby judges to send balance adjustments
+        // For simplicity, pair judges sequentially
+        int dst = (src + 1) % network->num_judges;
         if (dst == src) {
-            continue;  // Only 1 monitor, no need for adjustment
+            continue;  // Only 1 judge, no need for adjustment
         }
 
-        MonitorAgent* dst_monitor = &network->monitors[dst];
-        struct node* dst_node = (struct node*)array_get(network->nodes, dst_monitor->node_id);
+        JudgeAgent* dst_judge = &network->judges[dst];
+        struct node* dst_node = (struct node*)array_get(network->nodes, dst_judge->node_id);
 
         if (dst_node == NULL) {
             continue;
@@ -563,8 +571,8 @@ struct array* generate_balance_adjustment_payments(
             (struct balance_adjustment_payment*)malloc(sizeof(struct balance_adjustment_payment));
 
         ba_payment->payment_id = payment_id_base + array_len(balance_payments);
-        ba_payment->src_monitor_id = src_monitor->node_id;
-        ba_payment->dst_monitor_id = dst_monitor->node_id;
+        ba_payment->src_judge_id = src_judge->node_id;
+        ba_payment->dst_judge_id = dst_judge->node_id;
         ba_payment->amount = adjustment_amount;
         ba_payment->timestamp = current_time;
         ba_payment->is_internal = 1;
@@ -577,12 +585,12 @@ struct array* generate_balance_adjustment_payments(
     return balance_payments;
 }
 
-/* === Monitor Information Sharing & Dynamic Reputation System === */
+/* === Judge Information Sharing & Dynamic Reputation System === */
 
-/* 全監視器の観測を統合し、グローバル評判スコアを更新する。
- * 1. 全監視器の観測を統合  2. 決済経路から疑わしいノードを特定
+/* 全判定ノードの観測を統合し、グローバル評判スコアを更新する。
+ * 1. 全判定ノードの観測を統合  2. 決済経路から疑わしいノードを特定
  * 3. 全ノードの評判スコアを更新  4. 評判データをルーティングから参照可能にする。 */
-void share_monitor_information_and_update_reputation(
+void share_judge_information_and_update_reputation(
     struct network* network,
     struct network_params net_params
 ) {
@@ -596,11 +604,11 @@ void share_monitor_information_and_update_reputation(
         return;
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Sharing information across monitors...\n");
-    if (cloth_debug_enabled()) printf("[Monitoring] Total observations: %d\n", num_observations);
+    if (cloth_debug_enabled()) printf("[Judging] Sharing information across judges...\n");
+    if (cloth_debug_enabled()) printf("[Judging] Total observations: %d\n", num_observations);
 
     // Integrate observations to get estimated payment paths
-    struct array* estimated_payments = integrate_observations_from_monitors(network, NULL);
+    struct array* estimated_payments = integrate_observations_from_judges(network, NULL);
 
     if (estimated_payments == NULL) {
         return;
@@ -608,7 +616,7 @@ void share_monitor_information_and_update_reputation(
 
     // Analyze estimated payments to identify suspicious nodes
     int num_estimated = array_len(estimated_payments);
-    if (cloth_debug_enabled()) printf("[Monitoring] Estimated payments from integration: %d\n", num_estimated);
+    if (cloth_debug_enabled()) printf("[Judging] Estimated payments from integration: %d\n", num_estimated);
 
     // Initialize node suspicion scores (0.0 = trusted, 1.0 = malicious)
     double* node_suspicion = (double*)calloc(array_len(network->nodes), sizeof(double));
@@ -653,7 +661,7 @@ void share_monitor_information_and_update_reputation(
     }
 
     // Update global reputation scores based on integrated information
-    if (cloth_debug_enabled()) printf("[Monitoring] Updating reputation scores...\n");
+    if (cloth_debug_enabled()) printf("[Judging] Updating reputation scores...\n");
 
     int nodes_updated = 0;
     int num_nodes = array_len(network->nodes);
@@ -668,7 +676,7 @@ void share_monitor_information_and_update_reputation(
         /* Fix 1 (non-destructive batch update): if this sweep has no suspicion
          * evidence against the node, leave its reputation untouched. Recomputing
          * from a 1.0 baseline here would wipe out penalties already accumulated by
-         * the realtime detection path (report_attacked_node_to_monitors ->
+         * the realtime detection path (report_attacked_node_to_judges ->
          * update_node_reputation_on_detection), which is currently the only path
          * that actually lowers reputation. */
         if (node_suspicion_count[i] == 0) {
@@ -688,7 +696,7 @@ void share_monitor_information_and_update_reputation(
              * accumulate suspicion reports faster than low-degree nodes,
              * so scale down the penalty proportionally to degree.
              * degree=0: scale=1.0, degree=200: scale=0.5, degree=1000: scale=0.17
-             * Consistent with the scaling in report_attacked_node_to_monitors. */
+             * Consistent with the scaling in report_attacked_node_to_judges. */
             long degree = 0;
             if (node->open_edges != NULL) degree = array_len(node->open_edges);
             double degree_scale = 1.0 / (1.0 + (double)degree / 200.0);
@@ -722,7 +730,7 @@ void share_monitor_information_and_update_reputation(
         double old_rep = node->reputation_score;
         /* このバッチ統合は「疑い」に基づく更新なので評判を上げてはならない。
          * 従来は 1.0 基準で再計算した値をそのまま代入しており、realtime 検知
-         * (report_attacked_node_to_monitors) が積み上げたペナルティを毎スイープ
+         * (report_attacked_node_to_judges) が積み上げたペナルティを毎スイープ
          * 帳消しにして高次数攻撃者 (node2 等) の評判を 1.0 に戻していた。
          * 下げる方向のみ反映する。正常ハブの誤報による低下の回復経路は
          * 評判減衰レバー (cloth.c, env CLOTH_REPUTATION_DECAY_RATE, 既定0=OFF)
@@ -737,7 +745,7 @@ void share_monitor_information_and_update_reputation(
         }
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Updated reputation for %d nodes\n", nodes_updated);
+    if (cloth_debug_enabled()) printf("[Judging] Updated reputation for %d nodes\n", nodes_updated);
 
     // Identify and report suspected malicious nodes
     int suspect_count = 0;
@@ -748,8 +756,8 @@ void share_monitor_information_and_update_reputation(
         }
     }
 
-    if (cloth_debug_enabled()) printf("[Monitoring] Nodes with low reputation (<0.5): %d\n", suspect_count);
-    if (cloth_debug_enabled()) printf("[Monitoring] Information sharing complete - Routing can now use reputation scores\n");
+    if (cloth_debug_enabled()) printf("[Judging] Nodes with low reputation (<0.5): %d\n", suspect_count);
+    if (cloth_debug_enabled()) printf("[Judging] Information sharing complete - Routing can now use reputation scores\n");
 
     // Clean up
     free(node_suspicion);
@@ -767,7 +775,7 @@ void share_monitor_information_and_update_reputation(
     }
 }
 
-void report_attacked_node_to_monitors(
+void report_attacked_node_to_judges(
     struct network* network,
     long reporter_node_id,
     long attacked_node_id,
@@ -775,7 +783,7 @@ void report_attacked_node_to_monitors(
     uint64_t timestamp,
     struct network_params net_params
 ) {
-    if (network == NULL || !net_params.monitoring_strategy || !net_params.enable_reputation_system) {
+    if (network == NULL || !net_params.judging_strategy || !net_params.enable_reputation_system) {
         return;
     }
 
@@ -789,7 +797,7 @@ void report_attacked_node_to_monitors(
     }
 
     if (cloth_debug_enabled())
-        printf("[Monitoring] reporter=%ld reported attack on node=%ld for payment=%" PRIu64 "\n",
+        printf("[Judging] reporter=%ld reported attack on node=%ld for payment=%" PRIu64 "\n",
                reporter_node_id,
                attacked_node_id,
                payment_id);
@@ -831,7 +839,7 @@ void report_attacked_node_to_monitors(
         double scaled_penalty = net_params.reputation_penalty_on_detection * degree_scale;
 
         if (cloth_debug_enabled())
-            printf("[Monitoring] applying scaled penalty to node=%ld degree=%ld scale=%.4f base_penalty=%.4f scaled_penalty=%.4f\n",
+            printf("[Judging] applying scaled penalty to node=%ld degree=%ld scale=%.4f base_penalty=%.4f scaled_penalty=%.4f\n",
                    attacked_node_id, degree, degree_scale, net_params.reputation_penalty_on_detection, scaled_penalty);
 
         update_node_reputation_on_detection(
@@ -904,7 +912,7 @@ double calculate_p_value_log_normal(double observed_latency_ms, double baseline_
  * Update baseline using exponential moving average (EMA)
  * EMA weight: 0.99 old, 0.01 new (slow adaptation)
  */
-void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
+void update_fail_baseline_lognormal(struct node* node, double observed_latency_ms) {
     if (node == NULL) return;
 
     double log_latency = log(observed_latency_ms + 1.0);
@@ -935,36 +943,34 @@ void update_baseline_lognormal(struct node* node, double observed_latency_ms) {
 }
 
 /**
- * Process HTLC result and apply hypothesis testing
- *
- * Returns: 1 if attack should be reported (suspicion_score >= 2), 0 otherwise
- *
- * Logic:
- * 1. Compute p-value from observed latency
- * 2. During warm-up (payment_count < 500): learn baseline, update score but don't report
- * 3. After warm-up:
- *    - If p < 0.005: increment suspicion_score
- *    - If p >= 0.005: decrement suspicion_score (if > 0)
- *    - If suspicion_score >= 2: return 1 (report attack)
- * 4. Always update baseline for next iteration
- */
-/**
- * on_payment_result_hypothesis_test  ― ホップ間レイテンシ仮説検定版
+ * on_fail_hypothesis_test ― fail 検知器 (forward leg のホップ間レイテンシ)
  *
  * htlc.c 側で hop_send_times[i] → hop_send_times[i+1]（または result_time）を
  * 1 ホップ分の区間レイテンシとして渡すため、ここでは 1 ホップ単体を検定する。
- * 監視ノードの有無に関係なく、各ノードを独立に評価できる。
+ * 判定ノードの有無に関係なく、各ノードを独立に評価できる。
+ *
+ * 処理:
+ * 1. warmup 中 (payment_count_global < CLOTH_WARMUP_PAYMENTS, 既定 500) は
+ *    baseline 学習のみで報告しない。
+ * 2. post-warmup は p < α (CLOTH_PVALUE_THRESHOLD, 既定 0.005) で異常と判定し、
+ *    Axis-2 カウンタ (hyp_test_count / hyp_anomaly_count) を蓄積する。
+ * 3. 報告 (戻り値 1) は is_fail=1 のときのみ。既定は per-hop 1-strike
+ *    (CLOTH_ATTRIB_PER_HOP)、k-of-m モードでは窓内異常数 >= k を要求。
+ * 4. 非異常観測でのみ baseline を更新する (攻撃レイテンシでの汚染回避)。
  *
  * 引数:
- *   forwarding_node     : 検定対象のノード
+ *   forwarding_node     : 検定対象のノード (= hop[i].from_node)
  *   htlc_send_time      : そのホップの送信開始時刻
  *   result_time         : そのホップの処理完了時刻（次ホップ送信 or 最終結果時刻）
  *   payment_count_global: グローバル支払いカウント（ウォームアップ判定用）
- *   is_fail             : 1=forward_fail, 0=forward_success
+ *   is_fail             : 1=receive_fail 経路, 0=receive_success 経路(報告なし)
  *
- * 戻り値: 1=報告すべき異常検知, 0=正常 or ウォームアップ中
+ * 戻り値: 1=fail 型攻撃として報告すべき, 0=正常 / warmup 中 / 成功経路
+ *
+ * hold 型 (支払いを成功させ settlement レグで preimage を保持) はこの検知器には
+ * 映らない。on_hold_hypothesis_test (hold 検知器) が担当する。
  */
-int on_payment_result_hypothesis_test(
+int on_fail_hypothesis_test(
     struct node* forwarding_node,
     uint64_t htlc_send_time,
     uint64_t result_time,
@@ -981,7 +987,7 @@ int on_payment_result_hypothesis_test(
 
     /* === ウォームアップ(最初の500支払い): ベースライン学習のみ === */
     if (payment_count_global < get_warmup_payments()) {
-        update_baseline_lognormal(forwarding_node, latency_ms);
+        update_fail_baseline_lognormal(forwarding_node, latency_ms);
         return 0;
     }
 
@@ -990,7 +996,7 @@ int on_payment_result_hypothesis_test(
     double p_threshold = get_pvalue_threshold();
     int anomalous;
     double p_value = -1.0; /* 診断ログ用 (quantileモードでは未使用→-1) */
-    if (get_null_quantile_mode()) {
+    if (get_fail_null_quantile_mode()) {
         /* per-node 経験的分位点 null: log_lat が学習済み (1-α)分位点 anom_q を超えたら異常。
          * anom_q を Robbins-Monro で更新し per-node 異常率を α に収束させる。 */
         double log_lat = log(latency_ms + 1.0);
@@ -1000,13 +1006,13 @@ int on_payment_result_hypothesis_test(
         double gauss_thresh = forwarding_node->baseline_mean + 2.326 * sd; /* α=0.01 の z */
         if (forwarding_node->anom_q < gauss_thresh) forwarding_node->anom_q = gauss_thresh;
         anomalous = (log_lat > forwarding_node->anom_q);
-        double step = get_null_q_step() * sd;
+        double step = get_fail_null_q_step() * sd;
         forwarding_node->anom_q += step * ((anomalous ? 1.0 : 0.0) - p_threshold);
         if (forwarding_node->anom_q < gauss_thresh) forwarding_node->anom_q = gauss_thresh;
     } else {
         /* Axis-3(degree版) or 従来: 次数依存で null σ を広げる (k=0 なら従来の baseline_std)。 */
         double sigma_eff = forwarding_node->baseline_std;
-        double k_null = get_null_degree_sigma();
+        double k_null = get_fail_null_degree_sigma();
         if (k_null > 0.0) {
             long deg = (forwarding_node->open_edges != NULL)
                            ? array_len(forwarding_node->open_edges) : 0;
@@ -1037,13 +1043,13 @@ int on_payment_result_hypothesis_test(
                 should_report = 1;
         } else {
             /* 正常観測でベースライン更新(攻撃レイテンシでの汚染を避ける) */
-            update_baseline_lognormal(forwarding_node, latency_ms);
+            update_fail_baseline_lognormal(forwarding_node, latency_ms);
         }
     } else {
         /* === 従来: suspicion_score ランダムウォーク (+1異常/-1正常, +2で報告) === */
         if (anomalous) {
             forwarding_node->suspicion_score++;
-            /* lever②: per-hop 1-strike。報告者の2-strikeを待たず、この異常ホップで
+            /* lever②: per-hop 1-strike。計測・報告者の2-strikeを待たず、この異常ホップで
              * 即報告し、証拠累積を攻撃者側(malicious_reports>=CLOTH_FLAG_MIN_REPORTS)に
              * 委ねる。suspicion_score の加算は診断用に残す。 */
             int report_strike = get_attrib_per_hop() ? 1 : 2;
@@ -1052,7 +1058,7 @@ int on_payment_result_hypothesis_test(
         } else {
             if (forwarding_node->suspicion_score > 0)
                 forwarding_node->suspicion_score--;
-            update_baseline_lognormal(forwarding_node, latency_ms);
+            update_fail_baseline_lognormal(forwarding_node, latency_ms);
         }
     }
 
@@ -1082,15 +1088,15 @@ int on_payment_result_hypothesis_test(
     return should_report;
 }
 
-/* === Grief-hold detection (Phase 1): 決済(backward)経路レイテンシの baseline 更新 ===
- * フォワードの update_baseline_lognormal と同型だが settle_baseline_* を更新する。
+/* === hold 検知器 (Phase 1): settlement (backward) レグレイテンシの baseline 更新 ===
+ * fail 検知器の update_fail_baseline_lognormal と同型だが settle_baseline_* を更新する。
  * 正常観測でのみ呼ぶこと(保持攻撃のレイテンシで baseline を汚染しないため)。 */
-static void update_settle_baseline_lognormal(struct node* node, double latency_ms) {
+static void update_hold_baseline_lognormal(struct node* node, double latency_ms) {
     double log_latency = log(latency_ms + 1.0);
     if (node->settle_baseline_mean == 0.0 && node->settle_baseline_var == 0.0) {
         node->settle_baseline_mean = log_latency;
-        /* 初期 σ²=0.01 (σ=0.1)。決済レイテンシは log空間で非常に密(実測 std~0.02)
-         * なので forward版の 0.25 は緩すぎ、2×保持(log+0.685)でも z=1.45 にしかならず
+        /* 初期 σ²=0.01 (σ=0.1)。settlement レグのレイテンシは log空間で非常に密
+         * (実測 std~0.02) なので fail 検知器の 0.25 は緩すぎ、2×保持(log+0.685)でも z=1.45 にしかならず
          * p<0.01 を超えられない(=保持を全く検知できない)。0.01 なら保持 z=6.85 で確実に
          * 異常、正常揺らぎ(z~0.3)は非異常。env CLOTH_SETTLE_VAR_INIT で調整可。 */
         double var_init = 0.01;
@@ -1104,8 +1110,12 @@ static void update_settle_baseline_lognormal(struct node* node, double latency_m
     node->settle_baseline_var  = 0.99 * node->settle_baseline_var  + 0.01 * (dev * dev);
 }
 
-/* See monitoring.h. 決済転送レイテンシ(=preimage保持時間)を対数正規 null で検定。 */
-int on_settlement_result_hypothesis_test(
+/* hold 検知器。See monitoring.h.
+ * settlement レグの転送レイテンシ(=preimage保持時間)を対数正規 null で検定する。
+ * 入力は (ノード, 観測レイテンシ, 支払い数, seed) のみで、そのノードが hold 型攻撃者
+ * かどうかの事前ラベル (payment->grief_hold_node_id / node->is_malicious) は渡らない。
+ * forward_success を処理する全ノードが同じ検定を受ける。 */
+int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
     long payment_count_global,
@@ -1113,13 +1123,13 @@ int on_settlement_result_hypothesis_test(
 ) {
     if (node == NULL || settle_latency_ms <= 0.0) return 0;
 
-    /* === グローバル決済 baseline で seed ===
-     * Phase0 で決済レイテンシは次数非依存・全 honest ノードでほぼ一定(=平均転送
-     * インターバル付近)と判明。よって per-node 学習を待たず、全ノードを共通の
+    /* === グローバルな settlement baseline で seed ===
+     * Phase0 で settlement レグのレイテンシは次数非依存・全 honest ノードでほぼ一定
+     * (=平均転送インターバル付近)と判明。よって per-node 学習を待たず、全ノードを共通の
      * グローバル既定値で初期化する。これで (a) 未学習ノードがゼロ=カバレッジ全域、
      * (b) 保持(2×)は seed に対し常に異常→baseline 更新されず汚染なし、を同時に解決。
-     * 旧 per-node 学習方式は決済サンプルが疎で大半が未検定&warmup後初出ノードが保持を
-     * 学習して汚染、という二重の取りこぼしがあった。 */
+     * 旧 per-node 学習方式は settlement サンプルが疎で大半が未検定&warmup後初出ノードが
+     * 保持を学習して汚染、という二重の取りこぼしがあった。 */
     if (node->settle_baseline_mean == 0.0) {
         double seed = (expected_settle_ms > 0.0) ? expected_settle_ms : 100.0;
         node->settle_baseline_mean = log(seed + 1.0);
@@ -1130,20 +1140,20 @@ int on_settlement_result_hypothesis_test(
     }
 
     double p_threshold = get_pvalue_threshold();
-    int settle_qmode = get_settle_null_quantile_mode();
+    int settle_qmode = get_hold_null_quantile_mode();
 
     /* グローバル warmup 中は報告しない(攻撃遅延も非アクティブ)。baseline は refine のみ。
      * quantile モードでは warmup のクリーン(攻撃非アクティブ)サンプルで per-node の
      * (1-α)分位点 settle_anom_q も RM 学習する(post-warmup は凍結=保持サンプルで汚染しない)。 */
     if (payment_count_global < get_warmup_payments()) {
-        update_settle_baseline_lognormal(node, settle_latency_ms);
+        update_hold_baseline_lognormal(node, settle_latency_ms);
         if (settle_qmode) {
             double log_lat = log(settle_latency_ms + 1.0);
             double sdw = sqrt(node->settle_baseline_var); if (sdw < 1e-6) sdw = 0.1;
             double gauss = node->settle_baseline_mean + 2.326 * sdw; /* Gaussian ~99%点(下限) */
             if (node->settle_anom_q < gauss) node->settle_anom_q = gauss;
             int a = (log_lat > node->settle_anom_q) ? 1 : 0;
-            node->settle_anom_q += get_settle_q_step() * ((double)a - p_threshold); /* 絶対ステップ(②安定化) */
+            node->settle_anom_q += get_hold_q_step() * ((double)a - p_threshold); /* 絶対ステップ(②安定化) */
             if (node->settle_anom_q < gauss) node->settle_anom_q = gauss;
         }
         return 0;
@@ -1163,7 +1173,7 @@ int on_settlement_result_hypothesis_test(
         /* z検定(分位点null OFF)。forward検知器と対称に次数σ膨張を適用し、
          * 高次数=高トラフィックの busy ハブの FWER 膨張による FP を抑える。 */
         double sigma_eff = sd;
-        double k_deg = get_settle_degree_sigma();
+        double k_deg = get_hold_degree_sigma();
         if (k_deg > 0.0) {
             long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
             sigma_eff *= (1.0 + k_deg * log(1.0 + (double)deg));
@@ -1177,7 +1187,7 @@ int on_settlement_result_hypothesis_test(
     if (anomalous) node->settle_anomaly_count++;
 
     /* 報告に要する異常回数 (strike)。既定 1 (初回異常で報告)。
-     * 本検知器は正常ノードの異常率が ~0 (seed42/7 で honest anomaly=0) なので、
+     * hold 検知器は正常ノードの異常率が ~0 (seed42/7 で honest anomaly=0) なので、
      * 1-strike でも FP を増やさず recall を感度上限近く(47%->76%)まで上げられる
      * ことを実測済み。保守側に戻したい場合は env CLOTH_SETTLE_REPORT_STRIKES=2。 */
     int report_strikes = 1;
@@ -1194,7 +1204,7 @@ int on_settlement_result_hypothesis_test(
         if (node->settle_suspicion >= report_strikes) should_report = 1;
     } else {
         if (node->settle_suspicion > 0) node->settle_suspicion--;
-        update_settle_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
+        update_hold_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
     }
     return should_report;
 }
