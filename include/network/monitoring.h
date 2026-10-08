@@ -245,7 +245,8 @@ int has_attack_reporter(struct payment* payment, long node_id);
  *                 CLOTH_DETECT_KOFM, CLOTH_DETECT_WINDOW, CLOTH_DETECT_K,
  *                 CLOTH_ATTRIB_PER_HOP
  *   hold 検知器 : CLOTH_DETECT_GRIEF ("grief"=hold), CLOTH_SETTLE_* ("settle"=hold)
- *   両方で共有   : CLOTH_PVALUE_THRESHOLD (α), CLOTH_WARMUP_PAYMENTS
+ *   両方で共有   : CLOTH_PVALUE_THRESHOLD (α), CLOTH_DETECT_WARMUP_BY_COMPLETED
+ *                 (+ 旧判定時のみ CLOTH_WARMUP_PAYMENTS)
  * =========================================================================== */
 
 /**
@@ -265,6 +266,15 @@ double calculate_p_value_log_normal(double observed_latency_ms, double baseline_
 void update_fail_baseline_lognormal(struct node* node, double observed_latency_ms);
 
 /**
+ * 検知器 (fail / hold 共通) の warmup 判定。warmup 中は baseline 学習のみで報告しない。
+ * 既定は payment->is_warmup (攻撃の発動判定と同じ変数 = 攻撃サンプルが学習に混入しない)。
+ * CLOTH_DETECT_WARMUP_BY_COMPLETED=1 で旧判定 (完了件数 completed_payments <
+ * CLOTH_WARMUP_PAYMENTS) に戻る。過去 run の再現には CLOTH_FAIL_ATTACK_IN_WARMUP=1 も併用する
+ * (片方だけ旧に戻す組み合わせは前提が崩れる。monitoring.c::detector_in_warmup 参照)。
+ */
+int detector_in_warmup(const struct payment* payment, long completed_payments);
+
+/**
  * fail 検知器: forward leg のホップ間レイテンシを対数正規 null で検定する。
  * htlc.c の receive_fail() (is_fail=1) と receive_success() (is_fail=0) の双方から
  * 経路上の全ホップについて呼ばれるが、報告 (戻り値 1) は is_fail=1 のときのみ。
@@ -275,7 +285,7 @@ int on_fail_hypothesis_test(
     struct node* forwarding_node,
     uint64_t htlc_send_time,
     uint64_t result_time,
-    long payment_count_global,
+    int in_warmup,
     int is_fail
 );
 
@@ -286,13 +296,14 @@ int on_fail_hypothesis_test(
  * 直接特定する(下流帰属トリック不要 — 保持ノード自身が release を転送するため)。
  * hold 型は支払いを成功させるため fail 検知器には映らず、この検知器だけが拾える。
  * 戻り値: 1=hold 型攻撃として報告すべき, 0=正常 or warmup中。
+ * in_warmup: detector_in_warmup() の結果。
  * n_hops: この決済の経路ホップ数(=決済が通るノード数の代理)。経路長σ膨張
  *         (CLOTH_SETTLE_HOP_SIGMA) を使うときだけ参照する。不明なら 0 を渡す。
  */
 int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
-    long payment_count_global,
+    int in_warmup,
     double expected_settle_ms,
     int n_hops
 );

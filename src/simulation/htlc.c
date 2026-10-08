@@ -55,7 +55,9 @@ static uint64_t sample_base_forward_delay(struct simulation* simulation, struct 
  * settle する時点でも完了数がしきい値(500)に届かず攻撃遅延が一切注入されない不整合を
  * 起こした(n=200 は総700件でも完了数が最大432止まり→no_defense の grief=0 の根因)。よって
  * 撤去し、ゲートを is_warmup に揃えた(判定は呼び出し側 apply_attack_delay_if_needed)。
- * 検知器側の warmup 保護は monitoring.c::get_warmup_payments が別途担う。 */
+ * hold-to-timeout 型の失敗攻撃も warmup 決済では発動しない (fail_attack_in_warmup)。
+ * 検知器側の warmup 判定も同じ is_warmup に揃えた (monitoring.c::detector_in_warmup)。
+ * 揃える前は完了数で判定しており、境界で攻撃サンプルを warmup 学習して baseline を汚染した。 */
 
 /* 攻撃遅延の発動判定(config チェックのみ; warmup 判定は呼び出し側で per-payment)。
  * 時刻窓 [start_time,+duration] は既定窓が warmup にほぼ収まり信号が乗らず廃止。 */
@@ -356,6 +358,23 @@ static uint64_t reported_time(struct node* nd, struct payment* pm, uint64_t true
  *   3 = 混在 (fail + hold) (hold 割合は CLOTH_GRIEF_HOLD_RATIO、既定 0.5)
  * 未設定/範囲外のときは 0 を返し、get_grief_hold_ratio() は後方互換のため
  * CLOTH_GRIEF_HOLD_RATIO を直接参照する (既定 0.0 = 従来どおり全て fail 型)。 */
+/* === hold-to-timeout 型を warmup 決済にも発動させるか (CLOTH_FAIL_ATTACK_IN_WARMUP, 既定 0) ===
+ * 既定 0: warmup 決済 (payment->is_warmup) では失敗させず通常転送する。hold 型は遅延注入が
+ *   is_warmup で止まるため warmup 中は実質攻撃が無いのに、hold-to-timeout 型だけは warmup 中も
+ *   失敗させていた非対称を解消する。これで全攻撃型で「warmup = 攻撃の無い学習期間」が成り立ち、
+ *   検知器 (monitoring.c::detector_in_warmup) の warmup 学習に攻撃サンプルが混入しない。
+ *   (旧挙動では warmup 決済の 4 割強が攻撃を受けていた。2026-10-08 実測)
+ * 1: 旧挙動 (2026-10-08 以前)。過去 run の再現用。
+ * 乱数: attack_roll / mode_roll は従来どおり引くので、hold 型 (mode 2) の乱数列・結果は不変。 */
+static int fail_attack_in_warmup(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("CLOTH_FAIL_ATTACK_IN_WARMUP");
+    v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+  }
+  return v;
+}
+
 static int get_attack_mode(void) {
   char* e = getenv("CLOTH_ATTACK_MODE");
   if (e == NULL || e[0] == '\0') return 0;
@@ -959,6 +978,9 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
            * 残高減算(上の 617-620)はそのまま = HTLC は実際に転送される。
            * fall through して下の通常送信処理 (success sending) に進む。 */
           payment->grief_hold_node_id = first_hop_node->id;
+        } else if (payment->is_warmup && !fail_attack_in_warmup()) {
+          /* warmup 決済には hold-to-timeout 型を発動しない (fail_attack_in_warmup 参照)。
+           * hold 型と同じく fall through して下の通常送信処理に進む。 */
         } else {
         uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
         uint64_t forward_delay = apply_attack_delay_if_needed(
@@ -967,6 +989,8 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
         uint64_t attack_event_time = simulation->current_time + forward_delay;
 
         /* 分母正常化: 検知が報告可能になる post-warmup の攻撃のみ first_attack_time を立てる。
+         * (既定では warmup 決済にはそもそも攻撃が発動しない=fail_attack_in_warmup。以下は
+         *  CLOTH_FAIL_ATTACK_IN_WARMUP=1 の旧挙動向けの保護として残している)
          * warmup 中の hold-to-timeout 攻撃は仮説検定が抑制され報告できないため、recall 分母
          * (observable_attacked=観測×攻撃)に数えると検知器を不当に減点する(測定アーティファクト)。
          * ゲートは is_warmup(injection ゲートと同根: 完了数基準は小 n で分母が過小/0 になる)。 */
@@ -1116,6 +1140,9 @@ void forward_payment(struct event* event, struct simulation* simulation, struct 
          * (途中で別要因により決済に到達しなかった場合はこのノードは「攻撃せず」)。
          * fall through (return しない) して下の通常転送処理に進む。 */
         payment->grief_hold_node_id = next_node->id;
+      } else if (payment->is_warmup && !fail_attack_in_warmup()) {
+        /* warmup 決済には hold-to-timeout 型を発動しない (fail_attack_in_warmup 参照)。
+         * fall through して下の通常転送処理に進む。 */
       } else {
         /* === hold-to-timeout 型 (HTLC を保持してタイムアウト失敗させる; 旧称 fail型/forward型) === */
         uint64_t base_delay = sample_base_forward_delay(simulation, net_params);
@@ -1372,14 +1399,15 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
    * 異常(=保持)を出したノード本人を攻撃者として報告する。保持ノードは自分で release を
    * 転送するので直接帰属でよい(下流帰属トリック不要)。計測・報告者は上流ノード(prev_node_id)。
    * 観測ゲート(method1/method2)は fail 検知器と共通。既定 OFF (CLOTH_DETECT_GRIEF)。
-   * 検知器に渡すのは (ノード, 観測レイテンシ, 支払い数, seed) だけで、grief_hold_node_id
+   * 検知器に渡すのは (ノード, 観測レイテンシ, warmup 判定, seed) だけで、grief_hold_node_id
    * や is_malicious は渡さない = 攻撃型の事前ラベルなしで判定する。
    * ※ 案A(CLOTH_HOLD_ROUNDTRIP, 既定ON)有効時はこの直接検定を無効化し、receive_success の
    *    往復走査に一本化する(同一ノードを二重報告しないため)。 */
   if (net_params.enable_reputation_system && get_detect_hold() && !get_hold_roundtrip()) {
     int nh_b = (payment->route != NULL) ? array_len(payment->route->route_hops) : 0;
     int should_report = on_hold_hypothesis_test(
-        node, (double)settle_delay, (long)simulation->processed_payments,
+        node, (double)settle_delay,
+        detector_in_warmup(payment, (long)simulation->processed_payments),
         (double)net_params.average_payment_forward_interval, nh_b);
     if (should_report && is_node_observed_by_judges(network, node->id)) {
       report_attacked_node_to_judges(
@@ -1544,7 +1572,8 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。 */
           int should_report = on_hold_hypothesis_test(
-              dn_node, settle_lat, (long)simulation->processed_payments, avg_iv, nh);
+              dn_node, settle_lat,
+              detector_in_warmup(payment, (long)simulation->processed_payments), avg_iv, nh);
           if (should_report && cand != payment->sender && cand != payment->receiver &&
               is_node_observed_by_judges(network, cand) &&
               !has_attack_reporter(payment, cand)) {   /* dedup: 同一決済で同一ノードは1回 */
@@ -1603,7 +1632,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               hop_node,
               t_start,
               t_end,
-              simulation->processed_payments,
+              detector_in_warmup(payment, (long)simulation->processed_payments),
               0           /* is_fail = 0 */
           );
       }
@@ -1790,7 +1819,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
               hop_node,
               t_start,
               t_end,
-              simulation->processed_payments,
+              detector_in_warmup(payment, (long)simulation->processed_payments),
               1  /* is_fail = 1 */
           );
 

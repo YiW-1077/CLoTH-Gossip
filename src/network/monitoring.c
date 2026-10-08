@@ -151,15 +151,40 @@ static double hub_escalated_scale(double degree_scale, long malicious_reports) {
     return degree_scale + (1.0 - degree_scale) * esc;
 }
 
-/* CLOTH_WARMUP_PAYMENTS - baseline 学習に充てる先頭支払い数 (default 500)。
- * これを超えてから仮説検定(報告)を開始する。学習サンプルを増やすと baseline
- * (μ,σ) 推定が安定するが、検定に使える期間は短くなる。 */
+/* CLOTH_WARMUP_PAYMENTS - 旧 warmup 判定 (CLOTH_DETECT_WARMUP_BY_COMPLETED=1) でのみ使う
+ * 完了件数のしきい値 (default 500)。既定の判定は payment->is_warmup (cloth.c で先頭500件に
+ * 固定) なので、既定ではこの env は効かない。 */
 static long get_warmup_payments() {
     char *env = getenv("CLOTH_WARMUP_PAYMENTS");
     if (env == NULL) return 500;
     long v = atol(env);
     if (v <= 0) return 500;
     return v;
+}
+
+/* === 検知器 (fail / hold) の warmup 判定 (CLOTH_DETECT_WARMUP_BY_COMPLETED, 既定 0) ===
+ * 既定: 決済ごとの payment->is_warmup。攻撃の発動判定 (htlc.c の遅延注入ゲートと
+ *   fail_attack_in_warmup) と同じ変数なので、攻撃を受けたサンプルが warmup の無条件学習に
+ *   混入することが構造的に無い。
+ *   ⚠️ 前提は「warmup 決済は攻撃されない」。CLOTH_FAIL_ATTACK_IN_WARMUP=1 (hold-to-timeout 型を
+ *   warmup 中も発動) と組み合わせると前提が崩れ、攻撃でリトライを重ねて遅れて完了する warmup 決済の
+ *   攻撃サンプルを検定せずに学習してしまう (実測 mode1 n=3200 3seed: recall 69.4% → 53.5%)。
+ *   旧挙動を再現するときは両 env を 1 にすること。
+ * 旧挙動 (=1): 完了件数 completed_payments < CLOTH_WARMUP_PAYMENTS。決済は重なって走るため、
+ *   warmup 最後の決済が未完了のうちに最初の非 warmup 決済(=攻撃対象)が settle すると、
+ *   その攻撃サンプルを warmup として学習して baseline を汚染する。σ に余裕の無いノードでは
+ *   以後の攻撃が全て「正常」と判定され、正常時のみ学習する更新が正帰還して永久に未検出になる
+ *   (実例: seed42 の node 282 = 次数620の悪意ハブ。2026-10-08)。過去 run の再現用にのみ残す。 */
+int detector_in_warmup(const struct payment* payment, long completed_payments) {
+    static int by_completed = -1;
+    if (by_completed < 0) {
+        const char* e = getenv("CLOTH_DETECT_WARMUP_BY_COMPLETED");
+        by_completed = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (by_completed || payment == NULL) {
+        return completed_payments < get_warmup_payments();
+    }
+    return payment->is_warmup ? 1 : 0;
 }
 
 /* === k-of-m 窓検定 (n=1 → n=k 集約) ===
@@ -982,7 +1007,7 @@ void update_fail_baseline_lognormal(struct node* node, double observed_latency_m
  * 判定ノードの有無に関係なく、各ノードを独立に評価できる。
  *
  * 処理:
- * 1. warmup 中 (payment_count_global < CLOTH_WARMUP_PAYMENTS, 既定 500) は
+ * 1. warmup 中 (in_warmup = detector_in_warmup(), 既定は payment->is_warmup) は
  *    baseline 学習のみで報告しない。
  * 2. post-warmup は p < α (CLOTH_PVALUE_THRESHOLD, 既定 0.005) で異常と判定し、
  *    Axis-2 カウンタ (hyp_test_count / hyp_anomaly_count) を蓄積する。
@@ -994,7 +1019,7 @@ void update_fail_baseline_lognormal(struct node* node, double observed_latency_m
  *   forwarding_node     : 検定対象のノード (= hop[i].from_node)
  *   htlc_send_time      : そのホップの送信開始時刻
  *   result_time         : そのホップの処理完了時刻（次ホップ送信 or 最終結果時刻）
- *   payment_count_global: グローバル支払いカウント（ウォームアップ判定用）
+ *   in_warmup           : この決済が warmup 中か (detector_in_warmup() の結果)
  *   is_fail             : 1=receive_fail 経路, 0=receive_success 経路(報告なし)
  *
  * 戻り値: 1=fail 型攻撃として報告すべき, 0=正常 / warmup 中 / 成功経路
@@ -1006,7 +1031,7 @@ int on_fail_hypothesis_test(
     struct node* forwarding_node,
     uint64_t htlc_send_time,
     uint64_t result_time,
-    long payment_count_global,
+    int in_warmup,
     int is_fail
 ) {
     if (forwarding_node == NULL || htlc_send_time >= result_time) return 0;
@@ -1018,7 +1043,7 @@ int on_fail_hypothesis_test(
     double latency_ms = (double)(result_time - htlc_send_time);
 
     /* === ウォームアップ(最初の500支払い): ベースライン学習のみ === */
-    if (payment_count_global < get_warmup_payments()) {
+    if (in_warmup) {   /* detector_in_warmup() の結果 (既定 payment->is_warmup) */
         update_fail_baseline_lognormal(forwarding_node, latency_ms);
         return 0;
     }
@@ -1144,13 +1169,13 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
 
 /* hold 検知器。See monitoring.h.
  * settlement レグの転送レイテンシ(=preimage保持時間)を対数正規 null で検定する。
- * 入力は (ノード, 観測レイテンシ, 支払い数, seed) のみで、そのノードが hold 型攻撃者
+ * 入力は (ノード, 観測レイテンシ, warmup 判定, seed) のみで、そのノードが hold 型攻撃者
  * かどうかの事前ラベル (payment->grief_hold_node_id / node->is_malicious) は渡らない。
  * forward_success を処理する全ノードが同じ検定を受ける。 */
 int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
-    long payment_count_global,
+    int in_warmup,
     double expected_settle_ms,
     int n_hops
 ) {
@@ -1178,7 +1203,7 @@ int on_hold_hypothesis_test(
     /* グローバル warmup 中は報告しない(攻撃遅延も非アクティブ)。baseline は refine のみ。
      * quantile モードでは warmup のクリーン(攻撃非アクティブ)サンプルで per-node の
      * (1-α)分位点 settle_anom_q も RM 学習する(post-warmup は凍結=保持サンプルで汚染しない)。 */
-    if (payment_count_global < get_warmup_payments()) {
+    if (in_warmup) {   /* detector_in_warmup() の結果 (既定 payment->is_warmup) */
         update_hold_baseline_lognormal(node, settle_latency_ms);
         if (settle_qmode) {
             double log_lat = log(settle_latency_ms + 1.0);
