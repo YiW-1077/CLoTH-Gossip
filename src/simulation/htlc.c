@@ -375,6 +375,38 @@ static int fail_attack_in_warmup(void) {
   return v;
 }
 
+/* === fail 検知器: 失敗ホップ(fallthrough)の検定対象 (CLOTH_FAIL_FALLTHROUGH_ALL_ERRORS, 既定 0) ===
+ * 失敗したホップは次ノードが転送しないので、区間の終わりを「送信者が失敗を受けた時刻」で代用する
+ * (fallthrough)。この区間には失敗が送信者へ戻る往復 (k ホップ × 転送間隔) が丸ごと入る。
+ * 既定 0: 攻撃による失敗 (error.type == OFFLINENODE) のときだけ検定する。hold-to-timeout 型は
+ *   ここで保持時間 (攻撃遅延 + OFFLINELATENCY) が現れるので検出の本体になる。残高不足などの
+ *   普通の失敗 (NORESPONSE) では失敗ホップのノードは転送していないので測るべき遅延が無く、
+ *   戻りの往復を遅延と誤認して異常判定していた (k≥4 で p<0.01、k≥5 で p<0.001 を超える)。
+ *   error.type は実網の失敗コード (unknown_next_peer / temporary_channel_failure) に相当し観測可能。
+ * 1: 旧挙動 (エラー種別によらず検定)。過去 run の再現用。 */
+static int fail_fallthrough_all_errors(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("CLOTH_FAIL_FALLTHROUGH_ALL_ERRORS");
+    v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+  }
+  return v;
+}
+
+/* === fail 検知器: Phase 2 フォールバック (CLOTH_FAIL_PHASE2_FALLBACK, 既定 0) ===
+ * 案D で攻撃者が決まらない (異常ホップの送り先が送信者/受信者だけ) とき、「経路上で最初に報告して
+ * いない中継ノード」を攻撃者とする旧ロジック。異常の位置と無関係なノードを選ぶため、本物の攻撃の
+ * 帰属には一度も使われず (mode1 で使用 0 回)、誤検知だけを生んでいた (mode2 の FP の約半数)。
+ * 既定 0: 使わない (案D で決まらなければ報告しない)。1: 旧挙動。過去 run の再現用。 */
+static int fail_phase2_fallback(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char* e = getenv("CLOTH_FAIL_PHASE2_FALLBACK");
+    v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0;
+  }
+  return v;
+}
+
 static int get_attack_mode(void) {
   char* e = getenv("CLOTH_ATTACK_MODE");
   if (e == NULL || e[0] == '\0') return 0;
@@ -1768,8 +1800,10 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
    *          計測・報告者リスト (attack_reporters) に登録する。
    *          攻撃者は HTLC を転送しないため hop_send_times が 0 となり検定がスキップされ、
    *          自然に計測・報告者リストに入らない。
-   * Phase 2: 経路を送信者→受信者方向に走査し、最初に報告していないノードを
-   *          攻撃者と判定してペナルティを与える。 */
+   * Phase 2: (既定 OFF, CLOTH_FAIL_PHASE2_FALLBACK=1 で旧挙動) 経路を送信者→受信者方向に
+   *          走査し、最初に報告していないノードを攻撃者と判定する。
+   * 帰属は下の「案D」(異常ホップの送り先) が本体。失敗ホップの区間は攻撃による失敗
+   * (OFFLINENODE) のときだけ検定する (CLOTH_FAIL_FALLTHROUGH_ALL_ERRORS=1 で旧挙動)。 */
   if (net_params.enable_reputation_system && payment->route != NULL && payment->hop_send_times != NULL) {
       int n_hops = array_len(payment->route->route_hops);
 
@@ -1814,6 +1848,10 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
               tend_fallthrough = 1;
           }
           if (t_end <= t_start) continue;
+          /* 失敗ホップ(fallthrough)は攻撃による失敗のときだけ検定する (fail_fallthrough_all_errors)。
+           * 普通の失敗では区間が「失敗の戻り往復」でしかなく、検定も学習もしない。 */
+          if (tend_fallthrough && payment->error.type != OFFLINENODE &&
+              !fail_fallthrough_all_errors()) continue;
 
           int should_report = on_fail_hypothesis_test(
               hop_node,
@@ -1841,10 +1879,10 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
           }
       }
 
-      /* Phase 2 (フォールバック): 案D で攻撃者が確定しなかった場合 (報告ホップの
-       * 送り先が送信者/受信者のみ等) に限り、従来の「経路上で最初に報告していない
-       * ノード」を攻撃者とする。 */
-      for (int i = 0; i < n_hops; i++) {
+      /* Phase 2 (フォールバック, 既定 OFF = fail_phase2_fallback): 案D で攻撃者が確定しなかった
+       * 場合 (報告ホップの送り先が送信者/受信者のみ等) に限り、旧来の「経路上で最初に報告して
+       * いないノード」を攻撃者とする。異常の位置と無関係なノードを選ぶため既定では使わない。 */
+      for (int i = 0; fail_phase2_fallback() && i < n_hops; i++) {
           struct route_hop* hop = (struct route_hop*)array_get(
                                       payment->route->route_hops, i);
           if (hop == NULL) continue;
