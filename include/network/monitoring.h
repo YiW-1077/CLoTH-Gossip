@@ -118,13 +118,27 @@ void share_judge_information_and_update_reputation(
 /**
  * Report an attacked node from the one-hop upstream node to the judging layer.
  * This is invoked at the node that first observes the failure.
+ * Returns 1 if the report was counted (judging/reputation enabled), 0 otherwise.
  */
-void report_attacked_node_to_judges(
+int report_attacked_node_to_judges(
     struct network* network,
     long reporter_node_id,
     long attacked_node_id,
     uint64_t payment_id,
     uint64_t timestamp,
+    struct network_params net_params
+);
+
+/**
+ * 報告の取り消し (評判の回復)。report_attacked_node_to_judges で数えた報告を n 件取り消す。
+ * malicious_reports を n 減らし、そのせいで成立しなくなった罰のバッチ分の評判を、
+ * 実際に引いた量 (台帳) から新しい順に返金する。報告が0件になれば first_detection_time も戻す。
+ * 返金しないもの: 罰で止まっていた間の成功 boost、バッチ統合(失敗ベース)の罰、代役配置。
+ */
+void revoke_reports_from_judges(
+    struct network* network,
+    long node_id,
+    long n_revoke,
     struct network_params net_params
 );
 
@@ -303,6 +317,28 @@ int on_fail_hypothesis_test(
 int on_hold_hypothesis_test(
     struct node* node,
     double settle_latency_ms,
+    int in_warmup,
+    double expected_settle_ms,
+    int n_hops
+);
+
+/* 判定はするが学習しない版。正常判定でも baseline 更新・suspicion 減算をしない。
+ * 申告が食い違った標本(どちらかが嘘)で null を汚さないために使う。 */
+int on_hold_hypothesis_test_nolearn(
+    struct node* node,
+    double settle_latency_ms,
+    int in_warmup,
+    double expected_settle_ms,
+    int n_hops
+);
+
+/* 隣り合う2人の合計保持時間 sum_ms を検定する(ペア検定)。2人の外側の記録だけで
+ * 測った合計が異常なら「2人のどちらかが保持した」ことが確定する。状態は変えない。
+ * 戻り値: 1=異常, 0=正常 or warmup 中 or 分位点 null モード。 */
+int on_hold_pair_test(
+    struct node* a,
+    struct node* b,
+    double sum_ms,
     int in_warmup,
     double expected_settle_ms,
     int n_hops

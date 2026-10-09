@@ -340,13 +340,255 @@ static int stays_silent_on_payment(struct node* nd, struct payment* pm) {
   return ((double)(h % 100000UL) / 100000.0) < pr;
 }
 
+/* 嘘をつく側 (CLOTH_FALSE_REPORT_SIDE, 既定 both)。
+ *   both = 受領時刻を遅く・送出時刻を早く、の両方を偽る(従来)。2本のリンクが両方
+ *          食い違うので共通点ルール(CLOTH_ATTEST_DISPUTE_POLICY)で本人と断定される。
+ *   recv = 受領時刻だけ遅く申告する = 「下流がなかなか渡してこなかった」となすりつける。
+ *   send = 送出時刻だけ早く申告する = 「すぐ渡したのに上流(報告者)が遅れた」と逆告発する。
+ * 片側だけだと食い違うリンクは1本だけになり、従来ルールではどちらが嘘か決められず
+ * 帰属ごと破棄される(=攻撃者が逃げる)。それを測るためのノブ。 */
+enum { FALSE_REPORT_SIDE_BOTH = 0, FALSE_REPORT_SIDE_RECV = 1, FALSE_REPORT_SIDE_SEND = 2 };
+static int get_false_report_side(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_FALSE_REPORT_SIDE");
+  v = FALSE_REPORT_SIDE_BOTH;
+  if (e != NULL && strcmp(e, "recv") == 0) v = FALSE_REPORT_SIDE_RECV;
+  if (e != NULL && strcmp(e, "send") == 0) v = FALSE_REPORT_SIDE_SEND;
+  return v;
+}
+
+/* 片側だけの食い違い(1本のリンクだけ申告が合わない)の扱い (CLOTH_ATTEST_SINGLE_DISPUTE, 既定 2)。
+ *   0 = 従来: 帰属を破棄する。
+ *   1 = (4a) 食い違ったリンクの時刻は「被疑者に一番有利なほう」を採って検定する。
+ *       hold_fav = min(上流の受領, 本人の送出) - max(下流の送出, 本人の受領)。
+ *       正直なノードには自分の正しい申告が必ず選択肢にあるので、隣人の嘘で冤罪にならない。
+ *       嘘つきは嘘の分しか軽くならない。食い違った標本は null の学習に使わない。
+ *       あわせて「受け取る前に送った」申告(因果違反)を本人の記録が使えない扱いにする。
+ *   2 = 1 に加えて (4b) 外側2人の記録で2人の合計保持を検定し、異常ならペアとして記録、
+ *       (5) 違う相手とのペアが CLOTH_ATTEST_PAIR_MIN_PARTNERS 個以上になったノードを報告する。 */
+static int get_attest_single_dispute(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_SINGLE_DISPUTE");
+  v = 2;
+  if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 0 && t <= 2) v = t; }
+  return v;
+}
+/* (5) の「違う相手」の数のしきい値 (CLOTH_ATTEST_PAIR_MIN_PARTNERS, 既定 2)。 */
+static int get_attest_pair_min_partners(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_PAIR_MIN_PARTNERS");
+  v = 2;
+  if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 1) v = t; }
+  return v;
+}
+/* 送金者の記録を信頼する (CLOTH_ATTEST_TRUST_SENDER, 既定 1。0 で信頼しない)。
+ * 送金者は判定をする本人なので、自分の受領時刻と食い違ったら相手(経路の最初の中継)の
+ * 申告が嘘だと決められる。ペア検定は外側の基準点が無いので送金者を含むペアを扱えない。 */
+static int get_attest_trust_sender(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_TRUST_SENDER");
+  return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
+}
+
+/* 受取人の記録を信頼する (CLOTH_ATTEST_TRUST_RECEIVER, 既定 1。0 で信頼しない)。送金者信頼と対称。
+ * 受取人の送出申告と食い違ったら相手(経路の最後の中継)の受領申告が嘘と決める。 */
+static int get_attest_trust_receiver(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_TRUST_RECEIVER");
+  return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
+}
+
+/* (5) 説明済みのペアを除く (CLOTH_ATTEST_PAIR_EXPLAIN, 既定 1。0 で除かない)。
+ * 相手が個別の検定(従来経路/4a/端点の信頼)で既に報告されていれば、そのペアは相手の保持で
+ * 説明がつくので、こちらの「違う相手」にも割合の分子にも数えない。判定のたびに数え直すので、
+ * 後から相手が確定しても以降の判定ではそのペアが外れる(既に出た報告は取り消さない)。 */
+static int get_attest_pair_explain(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_PAIR_EXPLAIN");
+  return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
+}
+/* (5) 露出で正規化 (CLOTH_ATTEST_PAIR_MIN_RATE, 既定 0.2。0 で使わない)。
+ * ペア記録数 / そのノードの hold 検定数 (warmup 後, 判定時点の累計) がこの値未満なら報告しない。
+ * 正直なハブは通る決済が多いので、相手の数は増えても割合は小さい。 */
+static double get_attest_pair_min_rate(void) {
+  static int init = 0;
+  static double v = 0.2;
+  if (init) return v;
+  init = 1;
+  const char* e = getenv("CLOTH_ATTEST_PAIR_MIN_RATE");
+  if (e != NULL && e[0] != '\0') { double t = atof(e); v = (t > 0.0) ? t : 0.0; }
+  return v;
+}
+
+/* (5) の報告を後から取り消す (CLOTH_ATTEST_PAIR_REVOKE, 既定 0)。
+ * ペアの相手が後から個別の検定で確定したとき、その相手とペアになったノードについて (5) のルール
+ * (説明のつかない相手の数・割合、いずれもその時点の値) を判定し直し、もう満たさなければ
+ * 集計で出した報告を取り消して評判を戻す。本人が個別の検定で確定していれば取り消さない。 */
+static int get_attest_pair_revoke(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_PAIR_REVOKE");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+
+/* (5) 割合の分母から説明済みのペアを除く (CLOTH_ATTEST_PAIR_RATE_EXCL_EXPLAINED, 既定 0)。
+ * 外す処理で分子から除いたペア(相手が個別の検定で確定)は、こちらにとって証拠にも反証にもならない
+ * 決済なので、分母の検定数からもその数だけ引く(ペア1件 ≈ 検定1回)。 */
+static int get_attest_pair_rate_excl(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_PAIR_RATE_EXCL_EXPLAINED");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+
+/* 食い違いをそのままペアの記録にする (CLOTH_ATTEST_DISPUTE_FLAGS, 既定 0)。
+ * もめたときに判定ノードが鍵を預かる方式 (受領証＋エスクロー) のモデル: 受け渡しの食い違いは
+ * 判定ノードへのエスカレーションとして記録に残るので、(4b) のペア検定を経ずに、食い違った
+ * リンクの2人をそのままペアとして (5) の集計に回す。(4b) の代わりに使う(二重計上しない)。
+ * 時刻をずらせる幅の上限 D は嘘の大きさ (CLOTH_FALSE_REPORT_MS) で表す。 */
+static int get_attest_dispute_flags(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ATTEST_DISPUTE_FLAGS");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+
+static void add_pair_partner(struct node* nd, long partner_id) {
+  for (int k = 0; k < nd->pair_partner_count; k++)
+    if (nd->pair_partners[k] == partner_id) { nd->pair_partner_flags[k]++; return; }
+  if (nd->pair_partner_count >= nd->pair_partner_cap) {
+    int cap = (nd->pair_partner_cap == 0) ? 4 : nd->pair_partner_cap * 2;
+    long* p = (long*)realloc(nd->pair_partners, cap * sizeof(long));
+    if (p == NULL) return;
+    nd->pair_partners = p;
+    long* f = (long*)realloc(nd->pair_partner_flags, cap * sizeof(long));
+    if (f == NULL) return;
+    nd->pair_partner_flags = f;
+    nd->pair_partner_cap = cap;
+  }
+  nd->pair_partner_flags[nd->pair_partner_count] = 1;
+  nd->pair_partners[nd->pair_partner_count++] = partner_id;
+}
+
+/* (4b) で合計保持が異常だったペア {a(上流), b(下流)} を記録し、(5) 違う相手との
+ * ペアが規定数に達したメンバーを報告する。env CLOTH_ATTEST_PAIR_LOG=<path> で
+ * ペアを1行ずつ追記する(集計ルールをオフラインで比較するため)。 */
+/* (5) のルール: 説明のつかない相手が K 人以上、かつ (正規化ありなら) その相手とのペア数 / hold 検定数
+ * がしきい値以上。報告するときと取り消しを判定し直すときで同じものを使う。 */
+static int pair_rule_holds(struct network* network, struct node* x, int* n_partners_out, long* n_flags_out) {
+  int explain = get_attest_pair_explain();
+  double min_rate = get_attest_pair_min_rate();
+  int n_partners = 0;
+  long n_flags = 0, n_explained = 0;
+  for (int j = 0; j < x->pair_partner_count; j++) {
+    if (explain) {
+      struct node* y = (struct node*)array_get(network->nodes, x->pair_partners[j]);
+      if (y != NULL && y->hold_reports_main + y->hold_reports_fav > 0) {
+        n_explained += x->pair_partner_flags[j];
+        continue;
+      }
+    }
+    n_partners++;
+    n_flags += x->pair_partner_flags[j];
+  }
+  if (n_partners_out) *n_partners_out = n_partners;
+  if (n_flags_out) *n_flags_out = n_flags;
+  if (n_partners < get_attest_pair_min_partners()) return 0;
+  if (min_rate > 0.0) {
+    long t = x->settle_test_count;
+    if (get_attest_pair_rate_excl()) t -= n_explained;
+    if (t < 1) t = 1;
+    if ((double)n_flags / (double)t < min_rate) return 0;
+  }
+  return 1;
+}
+
+/* 取り消しの判定し直し。集計の報告が残っていて、本人が個別の検定で確定しておらず、
+ * いまの値でルールを満たさなければ、残っている集計の報告を全部取り消す。 */
+static void pair_recheck(struct network* network, struct node* x, struct network_params net_params) {
+  if (x == NULL || x->pair_reports_active <= 0) return;
+  if (x->hold_reports_main + x->hold_reports_fav > 0) return;
+  if (pair_rule_holds(network, x, NULL, NULL)) return;
+  revoke_reports_from_judges(network, x->id, x->pair_reports_active, net_params);
+  x->pair_reports_revoked += x->pair_reports_active;
+  x->pair_reports_active = 0;
+}
+
+static void handle_pair_flag(struct network* network, struct simulation* simulation,
+                             struct payment* payment, struct network_params net_params,
+                             struct node* a, struct node* b, double sum_ms) {
+  add_pair_partner(a, b->id);
+  add_pair_partner(b, a->id);
+  a->pair_flag_count++;
+  b->pair_flag_count++;
+  const char* log_path = getenv("CLOTH_ATTEST_PAIR_LOG");
+  if (log_path != NULL && log_path[0] != '\0') {
+    FILE* f = fopen(log_path, "a");
+    if (f != NULL) {
+      fprintf(f, "%ld,%llu,%ld,%ld,%u,%u,%ld,%ld,%ld,%.0f\n",
+              payment->id, (unsigned long long)simulation->current_time,
+              a->id, b->id, a->is_malicious, b->is_malicious,
+              array_len(a->open_edges), array_len(b->open_edges), payment->grief_hold_node_id, sum_ms);
+      fclose(f);
+    }
+  }
+  struct node* m[2] = { a, b };
+  for (int k = 0; k < 2; k++) {
+    struct node* x = m[k];
+    /* 説明のつかない相手の数と、その相手とのペア記録数 */
+    int n_partners = 0;
+    long n_flags = 0;
+    if (!pair_rule_holds(network, x, &n_partners, &n_flags)) continue;
+    if (x->id == payment->sender || x->id == payment->receiver) continue;
+    if (!is_node_observed_by_judges(network, x->id)) continue;
+    if (has_attack_reporter(payment, x->id)) continue;
+    register_attack_reporter(payment, x->id);
+    if (report_attacked_node_to_judges(network, payment->sender, x->id,
+            payment->id, simulation->current_time, net_params))
+      x->pair_reports_active++;   /* 実際に数えられた報告だけを取り消しの対象にする */
+    x->hold_reports_pair++;
+    /* 診断ログ (env CLOTH_ATTEST_PAIR_REPORT_LOG=<path>): 集計で報告した時点の判定材料。
+     * payment_id,time,node,is_mal,deg,tests,n_partners(説明なし),n_flags(説明なし),相手の内訳
+     * 相手の内訳 = id:ペア数:個別検定で報告済みか を ; 区切り */
+    const char* rlog = getenv("CLOTH_ATTEST_PAIR_REPORT_LOG");
+    if (rlog != NULL && rlog[0] != '\0') {
+      FILE* rf = fopen(rlog, "a");
+      if (rf != NULL) {
+        fprintf(rf, "%ld,%llu,%ld,%u,%ld,%ld,%d,%ld,", payment->id,
+                (unsigned long long)simulation->current_time, x->id, x->is_malicious,
+                array_len(x->open_edges), x->settle_test_count, n_partners, n_flags);
+        for (int j = 0; j < x->pair_partner_count; j++) {
+          struct node* y = (struct node*)array_get(network->nodes, x->pair_partners[j]);
+          int conf = (y != NULL && y->hold_reports_main + y->hold_reports_fav > 0);
+          fprintf(rf, "%s%ld:%ld:%d", (j > 0) ? ";" : "", x->pair_partners[j],
+                  x->pair_partner_flags[j], conf);
+        }
+        fprintf(rf, "\n");
+        fclose(rf);
+      }
+    }
+  }
+}
+
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
  * dir: +1 = 「遅く受け取った」方向に盛る, -1 = 「早く送った」方向に盛る。
  * 保持者は「遅く受け取って、すぐ送った」と偽ることで見かけの保持時間を 2X 縮める。
  * pm == NULL を渡すと嘘は乗らない(時計オフセットのみ)。 */
 static uint64_t reported_time(struct node* nd, struct payment* pm, uint64_t true_time, int dir) {
   long adj = node_clock_offset(nd != NULL ? nd->id : 0);
-  if (lies_on_this_payment(nd, pm)) adj += dir * get_false_report_ms();
+  if (lies_on_this_payment(nd, pm)) {
+    int side = get_false_report_side();
+    if (side == FALSE_REPORT_SIDE_BOTH ||
+        (side == FALSE_REPORT_SIDE_RECV && dir > 0) ||
+        (side == FALSE_REPORT_SIDE_SEND && dir < 0))
+      adj += dir * get_false_report_ms();
+  }
   long t = (long)true_time + adj;
   return (t < 0) ? 0 : (uint64_t)t;
 }
@@ -1495,6 +1737,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
        * までの時間 = i+1 自身の保持時間 = (B)の settle_delay と同量) を各ペアで検定する。
        * 往復差分と違い順方向ホップのばらつきが混入しないためベースライン分散が膨らまず、
        * 保持者の取りこぼしが起きない。各異常ノード(=保持者)を報告(1決済1ノード dedup)。 */
+      int anom_pos = -1;   /* この決済で直前に異常と判定した経路位置 (ペア検定の「説明済み」判定用) */
       for (int i = 0; i + 1 < nh; i++) {
           if (i + 1 >= payment->hop_settle_recv_capacity) break;
           uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
@@ -1545,6 +1788,12 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           struct node* dn_node = (struct node*)array_get(network->nodes, hop_dn->from_node_id);
           if (dn_node == NULL) continue;
           long cand = hop_dn->from_node_id;   /* 攻撃者候補 = 下流ノード本人(保持者) */
+          int fav_test = 0;                   /* (4a) 片側の食い違いを被疑者に有利な時刻で検定した */
+          int dispute_up = 0, dispute_dn = 0; /* (4a) のとき食い違ったリンク */
+          uint64_t sb_dn_anchor = 0;          /* 下流の送出申告 (ペア検定の下側の基準点) */
+          struct node* up_node_p = NULL;
+          int diag_p_silent = 0;              /* 診断ログ用: 本人の記録を使えない扱いにした */
+          long esc_d1 = 0;                    /* 上側リンク (i, i+1) の食い違いの大きさ (エスカレーション) */
 
           /* === 相互証明モード (CLOTH_REPORT_ATTEST=1) ===========================
            * 被疑ノード p(=位置 i+1) 自身の申告を一切使わず、両隣の申告だけで
@@ -1564,6 +1813,13 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               uint64_t rd2   = payment->hop_settle_recv_times[i + 1]; /* p 自身の受領申告 */
               if (sb_dn == 0) continue;            /* 隣人(下流)の記録が無ければ帰属不能 */
               int p_silent = (sb_p == 0 || rd2 == 0 || accused_unusable);
+              int sd_pol = get_attest_single_dispute();
+              /* 因果違反: 本人の申告が「受け取る前に送った」になっている = 本人の記録は使えない。
+               * 送出時刻だけを早く偽る嘘は入れ子制約(受領側)に掛からないので、ここで受ける。 */
+              if (sd_pol >= 1 && !p_silent && sb_p <= rd2) {
+                  p_silent = 1;
+                  dn_node->causality_violation_count++;
+              }
               /* 本人の記録が無い/入れ子違反で信用できない = 突き合わせはできないが帰属は成立する */
               if (p_silent && !get_attest_silence_policy()) continue;  /* 旧実装: 逃がす */
               long tol = get_attest_tolerance_ms();
@@ -1571,10 +1827,27 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               struct route_hop* hop_dn2 = (struct route_hop*)array_get(payment->route->route_hops, i + 2);
               struct node* dn2_node = (hop_dn2 != NULL)
                   ? (struct node*)array_get(network->nodes, hop_dn2->from_node_id) : NULL;
+              up_node_p = up_node;
+              sb_dn_anchor = sb_dn;
               /* リンク(p-1,p): 上流の受領申告 vs p の送信申告 (同一イベント) */
               long d1 = (long)ru - (long)sb_p;  if (d1 < 0) d1 = -d1;
               /* リンク(p,p+1): p の受領申告 vs 下流の送信申告 (同一イベント) */
               long d2 = (long)rd2 - (long)sb_dn; if (d2 < 0) d2 = -d2;
+              if (d1 > tol) esc_d1 = d1;
+              /* 送金者(i==0 の上流)は判定をする本人なので自分の受領時刻を信頼する。
+               * 食い違えば p の送信申告が嘘と決まるので、p の記録を使えない扱いにして帰属を続ける。 */
+              if (!p_silent && i == 0 && d1 > tol && get_attest_trust_sender()) {
+                  if (up_node) up_node->attest_dispute_count++;
+                  dn_node->attest_dispute_count++;
+                  p_silent = 1;
+              }
+              /* 受取人(i+2 == nh の下流)も同様に信頼すると、p の受領申告の嘘が決まる。 */
+              if (!p_silent && i + 2 == nh && d2 > tol && get_attest_trust_receiver()) {
+                  dn_node->attest_dispute_count++;
+                  if (dn2_node) dn2_node->attest_dispute_count++;
+                  p_silent = 1;
+              }
+              diag_p_silent = p_silent;
               if (p_silent) {
                   /* 突き合わせはできないが、両隣の記録だけで帰属は成立する。
                    * 黙秘そのものを証拠として計上し、帰属は続行する。 */
@@ -1590,10 +1863,22 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                                   dn_node->attest_dispute_count++; }
                   if (d2 > tol) { dn_node->attest_dispute_count++;
                                   if (dn2_node) dn2_node->attest_dispute_count++; }
-                  continue;   /* 不一致リンクからは帰属しない */
+                  if (sd_pol == 0) continue;   /* 従来: 不一致リンクからは帰属しない */
+                  /* (4a) 食い違ったリンクの時刻は p に一番有利なほうを採る:
+                   *   上端(p が上流へ渡した時刻) = 早いほう, 下端(p が受け取った時刻) = 遅いほう。
+                   * 正直な p なら自分の正しい申告が選ばれるので隣人の嘘では膨らまない。 */
+                  dispute_up = (d1 > tol);
+                  dispute_dn = (d2 > tol);
+                  uint64_t upper = (ru < sb_p) ? ru : sb_p;
+                  uint64_t lower = (sb_dn > rd2) ? sb_dn : rd2;
+                  if (upper <= lower) continue;
+                  settle_lat = (double)(upper - lower);
+                  fav_test = 1;
               }
-              if (ru <= sb_dn) continue;
-              settle_lat = (double)(ru - sb_dn);   /* 両隣の申告のみで構成 */
+              if (!fav_test) {
+                  if (ru <= sb_dn) continue;
+                  settle_lat = (double)(ru - sb_dn);   /* 両隣の申告のみで構成 */
+              }
           }
           if (getenv("CLOTH_HOLD_RT_DEBUG") && payment->grief_hold_node_id >= 0) {
               FILE* _f = fopen("/tmp/holdrt_debug.csv", "a");
@@ -1602,16 +1887,83 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                   payment->grief_hold_node_id, (cand == payment->grief_hold_node_id) ? 1 : 0, settle_lat);
                   fclose(_f); }
           }
-          /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。 */
-          int should_report = on_hold_hypothesis_test(
-              dn_node, settle_lat,
-              detector_in_warmup(payment, (long)simulation->processed_payments), avg_iv, nh);
+          /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。
+           * (4a) の標本は片方が嘘なので学習しない版で検定する。 */
+          int should_report = fav_test
+              ? on_hold_hypothesis_test_nolearn(
+                    dn_node, settle_lat,
+                    detector_in_warmup(payment, (long)simulation->processed_payments), avg_iv, nh)
+              : on_hold_hypothesis_test(
+                    dn_node, settle_lat,
+                    detector_in_warmup(payment, (long)simulation->processed_payments), avg_iv, nh);
           if (should_report && cand != payment->sender && cand != payment->receiver &&
               is_node_observed_by_judges(network, cand) &&
               !has_attack_reporter(payment, cand)) {   /* dedup: 同一決済で同一ノードは1回 */
               register_attack_reporter(payment, cand); /* dedup キーとして保持者を記録 */
               report_attacked_node_to_judges(network, hop_up->from_node_id, cand,
                   payment->id, simulation->current_time, net_params);
+              int newly_confirmed = (dn_node->hold_reports_main + dn_node->hold_reports_fav == 0);
+              if (fav_test) dn_node->hold_reports_fav++; else dn_node->hold_reports_main++;
+              /* このノードが初めて個別の検定で確定した: これとペアになったノードの集計の報告を見直す */
+              if (newly_confirmed && get_attest_pair_revoke()) {
+                  for (int j = 0; j < dn_node->pair_partner_count; j++)
+                      pair_recheck(network,
+                          (struct node*)array_get(network->nodes, dn_node->pair_partners[j]), net_params);
+              }
+          }
+          if (should_report) anom_pos = i + 1;
+
+          /* 診断ログ (env CLOTH_ATTEST_DIAG_LOG=<path>): warmup 後に実際に保持遅延が入った決済で、
+           * 被疑者か上流が保持者である評価を1行ずつ書く。位置別・端点別の内訳を出すため。 */
+          {
+              const char* dlog = getenv("CLOTH_ATTEST_DIAG_LOG");
+              long holder = payment->grief_hold_node_id;
+              if (dlog != NULL && dlog[0] != '\0' && holder >= 0 &&
+                  payment->attack_delay_event_count > 0 &&
+                  !detector_in_warmup(payment, (long)simulation->processed_payments) &&
+                  (cand == holder || hop_up->from_node_id == holder)) {
+                  FILE* df = fopen(dlog, "a");
+                  if (df != NULL) {
+                      fprintf(df, "%ld,%d,%d,%ld,%ld,%ld,%ld,%d,%d,%d,%d,%.0f,%d\n",
+                          payment->id, nh, i + 1, cand, hop_up->from_node_id, holder,
+                          (dn_node->open_edges != NULL) ? array_len(dn_node->open_edges) : 0,
+                          diag_p_silent, fav_test, dispute_up, dispute_dn, settle_lat, should_report);
+                      fclose(df);
+                  }
+              }
+          }
+
+          /* (4b) 有利な時刻でも正常に見えた = 嘘が保持時間のほとんどを隣へ付け替えた可能性。
+           * 食い違ったリンクの両端 {i, i+1} の合計保持を、2人の外側の記録
+           * (i-1 の受領申告と i+2 の送出申告) だけで測って検定する。合計は2人の間の
+           * 付け替えでは動かないので、異常なら「2人のどちらか」が保持したと確定する。
+           * 下側リンク(p, p+1)の食い違いは次の反復で p+1 の上側リンクとして扱う。 */
+          /* 食い違いの記録 (エスクロー方式): 上側リンク (i, i+1) が食い違っていれば、その2人をペアとして
+           * 記録する。送金者とのリンク (i == 0) は送金者の信頼で決着済み、受取人とのリンクは被疑者の
+           * 下側なのでここには来ない。warmup 中は記録しない (warmup でも予約された保持者は嘘をつくが
+           * 割合の分母は warmup 後の検定数なので)。この決済で既に報告されたノードを含むなら説明済み。 */
+          if (get_attest_dispute_flags() && esc_d1 > 0 && i >= 1 && up_node_p != NULL &&
+              !should_report && anom_pos != i &&
+              !detector_in_warmup(payment, (long)simulation->processed_payments)) {
+              handle_pair_flag(network, simulation, payment, net_params, up_node_p, dn_node, (double)esc_d1);
+          }
+          if (fav_test && !should_report && get_attest_single_dispute() >= 2 && !get_attest_dispute_flags()) {
+              if (dispute_up && anom_pos != i) {   /* 上流 i が既に異常判定なら説明済み */
+                  if (i == 0 || up_node_p == NULL) {
+                      dn_node->pair_endpoint_skips++;   /* 相手が送金者: 外側の基準点が無い */
+                  } else {
+                      uint64_t anchor_up = payment->hop_settle_recv_times[i - 1];
+                      if (anchor_up > sb_dn_anchor &&
+                          on_hold_pair_test(up_node_p, dn_node, (double)(anchor_up - sb_dn_anchor),
+                              detector_in_warmup(payment, (long)simulation->processed_payments),
+                              avg_iv, nh)) {
+                          handle_pair_flag(network, simulation, payment, net_params,
+                                           up_node_p, dn_node, (double)(anchor_up - sb_dn_anchor));
+                      }
+                  }
+              }
+              if (dispute_dn && i + 2 == nh)
+                  dn_node->pair_endpoint_skips++;       /* 相手が受取人: 外側の基準点が無い */
           }
       }
   }

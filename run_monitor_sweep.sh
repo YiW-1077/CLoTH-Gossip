@@ -48,6 +48,8 @@ ATTACK_SUCCESS_RATE=1.0         # 悪意ノードを通った決済が攻撃さ�
 #                      受領時刻 +X / 送出時刻 -X と偽り見かけの保持を 2X 縮める。
 #                      目安: 50 = 冤罪を出せる最小値、100超で入れ子制約が破れ始める
 #   FALSE_REPORT_PROB  嘘をつく確率 [0,1]。1.0 = 攻撃のたびに毎回
+#   FALSE_REPORT_SIDE  偽る側 both(受領も送出も) / recv(受領だけ遅く) / send(送出だけ早く)。
+#                      片側だけだと食い違うリンクが1本になり、2本ルールでは本人と断定できない
 #   SILENT_REPORT_PROB 攻撃者が自分の時刻記録を提出しない(黙秘)確率 [0,1]
 #   CLOCK_SKEW_MS      各ノードの固定時計オフセット幅[ms] (-E..+E)
 #   ATTACK_DELAY_DIST  注入遅延の分布 fixed(一律) / lognormal / exponential / pareto / uniform
@@ -57,6 +59,7 @@ ATTACK_SUCCESS_RATE=1.0         # 悪意ノードを通った決済が攻撃さ�
 #               黙秘=SILENT_REPORT_PROB=1.0 / 現実寄り=ATTACK_DELAY_DIST=lognormal
 FALSE_REPORT_MS=0
 FALSE_REPORT_PROB=1.0
+FALSE_REPORT_SIDE=both
 SILENT_REPORT_PROB=0
 CLOCK_SKEW_MS=0
 ATTACK_DELAY_DIST=fixed
@@ -67,13 +70,26 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 # --- [4] 検知方式 -----------------------------------------------------------
 #   REPORT_ATTEST  1 = 相互証明（既定）。帰属に被疑ノード自身の申告を使わず
 #                      hold[p] = recv[p-1] - send_back[p+1] と両隣の申告だけで構成する。
-#                      偽報告(嘘・黙秘)に不感。
+#                      両側の嘘・黙秘に不感。片側だけの嘘は下の ATTEST_SINGLE_DISPUTE 以下で扱う。
 #                  0 = 旧方式(被疑者の申告 RT を使う)。⚠️偽報告に破綻する
 #                      (嘘100msで冤罪152件・precision42%、黙秘100%で recall16%)。
 #                      過去結果の再現時のみ 0 にすること。
 #   ATTEST_SILENCE_POLICY 1 = 欠測(黙秘)・入れ子違反を「被疑者の記録が使えない」扱いにして帰属続行
 #   ATTEST_DISPUTE_POLICY 1 = 被疑者の2本のリンクが両方食い違えば原因を被疑者と断定して帰属続行
-#                             (片方だけの食い違いは冤罪防止のため破棄)
+#   ATTEST_SINGLE_DISPUTE 片方のリンクだけ食い違うとき(片側だけの嘘)の扱い。2026-10-09 既定 2。
+#                         0 = 帰属を破棄(旧。⚠️片側の嘘で recall 0%)
+#                         1 = (4a) 食い違ったリンクは被疑者に一番有利な時刻を採って検定(冤罪にならない)
+#                         2 = 1 + (4b) 外側2人の記録で2人の合計保持を検定しペアとして記録
+#                             + (5) 決済をまたいで違う相手 PAIR_MIN_PARTNERS 人以上のノードを報告
+#   ATTEST_TRUST_SENDER / ATTEST_TRUST_RECEIVER 1 = 送金者/受取人の記録を信頼し、端の中継の嘘を決める
+#                         (受取人信頼は仮定: シミュの受取人は嘘をつかない)
+#   ATTEST_PAIR_EXPLAIN   1 = 相手が個別の検定で報告済みのペアは(5)で数えない(外す処理)
+#   ATTEST_PAIR_MIN_RATE  (5) で ペア記録数/hold検定数 がこの値未満なら報告しない(正規化)。0 で無効
+#       片側の嘘 100ms・n=3200・新シード: recall 60-70%・FP 0-1 (result/single_dispute_20261008)
+#   以下は検証用の追加ノブ(既定0=OFF)。ログに残すため明示的に渡す。
+#   ATTEST_PAIR_REVOKE    1 = 相手が後から個別検定で確定したら (5) の報告を取り消して評判を戻す
+#   ATTEST_PAIR_RATE_EXCL_EXPLAINED 1 = 割合の分母から説明済みのペア数を引く
+#   ATTEST_DISPUTE_FLAGS  1 = 食い違ったリンクをそのままペア記録にする(エスクロー方式のモデル, 4b の代わり)
 #   SETTLE_DEGREE_SIGMA / SETTLE_DEGREE_MIN
 #       hold検知の次数σ膨張（ヒンジ型） σ_eff = σ·(1 + k·ln(1 + max(0, d−D)))
 #       次数 D 以下は膨張ゼロ。D=0 でヒンジ導入前の連続な ln(1+d) に戻る。
@@ -84,6 +100,15 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 REPORT_ATTEST=1
 ATTEST_SILENCE_POLICY=1
 ATTEST_DISPUTE_POLICY=1
+ATTEST_SINGLE_DISPUTE=2
+ATTEST_TRUST_SENDER=1
+ATTEST_TRUST_RECEIVER=1
+ATTEST_PAIR_MIN_PARTNERS=2
+ATTEST_PAIR_EXPLAIN=1
+ATTEST_PAIR_MIN_RATE=0.2
+ATTEST_PAIR_REVOKE=0
+ATTEST_PAIR_RATE_EXCL_EXPLAINED=0
+ATTEST_DISPUTE_FLAGS=0
 SETTLE_DEGREE_SIGMA=0.20
 SETTLE_DEGREE_MIN=150
 SETTLE_VAR_INIT=
@@ -194,13 +219,14 @@ echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=hold-to-timeout 2=hold 3
 # 攻撃モデル(偽報告・黙秘・時計ずれ・遅延分布)を全モードへ継承。値は設定ブロック[3]。
 export CLOTH_FALSE_REPORT_MS="$FALSE_REPORT_MS"
 export CLOTH_FALSE_REPORT_PROB="$FALSE_REPORT_PROB"
+export CLOTH_FALSE_REPORT_SIDE="$FALSE_REPORT_SIDE"
 export CLOTH_SILENT_REPORT_PROB="$SILENT_REPORT_PROB"
 export CLOTH_CLOCK_SKEW_MS="$CLOCK_SKEW_MS"
 export CLOTH_ATTACK_DELAY_DIST="$ATTACK_DELAY_DIST"
 export CLOTH_ATTACK_DELAY_SIGMA="$ATTACK_DELAY_SIGMA"
 if [ "$FALSE_REPORT_MS" != "0" ] || [ "$SILENT_REPORT_PROB" != "0" ] || \
    [ "$CLOCK_SKEW_MS" != "0" ] || [ "$ATTACK_DELAY_DIST" != "fixed" ]; then
-    echo "[Config] ⚠️攻撃モデル拡張ON: 嘘=${FALSE_REPORT_MS}ms(確率${FALSE_REPORT_PROB}) 黙秘=${SILENT_REPORT_PROB} 時計ずれ=${CLOCK_SKEW_MS}ms 遅延分布=${ATTACK_DELAY_DIST}(σ=${ATTACK_DELAY_SIGMA})"
+    echo "[Config] ⚠️攻撃モデル拡張ON: 嘘=${FALSE_REPORT_MS}ms(確率${FALSE_REPORT_PROB}, 側=${FALSE_REPORT_SIDE}) 黙秘=${SILENT_REPORT_PROB} 時計ずれ=${CLOCK_SKEW_MS}ms 遅延分布=${ATTACK_DELAY_DIST}(σ=${ATTACK_DELAY_SIGMA})"
 else
     echo "[Config] 攻撃モデル: 偽報告なし/黙秘なし/時計ずれなし/遅延は一律(fixed) ※既定"
 fi
@@ -230,13 +256,17 @@ else
     # (次数>=150)には厚い保護を同時に与える。D=0 でヒンジ導入前の挙動に戻る。
     DETECT_ENV_DEFENSE="CLOTH_SETTLE_DEGREE_SIGMA=$SETTLE_DEGREE_SIGMA CLOTH_SETTLE_DEGREE_MIN=$SETTLE_DEGREE_MIN"
     # 2026-10-06: 報告の帰属は既定で**相互証明**(被疑者自身の申告を使わない)。
-    # 偽報告(嘘・黙秘)に不感。旧方式に戻すには env CLOTH_REPORT_ATTEST=0。
+    # 両側の嘘・黙秘に不感。旧方式に戻すには env CLOTH_REPORT_ATTEST=0。
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_REPORT_ATTEST=$REPORT_ATTEST"
     # 相互証明の2ポリシー(いずれも既定1)。コード側の既定に任せるとログに残らず、
     # 後から「どの版で回したか」が追えないので明示的に渡して記録する。
     #   SILENCE_POLICY: 欠測(黙秘)・入れ子違反を「被疑者の記録が使えない」扱いにして帰属続行
     #   DISPUTE_POLICY: 2本のリンクが両方食い違えば共通点=被疑者と断定して帰属続行
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_SILENCE_POLICY=$ATTEST_SILENCE_POLICY CLOTH_ATTEST_DISPUTE_POLICY=$ATTEST_DISPUTE_POLICY"
+    # 片側だけの嘘への対策 (2026-10-09 既定化)。同じく明示的に渡して記録する。
+    DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_SINGLE_DISPUTE=$ATTEST_SINGLE_DISPUTE CLOTH_ATTEST_TRUST_SENDER=$ATTEST_TRUST_SENDER CLOTH_ATTEST_TRUST_RECEIVER=$ATTEST_TRUST_RECEIVER"
+    DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_PAIR_MIN_PARTNERS=$ATTEST_PAIR_MIN_PARTNERS CLOTH_ATTEST_PAIR_EXPLAIN=$ATTEST_PAIR_EXPLAIN CLOTH_ATTEST_PAIR_MIN_RATE=$ATTEST_PAIR_MIN_RATE"
+    DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_PAIR_REVOKE=$ATTEST_PAIR_REVOKE CLOTH_ATTEST_PAIR_RATE_EXCL_EXPLAINED=$ATTEST_PAIR_RATE_EXCL_EXPLAINED CLOTH_ATTEST_DISPUTE_FLAGS=$ATTEST_DISPUTE_FLAGS"
     [ -n "$SETTLE_VAR_INIT" ] && DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_SETTLE_VAR_INIT=$SETTLE_VAR_INIT"
     echo "[Config] hold検知=対数正規z検定+次数σ膨張(ヒンジ型)+相互証明帰属 (防御モードのみ): $DETECT_ENV_DEFENSE"
 fi

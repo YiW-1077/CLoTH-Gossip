@@ -832,7 +832,27 @@ void share_judge_information_and_update_reputation(
     }
 }
 
-void report_attacked_node_to_judges(
+/* 罰を掛けるのに要る報告数 (env CLOTH_REPORTS_REQUIRED, 既定 2)。報告と取り消しで共有する。 */
+static int get_reports_required(void) {
+    int v = 2;
+    const char* env = getenv("CLOTH_REPORTS_REQUIRED");
+    if (env != NULL) { int t = atoi(env); if (t >= 1) v = t; }
+    return v;
+}
+
+/* 報告で実際に引いた評判罰を台帳に積む (取り消し時の返金用)。 */
+static void push_rep_penalty(struct node* nd, double applied) {
+    if (nd->rep_penalty_n >= nd->rep_penalty_cap) {
+        int cap = (nd->rep_penalty_cap == 0) ? 4 : nd->rep_penalty_cap * 2;
+        double* p = (double*)realloc(nd->rep_penalty_ledger, cap * sizeof(double));
+        if (p == NULL) return;
+        nd->rep_penalty_ledger = p;
+        nd->rep_penalty_cap = cap;
+    }
+    nd->rep_penalty_ledger[nd->rep_penalty_n++] = applied;
+}
+
+int report_attacked_node_to_judges(
     struct network* network,
     long reporter_node_id,
     long attacked_node_id,
@@ -841,16 +861,16 @@ void report_attacked_node_to_judges(
     struct network_params net_params
 ) {
     if (network == NULL || !net_params.judging_strategy || !net_params.enable_reputation_system) {
-        return;
+        return 0;
     }
 
     if (attacked_node_id < 0 || attacked_node_id >= array_len(network->nodes)) {
-        return;
+        return 0;
     }
 
     struct node* attacked_node = (struct node*)array_get(network->nodes, attacked_node_id);
     if (attacked_node == NULL) {
-        return;
+        return 0;
     }
 
     if (cloth_debug_enabled())
@@ -865,11 +885,7 @@ void report_attacked_node_to_judges(
      * FP(正常ハブの単発誤報告, 報告中央=1)を落とし precision を上げる主レバー。
      * ⚠️ 検知フラグ閾値 (cloth.c CLOTH_FLAG_MIN_REPORTS=1) とは意図的に乖離:
      * 報告1件で「検知」には数えるが罰は2件目から。詳細は cloth.c 側コメント参照。 */
-    int REPORTS_REQUIRED = 2;
-    {
-        const char* env = getenv("CLOTH_REPORTS_REQUIRED");
-        if (env != NULL) { int v = atoi(env); if (v >= 1) REPORTS_REQUIRED = v; }
-    }
+    int REPORTS_REQUIRED = get_reports_required();
 
     /* Increment the report counter (represents independent reports received) */
     attacked_node->malicious_reports++;
@@ -899,11 +915,13 @@ void report_attacked_node_to_judges(
             printf("[Judging] applying scaled penalty to node=%ld degree=%ld scale=%.4f base_penalty=%.4f scaled_penalty=%.4f\n",
                    attacked_node_id, degree, degree_scale, net_params.reputation_penalty_on_detection, scaled_penalty);
 
+        double rep_before = attacked_node->reputation_score;
         update_node_reputation_on_detection(
             attacked_node,
             scaled_penalty,
             timestamp
         );
+        push_rep_penalty(attacked_node, rep_before - attacked_node->reputation_score);
 
         /* 検知トリガの代役配置(env CLOTH_SUBSTITUTE_ON_DETECTION): このノードが
          * REPORTS_REQUIRED に達して「悪意と判断」された(=評判罰=回避開始)時点で、
@@ -915,6 +933,36 @@ void report_attacked_node_to_judges(
                 activate_substitute_for_hub(network, attacked_node_id);
         }
     }
+    return 1;
+}
+
+void revoke_reports_from_judges(
+    struct network* network,
+    long node_id,
+    long n_revoke,
+    struct network_params net_params
+) {
+    if (network == NULL || !net_params.judging_strategy || !net_params.enable_reputation_system) return;
+    if (n_revoke <= 0 || node_id < 0 || node_id >= array_len(network->nodes)) return;
+    struct node* nd = (struct node*)array_get(network->nodes, node_id);
+    if (nd == NULL) return;
+    int R = get_reports_required();
+    long m_old = nd->malicious_reports;
+    long m_new = m_old - n_revoke;
+    if (m_new < 0) m_new = 0;
+    /* 成立しなくなった罰のバッチ分を新しい順に返金する。順序まで厳密には戻らない
+     * (fail 検知器の報告も同じ数に入るので、どの報告がどのバッチを満たしたかは区別しない)。 */
+    long lost = m_old / R - m_new / R;
+    double refund = 0.0;
+    for (long k = 0; k < lost && nd->rep_penalty_n > 0; k++)
+        refund += nd->rep_penalty_ledger[--nd->rep_penalty_n];
+    nd->reputation_score += refund;
+    if (nd->reputation_score > 1.0) nd->reputation_score = 1.0;
+    nd->malicious_reports = (int)m_new;
+    if (m_new == 0) nd->first_detection_time = 0;
+    if (cloth_debug_enabled())
+        printf("[Judging] revoked %ld reports on node=%ld refund=%.4f new_rep=%.4f\n",
+               n_revoke, node_id, refund, nd->reputation_score);
 }
 
 /**
@@ -1171,13 +1219,34 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
  * settlement レグの転送レイテンシ(=preimage保持時間)を対数正規 null で検定する。
  * 入力は (ノード, 観測レイテンシ, warmup 判定, seed) のみで、そのノードが hold 型攻撃者
  * かどうかの事前ラベル (payment->grief_hold_node_id / node->is_malicious) は渡らない。
- * forward_success を処理する全ノードが同じ検定を受ける。 */
-int on_hold_hypothesis_test(
+ * forward_success を処理する全ノードが同じ検定を受ける。
+ * learn=0 は「判定はするが学習しない」版: 正常判定でも baseline を更新せず、
+ * suspicion も減らさない。申告が食い違った標本(片方は嘘)を null の学習に混ぜないため。 */
+static double hold_sigma_eff(const struct node* node, double sd, int n_hops) {
+    double sigma_eff = sd;
+    double inflate = 1.0;
+    double k_deg = get_hold_degree_sigma();
+    if (k_deg > 0.0) {
+        long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
+        double excess = (double)deg - get_hold_degree_min();
+        if (excess < 0.0) excess = 0.0;
+        inflate += k_deg * log(1.0 + excess);
+    }
+    double k_hop = get_hold_hop_sigma();
+    if (k_hop > 0.0 && n_hops > 0) {
+        inflate += k_hop * log(1.0 + (double)n_hops);
+    }
+    sigma_eff *= inflate;
+    return sigma_eff;
+}
+
+static int hold_test_impl(
     struct node* node,
     double settle_latency_ms,
     int in_warmup,
     double expected_settle_ms,
-    int n_hops
+    int n_hops,
+    int learn
 ) {
     if (node == NULL || settle_latency_ms <= 0.0) return 0;
 
@@ -1204,6 +1273,7 @@ int on_hold_hypothesis_test(
      * quantile モードでは warmup のクリーン(攻撃非アクティブ)サンプルで per-node の
      * (1-α)分位点 settle_anom_q も RM 学習する(post-warmup は凍結=保持サンプルで汚染しない)。 */
     if (in_warmup) {   /* detector_in_warmup() の結果 (既定 payment->is_warmup) */
+        if (!learn) return 0;
         update_hold_baseline_lognormal(node, settle_latency_ms);
         if (settle_qmode) {
             double log_lat = log(settle_latency_ms + 1.0);
@@ -1233,20 +1303,7 @@ int on_hold_hypothesis_test(
          * 次数項はヒンジ型 max(0, deg-D) で、D 以下のノードは膨張ゼロ=生σのまま。
          * さらに経路長σ膨張 (k_hop, 既定0=無効) を加算できる。両者は「多重検定の
          * 露出」を次数で測るか経路長(=1決済が生む検定回数)で測るかの違い。 */
-        double sigma_eff = sd;
-        double inflate = 1.0;
-        double k_deg = get_hold_degree_sigma();
-        if (k_deg > 0.0) {
-            long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
-            double excess = (double)deg - get_hold_degree_min();
-            if (excess < 0.0) excess = 0.0;
-            inflate += k_deg * log(1.0 + excess);
-        }
-        double k_hop = get_hold_hop_sigma();
-        if (k_hop > 0.0 && n_hops > 0) {
-            inflate += k_hop * log(1.0 + (double)n_hops);
-        }
-        sigma_eff *= inflate;
+        double sigma_eff = hold_sigma_eff(node, sd, n_hops);
         double p_value = calculate_p_value_log_normal(
             settle_latency_ms, node->settle_baseline_mean, sigma_eff);
         anomalous = (p_value < p_threshold);
@@ -1271,11 +1328,48 @@ int on_hold_hypothesis_test(
     if (anomalous) {
         node->settle_suspicion++;
         if (node->settle_suspicion >= report_strikes) should_report = 1;
-    } else {
+    } else if (learn) {
         if (node->settle_suspicion > 0) node->settle_suspicion--;
         update_hold_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
     }
     return should_report;
+}
+
+int on_hold_hypothesis_test(struct node* node, double settle_latency_ms, int in_warmup,
+                            double expected_settle_ms, int n_hops) {
+    return hold_test_impl(node, settle_latency_ms, in_warmup, expected_settle_ms, n_hops, 1);
+}
+
+int on_hold_hypothesis_test_nolearn(struct node* node, double settle_latency_ms, int in_warmup,
+                                    double expected_settle_ms, int n_hops) {
+    return hold_test_impl(node, settle_latency_ms, in_warmup, expected_settle_ms, n_hops, 0);
+}
+
+/* 2人の合計保持時間の検定 (CLOTH_ATTEST_SINGLE_DISPUTE=2)。See monitoring.h.
+ * null の平均は2人の baseline 平均(線形)の和、σ は2人の σ_eff の大きいほう
+ * (和の対数は個々より裾が狭いので保守側)。状態は一切変えない。z検定モードのみ。 */
+int on_hold_pair_test(struct node* a, struct node* b, double sum_ms, int in_warmup,
+                      double expected_settle_ms, int n_hops) {
+    if (a == NULL || b == NULL || sum_ms <= 0.0 || in_warmup) return 0;
+    if (get_hold_null_quantile_mode()) return 0;
+    double seed_mu = log(((expected_settle_ms > 0.0) ? expected_settle_ms : 100.0) + 1.0);
+    double var_init = 0.01;
+    const char* e = getenv("CLOTH_SETTLE_VAR_INIT");
+    if (e != NULL) { double v = atof(e); if (v > 0.0) var_init = v; }
+    struct node* m[2] = { a, b };
+    double mean_sum = 0.0, sigma = 0.0;
+    for (int k = 0; k < 2; k++) {
+        int init = (m[k]->settle_baseline_mean != 0.0);
+        double mu  = init ? m[k]->settle_baseline_mean : seed_mu;
+        double var = init ? m[k]->settle_baseline_var  : var_init;
+        double sd = sqrt(var); if (sd < 1e-6) sd = 0.1;
+        double s = hold_sigma_eff(m[k], sd, n_hops);
+        if (s > sigma) sigma = s;
+        mean_sum += exp(mu) - 1.0;
+    }
+    if (mean_sum <= 0.0) return 0;
+    double p_value = calculate_p_value_log_normal(sum_ms, log(mean_sum + 1.0), sigma);
+    return (p_value < get_pvalue_threshold());
 }
 
 /* === Attack Report Tracking: per-payment reporter registry === */

@@ -44,6 +44,21 @@ struct node* new_node(long id) {
   node->attest_dispute_count = 0;
   node->nesting_violation_count = 0;
   node->silence_count = 0;
+  node->causality_violation_count = 0;
+  node->pair_flag_count = 0;
+  node->pair_partners = NULL;
+  node->pair_partner_flags = NULL;
+  node->pair_partner_count = 0;
+  node->pair_partner_cap = 0;
+  node->pair_endpoint_skips = 0;
+  node->hold_reports_main = 0;
+  node->hold_reports_fav = 0;
+  node->hold_reports_pair = 0;
+  node->pair_reports_active = 0;
+  node->pair_reports_revoked = 0;
+  node->rep_penalty_ledger = NULL;
+  node->rep_penalty_n = 0;
+  node->rep_penalty_cap = 0;
   node->last_movement_time = 0;     // Not yet moved
   node->first_attack_time = 0;
   node->first_detection_time = 0;
@@ -1491,6 +1506,9 @@ void free_network(struct network* network){
         for(struct element* iterator = (struct element *) n->results; iterator != NULL; iterator = iterator->next){
             list_free(iterator->data);
         }
+        free(n->pair_partners);
+        free(n->pair_partner_flags);
+        free(n->rep_penalty_ledger);
         free(n);
     }
     for(uint64_t i = 0; array_len(network->edges); i++){

@@ -51,6 +51,22 @@ struct node {
   long attest_dispute_count;        // 相互証明の突き合わせ不一致に関与した回数 (偽報告の痕跡)
   long nesting_violation_count;     // 入れ子制約(recv[i]>recv[i+1])違反で検定を飛ばした回数
   long silence_count;               // 自分の時刻記録を提出しなかった(黙秘した)回数
+  /* 片側だけの食い違い(CLOTH_ATTEST_SINGLE_DISPUTE)の診断・ペア集計用 */
+  long causality_violation_count;   // 自分の申告が「受け取る前に送った」になっていた回数
+  long pair_flag_count;             // 2人の合計保持が異常でペアとして記録された回数
+  long* pair_partners;              // ペアになった相手の ID (重複なし)
+  long* pair_partner_flags;         // 相手ごとのペア記録数 (pair_partners と同じ並び)
+  int pair_partner_count;
+  int pair_partner_cap;
+  long pair_endpoint_skips;         // 食い違いの相手が送金者/受取人で外側の基準点が無くペア検定できなかった回数
+  long hold_reports_main;           // hold 検知器の報告: 食い違いなし/両側食い違い(従来経路)
+  long hold_reports_fav;            // hold 検知器の報告: 片側食い違いを被疑者に有利な時刻で検定(4a)
+  long hold_reports_pair;           // hold 検知器の報告: 決済をまたいだペア集計(5)
+  long pair_reports_active;         // (5) の報告のうち効いていて取り消されていない数
+  long pair_reports_revoked;        // (5) の報告のうち後から取り消した数
+  double* rep_penalty_ledger;       // 報告で実際に引いた評判罰 (クランプ後) の履歴。取り消し時の返金用
+  int rep_penalty_n;
+  int rep_penalty_cap;
   long last_movement_time;          // last time this judge relocated (for movement tracking)
   uint64_t first_attack_time;       // first simulation time this malicious node triggered attack
   uint64_t first_detection_time;    // first simulation time this node was detected
