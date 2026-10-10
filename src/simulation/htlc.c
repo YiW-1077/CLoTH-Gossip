@@ -576,13 +576,216 @@ static void handle_pair_flag(struct network* network, struct simulation* simulat
   }
 }
 
+/* === もめたら判定ノードが鍵を預かる方式 (受領証＋エスクロー) のモデル (CLOTH_ESCROW, 既定 0) ===
+ * preimage の受け渡し (送り手 → 受け手) ごとに、受け手が受領証を返し送り手が鍵を渡す往復 r が掛かる。
+ * r はリンクごとに中央値の違う対数正規 (中央値 m·exp(σ_b·Z_link)) に、受け渡しごとのばらつき (σ_j) を掛けたもの。
+ * 送り手は期限 D までに受領証が来なければ判定ノードへエスカレーションし、判定ノードが e 後に鍵を渡す (タイムアウト)。
+ * 保持の起点: 通常はオファー時刻 + そのリンクの予想往復 E[r] (期限内に受領証を遅らせても隠せない)。
+ *             タイムアウトしたら判定ノードが鍵を渡した時刻 (待ちは免除される, CLOTH_ESCROW_EXCUSE_TIMEOUT=1 既定)。
+ * 攻撃者 (保持者) の手口: わざとタイムアウトさせて D + e - E[r] を隠す (記録が残る)、または
+ *   普段から受領証を Δ 遅らせて予想往復に混ぜ (CLOTH_ESCROW_INFLATE_MS)、Δ を記録なしで隠す。大きいほうを使う。
+ *   送出側の嘘は、保持の終わりが上流の受け手自身の受領証で決まるので意味がない (受領側だけ)。
+ * 往復はリンクと決済のハッシュから決める (乱数列を消費しない)。シミュの時刻 (イベント) には往復を足さない。
+ * 正直な遅いノード (既定 OFF):
+ *   Tor 経由 (CLOTH_ESCROW_TOR_FRAC): どちらかの端が Tor なら、その接続の往復に Tor の遅れが足され、ばらつきも大きい。
+ *     ネットワークの遅れは両方向に共通 (CLOTH_ESCROW_NET_SYMMETRIC=1 で向きによらず同じ値)。判定ノードとのやり取りも遅れる。
+ *   処理が遅い (CLOTH_ESCROW_SLOW_FRAC): 受け手として受領証を返す前の処理 (保存など) に時間が掛かる。
+ * 期限と予想往復の決め方 (CLOTH_ESCROW_D_MODE): fixed / adaptive (この向きの受領証の往復) /
+ *   ref (同じリンクのコミットメント更新の往復: 正直なら受領証と同じ分布、受領証だけの水増しは入らない) /
+ *   reverse (同じリンクの逆向きの受領証の往復: 処理の遅れは相手のものになる)。
+ * CLOTH_ESCROW_JITTER_IN_HOLD=1: 起点がオファー時刻 + 予想往復なので、期限内の往復のぶれ (r - E[r]) を保持に混ぜる。
+ * CLOTH_ESCROW_ANCHOR=key: 起点を送り手が鍵を渡した時刻にする。ぶれは混ざらないが、期限内に受領証を遅らせた分は
+ *   記録なしで隠せる (D - E[r])。攻撃者は記録の残らない手口で足りるならそちらを使う。
+ * CLOTH_ESCROW_HOLD_LEGS=n: 測る保持に片道 n 本ぶんのネットワークの遅れ (Tor ならぶれも大きい) を足す。
+ *   起点=鍵 なら 1 (鍵が届くまで)、エスクローなし (CLOTH_ESCROW=0 でも効く) なら 2 (下流→本人, 本人→上流)。 */
+static double escrow_env(const char* name, double def) {
+  const char* e = getenv(name);
+  return (e != NULL && e[0] != '\0') ? atof(e) : def;
+}
+static int get_escrow(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_ESCROW");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+struct escrow_params {
+  double m, sigma_link, sigma_jitter, esc_ms, d_fixed, d_z, d_cap, inflate;
+  double tor_frac, tor_ms, tor_sigma_link, tor_sigma_jitter, slow_frac, slow_ms, slow_sigma;
+  int d_mode, excuse, symmetric, mimic, tor_attacker, tor_max_degree, jitter_in_hold, anchor_key, hold_legs;
+};
+enum { ESCROW_D_FIXED = 0, ESCROW_D_ADAPTIVE = 1, ESCROW_D_REF = 2, ESCROW_D_REVERSE = 3 };
+static const struct escrow_params* escrow_params(void) {
+  static int init = 0;
+  static struct escrow_params P;
+  if (init) return &P;
+  init = 1;
+  P.m            = escrow_env("CLOTH_ESCROW_RTT_MEDIAN_MS", 20.0);
+  P.sigma_link   = escrow_env("CLOTH_ESCROW_RTT_LINK_SIGMA", 0.5);
+  P.sigma_jitter = escrow_env("CLOTH_ESCROW_RTT_JITTER_SIGMA", 0.3);
+  P.esc_ms       = escrow_env("CLOTH_ESCROW_ESC_MS", 40.0);
+  P.d_fixed      = escrow_env("CLOTH_ESCROW_D_MS", 50.0);
+  P.d_z          = escrow_env("CLOTH_ESCROW_D_Z", 2.326);      /* リンクごと: 往復の 99% 点 */
+  P.d_cap        = escrow_env("CLOTH_ESCROW_D_CAP_MS", 0.0);   /* 0 = 上限なし */
+  P.inflate      = escrow_env("CLOTH_ESCROW_INFLATE_MS", 0.0);
+  P.mimic        = (int)escrow_env("CLOTH_ESCROW_INFLATE_MIMIC", 0.0);   /* 1 = コミットメント更新も同じだけ遅らせる */
+  const char* mode = getenv("CLOTH_ESCROW_D_MODE");
+  P.d_mode = ESCROW_D_FIXED;
+  if (mode != NULL && strcmp(mode, "adaptive") == 0) P.d_mode = ESCROW_D_ADAPTIVE;
+  if (mode != NULL && strcmp(mode, "ref") == 0) P.d_mode = ESCROW_D_REF;
+  if (mode != NULL && strcmp(mode, "reverse") == 0) P.d_mode = ESCROW_D_REVERSE;
+  P.excuse = (int)escrow_env("CLOTH_ESCROW_EXCUSE_TIMEOUT", 1.0);
+  P.symmetric        = (int)escrow_env("CLOTH_ESCROW_NET_SYMMETRIC", 0.0);
+  P.tor_frac         = escrow_env("CLOTH_ESCROW_TOR_FRAC", 0.0);
+  P.tor_ms           = escrow_env("CLOTH_ESCROW_TOR_MS", 100.0);       /* Tor の遅れの中央値 */
+  P.tor_sigma_link   = escrow_env("CLOTH_ESCROW_TOR_LINK_SIGMA", 0.5);
+  P.tor_sigma_jitter = escrow_env("CLOTH_ESCROW_TOR_JITTER_SIGMA", 0.5);
+  P.tor_attacker     = (int)escrow_env("CLOTH_ESCROW_TOR_ATTACKER", -1.0);  /* -1 = 正直と同じ決め方, 0 = 使わない, 1 = 全員 */
+  P.tor_max_degree   = (int)escrow_env("CLOTH_ESCROW_TOR_MAX_DEGREE", 0.0); /* 0 = 次数によらない */
+  P.slow_frac        = escrow_env("CLOTH_ESCROW_SLOW_FRAC", 0.0);
+  P.slow_ms          = escrow_env("CLOTH_ESCROW_SLOW_MS", 30.0);       /* 処理の遅れの中央値 */
+  P.slow_sigma       = escrow_env("CLOTH_ESCROW_SLOW_SIGMA", 0.5);
+  P.jitter_in_hold   = (int)escrow_env("CLOTH_ESCROW_JITTER_IN_HOLD", 0.0);
+  const char* anchor = getenv("CLOTH_ESCROW_ANCHOR");
+  P.anchor_key = (anchor != NULL && strcmp(anchor, "key") == 0);  /* key = 送り手が鍵を渡した時刻を保持の起点にする */
+  P.hold_legs = (int)escrow_env("CLOTH_ESCROW_HOLD_LEGS", 0.0);
+  return &P;
+}
+static double escrow_hash_u01(unsigned long a, unsigned long b, unsigned long salt) {
+  unsigned long h = a * 0x9E3779B97F4A7C15UL;
+  h ^= (b + 0x632BE59BD9B4E019UL) * 0xBF58476D1CE4E5B9UL;
+  h ^= salt * 0x94D049BB133111EBUL;
+  h ^= h >> 31; h *= 0xBF58476D1CE4E5B9UL; h ^= h >> 27; h *= 0x94D049BB133111EBUL; h ^= h >> 31;
+  return ((double)(h >> 11) + 0.5) / 9007199254740992.0;
+}
+static double escrow_hash_normal(unsigned long a, unsigned long b, unsigned long salt) {
+  double u1 = escrow_hash_u01(a, b, salt), u2 = escrow_hash_u01(a, b, salt + 7919UL);
+  return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+}
+/* ノードの性質 (Tor 経由か・処理の遅れ) は最初の決済の成功時に一度だけ決める。
+ * ノードの一覧 (env CLOTH_ESCROW_NODE_LOG): node_id,is_malicious,degree,tor,proc_ms */
+static long escrow_n_nodes = 0;
+static unsigned char* escrow_tor = NULL;
+static unsigned char* escrow_mal = NULL;
+static double* escrow_proc = NULL;
+static void escrow_bind(struct network* network) {
+  if (escrow_tor != NULL || network == NULL) return;
+  const struct escrow_params* P = escrow_params();
+  long n = array_len(network->nodes);
+  escrow_tor = calloc((size_t)n + 1, 1);
+  escrow_mal = calloc((size_t)n + 1, 1);
+  escrow_proc = calloc((size_t)n + 1, sizeof(double));
+  escrow_n_nodes = n;
+  const char* nlog = getenv("CLOTH_ESCROW_NODE_LOG");
+  FILE* f = (nlog != NULL && nlog[0] != '\0') ? fopen(nlog, "w") : NULL;
+  if (f != NULL) fprintf(f, "node_id,is_malicious,degree,tor,proc_ms\n");
+  for (long i = 0; i < n; i++) {
+    struct node* nd = (struct node*)array_get(network->nodes, i);
+    if (nd == NULL || nd->id < 0 || nd->id >= n) continue;
+    unsigned long id = (unsigned long)nd->id;
+    long deg = (nd->open_edges != NULL) ? array_len(nd->open_edges) : 0;
+    int tor = 0;
+    if (P->tor_frac > 0.0) {
+      if (nd->is_malicious && P->tor_attacker >= 0) tor = (P->tor_attacker > 0);
+      else if (P->tor_max_degree <= 0 || deg <= P->tor_max_degree)
+        tor = escrow_hash_u01(id, 0UL, 21UL) < P->tor_frac;
+    }
+    double proc = 0.0;
+    if (P->slow_frac > 0.0 && escrow_hash_u01(id, 0UL, 23UL) < P->slow_frac)
+      proc = P->slow_ms * exp(P->slow_sigma * escrow_hash_normal(id, 0UL, 25UL));
+    escrow_tor[nd->id] = (unsigned char)tor;
+    escrow_mal[nd->id] = nd->is_malicious ? 1 : 0;
+    escrow_proc[nd->id] = proc;
+    if (f != NULL) fprintf(f, "%ld,%d,%ld,%d,%.1f\n", nd->id, escrow_mal[nd->id], deg, tor, proc);
+  }
+  if (f != NULL) fclose(f);
+}
+static int escrow_tor_of(long id) { return (escrow_tor != NULL && id >= 0 && id < escrow_n_nodes) ? escrow_tor[id] : 0; }
+static int escrow_mal_of(long id) { return (escrow_mal != NULL && id >= 0 && id < escrow_n_nodes) ? escrow_mal[id] : 0; }
+static double escrow_proc_of(long id) { return (escrow_proc != NULL && id >= 0 && id < escrow_n_nodes) ? escrow_proc[id] : 0.0; }
+struct escrow_link {
+  double r;        /* この受け渡しの往復 (水増し込み) */
+  double leg;      /* この決済での片道のネットワークの遅れ */
+  double er_true;  /* リンクの本来の予想往復 */
+  double er;       /* 送り手が学習している予想往復 (保持の起点に使う) */
+  double D;        /* 期限 */
+  double e;        /* 判定ノードが鍵を渡すまでの時間 */
+  int tor;         /* Tor を通る接続か */
+};
+/* 受け手 recv_id が送り手 offer_id から preimage を受け取る受け渡しの往復と期限 */
+static void escrow_link_eval(long recv_id, long offer_id, long pid, int recv_mal, struct escrow_link* L) {
+  const struct escrow_params* P = escrow_params();
+  unsigned long la = (unsigned long)recv_id, lb = (unsigned long)offer_id;
+  if (P->symmetric && la > lb) { unsigned long t = la; la = lb; lb = t; }   /* ネットワークの遅れは両方向に共通 */
+  int tor = escrow_tor_of(recv_id) || escrow_tor_of(offer_id);
+  double net = P->m * exp(P->sigma_link * escrow_hash_normal(la, lb, 11UL));
+  if (tor) net += P->tor_ms * exp(P->tor_sigma_link * escrow_hash_normal(la, lb, 17UL));
+  double sj = tor ? P->tor_sigma_jitter : P->sigma_jitter;
+  double b = net + escrow_proc_of(recv_id);          /* 受け手の処理の遅れは受領証の側だけに乗る */
+  double infl = recv_mal ? P->inflate : 0.0;
+  L->tor = tor;
+  L->e = P->esc_ms + (tor ? P->tor_ms : 0.0);
+  L->er_true = b * exp(0.5 * sj * sj);
+  L->r = b * exp(sj * escrow_hash_normal((unsigned long)pid,
+                   (unsigned long)recv_id * 1000003UL + (unsigned long)offer_id, 13UL)) + infl;
+  L->leg = 0.5 * net * exp(sj * escrow_hash_normal((unsigned long)pid,
+                   (unsigned long)recv_id * 1000003UL + (unsigned long)offer_id, 31UL));
+  /* 送り手が期限と予想往復を何から学ぶか */
+  double bb = b, add = infl;                         /* adaptive / fixed: この向きの受領証 (水増し込み) */
+  if (P->d_mode == ESCROW_D_REF) {
+    add = (recv_mal && P->mimic) ? P->inflate : 0.0; /* コミットメント更新: 全部遅らせる攻撃者だけ水増しが入る */
+  } else if (P->d_mode == ESCROW_D_REVERSE) {
+    bb = net + escrow_proc_of(offer_id);             /* 逆向き: 処理の遅れと水増しは相手のもの */
+    add = escrow_mal_of(offer_id) ? P->inflate : 0.0;
+  }
+  L->er = bb * exp(0.5 * sj * sj) + add;
+  if (P->d_mode == ESCROW_D_FIXED) {
+    L->D = P->d_fixed;
+  } else {
+    L->D = bb * exp(sj * P->d_z) + add;
+    if (P->d_cap > 0.0 && L->D > P->d_cap) L->D = P->d_cap;
+  }
+}
+/* 保持者が隠せる量 (最大 CLOTH_FALSE_REPORT_MS)。*via_timeout = わざとタイムアウトさせる手口を使ったか */
+static double escrow_hide(const struct escrow_link* L, int* via_timeout) {
+  const struct escrow_params* P = escrow_params();
+  double X = (double)get_false_report_ms();
+  double h_in = L->er - L->er_true;
+  if (P->anchor_key && L->D - L->er_true > h_in) h_in = L->D - L->er_true;
+  if (h_in >= X) { *via_timeout = 0; return X; }   /* 記録の残らない手口で足りる */
+  double h_to = P->excuse ? (L->D + L->e - L->er_true) : 0.0;
+  double h = (h_to > h_in) ? h_to : h_in;
+  *via_timeout = (P->excuse && h_to > h_in && h_to > 0.0);
+  if (h < 0.0) h = 0.0;
+  if (h > X) h = X;
+  return h;
+}
+/* 経路上で node_id が preimage を受け取る相手 (= hop の to_node) */
+static int escrow_offerer_of(struct payment* pm, long node_id, long* offer_id) {
+  if (pm == NULL || pm->route == NULL || pm->route->route_hops == NULL) return 0;
+  int nh = array_len(pm->route->route_hops);
+  for (int k = 0; k < nh; k++) {
+    struct route_hop* rh = (struct route_hop*)array_get(pm->route->route_hops, k);
+    if (rh != NULL && rh->from_node_id == node_id) { *offer_id = rh->to_node_id; return 1; }
+  }
+  return 0;
+}
+
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
  * dir: +1 = 「遅く受け取った」方向に盛る, -1 = 「早く送った」方向に盛る。
  * 保持者は「遅く受け取って、すぐ送った」と偽ることで見かけの保持時間を 2X 縮める。
  * pm == NULL を渡すと嘘は乗らない(時計オフセットのみ)。 */
 static uint64_t reported_time(struct node* nd, struct payment* pm, uint64_t true_time, int dir) {
   long adj = node_clock_offset(nd != NULL ? nd->id : 0);
-  if (lies_on_this_payment(nd, pm)) {
+  if (lies_on_this_payment(nd, pm) && get_escrow()) {
+    /* エスクロー方式: 隠せるのは受け取り側だけ、量は期限とエスカレーションで決まる */
+    long off = -1;
+    if (dir > 0 && escrow_offerer_of(pm, nd->id, &off)) {
+      struct escrow_link L;
+      int via = 0;
+      escrow_link_eval(nd->id, off, pm->id, 1, &L);
+      adj += (long)(escrow_hide(&L, &via) + 0.5);
+    }
+  } else if (lies_on_this_payment(nd, pm)) {
     int side = get_false_report_side();
     if (side == FALSE_REPORT_SIDE_BOTH ||
         (side == FALSE_REPORT_SIDE_RECV && dir > 0) ||
@@ -1574,6 +1777,7 @@ void receive_payment(struct event* event, struct simulation* simulation, struct 
 /* forward an HTLC success back to the payment sender (behavior of a intermediate hop node in the route) */
 
 void forward_success(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params){
+  if (get_escrow() || escrow_params()->hold_legs > 0) escrow_bind(network);
   struct route_hop* prev_hop;
   struct payment* payment;
   struct edge* forward_edge, * backward_edge;
@@ -1700,6 +1904,7 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
 
 /* receive an HTLC success (behavior of the payment sender node) */
 void receive_success(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params){
+  if (get_escrow() || escrow_params()->hold_legs > 0) escrow_bind(network);
   struct node* node;
   struct payment* payment;
   payment = event->payment;
@@ -1887,6 +2092,31 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                   payment->grief_hold_node_id, (cand == payment->grief_hold_node_id) ? 1 : 0, settle_lat);
                   fclose(_f); }
           }
+          if (get_escrow() && !escrow_params()->excuse) {
+              struct escrow_link L;
+              escrow_link_eval(cand, hop_dn->to_node_id, payment->id, dn_node->is_malicious, &L);
+              if (L.r > L.D) settle_lat += L.D + L.e - L.er;
+          }
+          if (escrow_params()->hold_legs > 0) {
+              /* 測る保持に含まれる片道の遅れ: 1本目 = 下流 (送り手) → 本人、2本目 = 本人 → 上流 */
+              struct escrow_link L;
+              escrow_link_eval(cand, hop_dn->to_node_id, payment->id, 0, &L);
+              settle_lat += L.leg;
+              if (escrow_params()->hold_legs >= 2) {
+                  escrow_link_eval(hop_up->from_node_id, cand, payment->id, 0, &L);
+                  settle_lat += L.leg;
+              }
+          }
+          if (get_escrow() && escrow_params()->jitter_in_hold && !escrow_params()->anchor_key &&
+              !lies_on_this_payment(dn_node, payment)) {
+              /* 起点 = オファー時刻 + 予想往復 なので、期限内の往復のぶれ (r - E[r]) は保持に混ざる */
+              struct escrow_link L;
+              escrow_link_eval(cand, hop_dn->to_node_id, payment->id, dn_node->is_malicious, &L);
+              if (L.r <= L.D) {
+                  settle_lat += L.r - L.er;
+                  if (settle_lat < 1.0) settle_lat = 1.0;
+              }
+          }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。
            * (4a) の標本は片方が嘘なので学習しない版で検定する。 */
           int should_report = fav_test
@@ -1942,12 +2172,12 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
            * 記録する。送金者とのリンク (i == 0) は送金者の信頼で決着済み、受取人とのリンクは被疑者の
            * 下側なのでここには来ない。warmup 中は記録しない (warmup でも予約された保持者は嘘をつくが
            * 割合の分母は warmup 後の検定数なので)。この決済で既に報告されたノードを含むなら説明済み。 */
-          if (get_attest_dispute_flags() && esc_d1 > 0 && i >= 1 && up_node_p != NULL &&
+          if (get_attest_dispute_flags() && !get_escrow() && esc_d1 > 0 && i >= 1 && up_node_p != NULL &&
               !should_report && anom_pos != i &&
               !detector_in_warmup(payment, (long)simulation->processed_payments)) {
               handle_pair_flag(network, simulation, payment, net_params, up_node_p, dn_node, (double)esc_d1);
           }
-          if (fav_test && !should_report && get_attest_single_dispute() >= 2 && !get_attest_dispute_flags()) {
+          if (fav_test && !should_report && get_attest_single_dispute() >= 2 && !get_attest_dispute_flags() && !get_escrow()) {
               if (dispute_up && anom_pos != i) {   /* 上流 i が既に異常判定なら説明済み */
                   if (i == 0 || up_node_p == NULL) {
                       dn_node->pair_endpoint_skips++;   /* 相手が送金者: 外側の基準点が無い */
@@ -1964,6 +2194,53 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               }
               if (dispute_dn && i + 2 == nh)
                   dn_node->pair_endpoint_skips++;       /* 相手が受取人: 外側の基準点が無い */
+          }
+      }
+
+      /* エスクロー方式: 受け渡しごとのタイムアウト (判定ノードへのエスカレーション) を記録する。
+       * 受け手 = hop k の from (中継), 送り手 = hop k の to。送金者が受け手の k=0 は除く。
+       * タイムアウトした受け渡しの2人をペアとして (5) の集計に回す (この決済で既に報告済みなら説明済み)。
+       * 統計ログ (env CLOTH_ESCROW_STATS_LOG): P,決済,受け渡し数,鍵待ちの合計,正直なタイムアウト,攻撃者のタイムアウト
+       *                                       ,Tor の受け渡し数,そのうち正直なタイムアウト,遅い処理の受け手の受け渡し数,そのうち正直なタイムアウト,受け手が攻撃者の受け渡し数
+       *                                       H,決済,保持者,隠した量,タイムアウトの手口か
+       *                                       K,受け手,送り手,タイムアウトしたか,嘘をついたか (受け渡しごと) */
+      if (get_escrow() && !detector_in_warmup(payment, (long)simulation->processed_payments)) {
+          const char* slog = getenv("CLOTH_ESCROW_STATS_LOG");
+          FILE* sf = (slog != NULL && slog[0] != '\0') ? fopen(slog, "a") : NULL;
+          double sum_wait = 0.0;
+          int n_to_honest = 0, n_to_att = 0, n_hand = 0;
+          int n_hand_tor = 0, n_to_h_tor = 0, n_hand_slow = 0, n_to_h_slow = 0, n_mal_recv = 0;
+          for (int k = 1; k < nh; k++) {
+              struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, k);
+              if (rh == NULL) continue;
+              struct node* rn = (struct node*)array_get(network->nodes, rh->from_node_id);
+              struct node* on = (struct node*)array_get(network->nodes, rh->to_node_id);
+              if (rn == NULL || on == NULL) continue;
+              struct escrow_link L;
+              escrow_link_eval(rn->id, on->id, payment->id, rn->is_malicious, &L);
+              int lying = lies_on_this_payment(rn, payment);
+              int via = 0;
+              double H = lying ? escrow_hide(&L, &via) : 0.0;
+              int timed_out = lying ? via : (L.r > L.D);
+              sum_wait += timed_out ? (L.D + L.e) : L.r;
+              n_hand++;
+              if (timed_out) { if (lying) n_to_att++; else n_to_honest++; }
+              int slow = escrow_proc_of(rn->id) > 0.0;
+              if (L.tor) { n_hand_tor++; if (timed_out && !lying) n_to_h_tor++; }
+              if (slow) { n_hand_slow++; if (timed_out && !lying) n_to_h_slow++; }
+              if (rn->is_malicious) n_mal_recv++;
+              if (timed_out && !has_attack_reporter(payment, rn->id) && !has_attack_reporter(payment, on->id))
+                  handle_pair_flag(network, simulation, payment, net_params, rn, on,
+                                   timed_out ? (L.D + L.e) : L.r);
+              if (lying && sf != NULL)
+                  fprintf(sf, "H,%ld,%ld,%.1f,%d\n", payment->id, rn->id, H, via);
+              if (sf != NULL)
+                  fprintf(sf, "K,%ld,%ld,%d,%d\n", rn->id, on->id, timed_out, lying);
+          }
+          if (sf != NULL) {
+              fprintf(sf, "P,%ld,%d,%.1f,%d,%d,%d,%d,%d,%d,%d\n", payment->id, n_hand, sum_wait, n_to_honest, n_to_att,
+                      n_hand_tor, n_to_h_tor, n_hand_slow, n_to_h_slow, n_mal_recv);
+              fclose(sf);
           }
       }
   }
