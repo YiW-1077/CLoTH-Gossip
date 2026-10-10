@@ -322,6 +322,10 @@ int on_hold_hypothesis_test(
     int n_hops
 );
 
+/* 次の hold 検定の標本の追加分散 (ms²) を渡す。その標本が通ったネットワークの片道のばらつき。
+ * CLOTH_SETTLE_STANDARDIZE=1 のときだけ使われ、次の検定で消費される。 */
+void hold_set_sample_var(double var_ms2);
+
 /* 判定はするが学習しない版。正常判定でも baseline 更新・suspicion 減算をしない。
  * 申告が食い違った標本(どちらかが嘘)で null を汚さないために使う。 */
 int on_hold_hypothesis_test_nolearn(

@@ -80,6 +80,11 @@ struct node* new_node(long id) {
   node->settle_learn_count = 0;
   node->settle_test_count = 0;
   node->settle_anomaly_count = 0;
+  node->settle_w_n = 0;
+  node->settle_w_sum = 0.0;
+  node->settle_w_sumsq = 0.0;
+  node->settle_w_vsum = 0.0;
+  node->settle_rebased = 0;
   return node;
 }
 
@@ -1159,6 +1164,11 @@ void initialize_reputation_scores(struct network* network) {
             node->settle_learn_count = 0;
             node->settle_test_count = 0;
             node->settle_anomaly_count = 0;
+            node->settle_w_n = 0;
+            node->settle_w_sum = 0.0;
+            node->settle_w_sumsq = 0.0;
+            node->settle_w_vsum = 0.0;
+            node->settle_rebased = 0;
         }
     }
 }

@@ -119,6 +119,27 @@ static double get_hold_degree_min() {
     return v;
 }
 
+/* === hold 検知器の warmup 後の学習 (CLOTH_SETTLE_ROBUST_LEARN, 既定 0) ===
+ * 0 = 従来: 異常と判定されなかった標本を全部学習する。測る保持にぶれがあると、閾値に届かなかった
+ *     攻撃の標本が学習されて基準値が上にずれ、その攻撃者を永久に見逃す (汚染)。
+ * 1 = 凍結: warmup 後は学習しない (攻撃は warmup 後にしか起きないので汚染しない)。
+ * 2 = 打ち切り: warmup 後は z (膨張前の σ) が CLOTH_SETTLE_LEARN_Z (既定 2) 未満の標本だけ学習する。
+ *     上を切ると平均が下がり分散が小さく出るので、切断正規分布の分だけ補正する。 */
+static int get_hold_robust_learn() {
+    static int v = -1;
+    if (v >= 0) return v;
+    char *env = getenv("CLOTH_SETTLE_ROBUST_LEARN");
+    v = (env != NULL) ? atoi(env) : 0;
+    if (v < 0 || v > 2) v = 0;
+    return v;
+}
+static double get_hold_learn_z() {
+    char *env = getenv("CLOTH_SETTLE_LEARN_Z");
+    if (env == NULL) return 2.0;
+    double v = atof(env);
+    return (v > 0.0) ? v : 2.0;
+}
+
 static double get_hold_q_step() {  /* RM 学習率 (log 単位の絶対ステップ) */
     char *env = getenv("CLOTH_SETTLE_Q_STEP");
     if (env == NULL) return 0.05;
@@ -1222,6 +1243,94 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
  * forward_success を処理する全ノードが同じ検定を受ける。
  * learn=0 は「判定はするが学習しない」版: 正常判定でも baseline を更新せず、
  * suspicion も減らさない。申告が食い違った標本(片方は嘘)を null の学習に混ぜないため。 */
+/* === 共通の事前分布 (CLOTH_SETTLE_PRIOR) と標本ごとの標準化 (CLOTH_SETTLE_STANDARDIZE), どちらも既定 0 ===
+ * 事前分布: warmup 中の全ノードの標本 (log) から共通の平均・分散を学ぶ。warmup 後の最初の検定で、各ノードの基準値を
+ *   (K × 共通の値 + 自分の warmup 標本) / (K + 標本数) に寄せ直す (K = CLOTH_SETTLE_PRIOR_K, 既定 20)。
+ *   標本の少ないノードが、遅れがほぼ一定のシミュ向けの決め打ちの初期値 (100ms・σ0.1) のまま検定され続けるのを防ぐ。
+ * 標準化: hold_set_sample_var() で渡された「その標本が通ったネットワークの片道のばらつき」を、検定の分散に標本ごとに足す
+ *   (log 空間へはデルタ法 Var(log X) ≈ Var(X)/E[X]² で換算)。ノード自身の分散は (偏差² − 追加分散) で学ぶ。 */
+#define HOLD_VAR_FLOOR 1e-4
+static int get_hold_prior() {
+    static int v = -1;
+    if (v >= 0) return v;
+    char *env = getenv("CLOTH_SETTLE_PRIOR");
+    return (v = (env != NULL && atoi(env) > 0) ? 1 : 0);
+}
+static int get_hold_standardize() {
+    static int v = -1;
+    if (v >= 0) return v;
+    char *env = getenv("CLOTH_SETTLE_STANDARDIZE");
+    return (v = (env != NULL && atoi(env) > 0) ? 1 : 0);
+}
+static double get_hold_prior_k() {
+    char *env = getenv("CLOTH_SETTLE_PRIOR_K");
+    double v = (env != NULL) ? atof(env) : 20.0;
+    return (v > 0.0) ? v : 20.0;
+}
+static double g_hold_sample_var_ms2 = 0.0;   /* 次の検定の標本の追加分散 (ms²) */
+void hold_set_sample_var(double var_ms2) { g_hold_sample_var_ms2 = (var_ms2 > 0.0) ? var_ms2 : 0.0; }
+static long   g_prior_n = 0;
+static double g_prior_mean = 0.0, g_prior_m2 = 0.0, g_prior_vsum = 0.0;
+/* 診断 (env CLOTH_SETTLE_PRIOR_LOG): warmup の全標本を覚えておき、最初の寄せ直しで共通の値と分位点を書き出す */
+static double* g_prior_dbg = NULL;
+static long g_prior_dbg_n = 0, g_prior_dbg_cap = 0;
+static void hold_prior_dump(void) {
+    static int done = 0;
+    const char* path = getenv("CLOTH_SETTLE_PRIOR_LOG");
+    if (done || path == NULL || path[0] == '\0') return;
+    done = 1;
+    FILE* f = fopen(path, "w");
+    if (f == NULL) return;
+    fprintf(f, "n=%ld mean=%.4f (=%.1fms) total_var=%.4f mean_vlog=%.4f prior_var=%.4f\n", g_prior_n, g_prior_mean,
+            exp(g_prior_mean) - 1.0, g_prior_m2 / (double)g_prior_n, g_prior_vsum / (double)g_prior_n,
+            g_prior_m2 / (double)g_prior_n - g_prior_vsum / (double)g_prior_n);
+    if (g_prior_dbg_n > 0) {
+        long n = g_prior_dbg_n;
+        for (long i = 1; i < n; i++) {   /* 挿入ソート (診断のみ) */
+            double v = g_prior_dbg[i]; long j = i - 1;
+            while (j >= 0 && g_prior_dbg[j] > v) { g_prior_dbg[j + 1] = g_prior_dbg[j]; j--; }
+            g_prior_dbg[j + 1] = v;
+        }
+        double qs[] = {0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 0.999};
+        for (int k = 0; k < 8; k++) {
+            double v = g_prior_dbg[(long)(qs[k] * (double)(n - 1))];
+            fprintf(f, "q%.3f=%.1fms ", qs[k], exp(v) - 1.0);
+        }
+        fprintf(f, "max=%.1fms\n", exp(g_prior_dbg[n - 1]) - 1.0);
+    }
+    fclose(f);
+}
+static void hold_prior_add(double xlog, double vlog) {
+    g_prior_n++;
+    double d = xlog - g_prior_mean;
+    g_prior_mean += d / (double)g_prior_n;
+    g_prior_m2 += d * (xlog - g_prior_mean);
+    g_prior_vsum += vlog;
+    if (getenv("CLOTH_SETTLE_PRIOR_LOG") != NULL) {
+        if (g_prior_dbg_n >= g_prior_dbg_cap) {
+            g_prior_dbg_cap = g_prior_dbg_cap ? 2 * g_prior_dbg_cap : 4096;
+            g_prior_dbg = realloc(g_prior_dbg, (size_t)g_prior_dbg_cap * sizeof(double));
+        }
+        g_prior_dbg[g_prior_dbg_n++] = xlog;
+    }
+}
+static int hold_prior_ready() { return g_prior_n >= 100; }
+static double hold_prior_var() {
+    double v = g_prior_m2 / (double)g_prior_n - g_prior_vsum / (double)g_prior_n;
+    return (v < HOLD_VAR_FLOOR) ? HOLD_VAR_FLOOR : v;
+}
+static double hold_vlog(const struct node* node, double v_ms2) {
+    if (v_ms2 <= 0.0) return 0.0;
+    double L = exp(node->settle_baseline_mean);
+    return v_ms2 / (L * L);
+}
+static void update_hold_baseline_std(struct node* node, double xlog, double vlog) {
+    double dev = xlog - node->settle_baseline_mean;
+    node->settle_baseline_mean = 0.99 * node->settle_baseline_mean + 0.01 * xlog;
+    double v = 0.99 * node->settle_baseline_var + 0.01 * (dev * dev - vlog);
+    node->settle_baseline_var = (v < HOLD_VAR_FLOOR) ? HOLD_VAR_FLOOR : v;
+}
+
 static double hold_sigma_eff(const struct node* node, double sd, int n_hops) {
     double sigma_eff = sd;
     double inflate = 1.0;
@@ -1248,7 +1357,11 @@ static int hold_test_impl(
     int n_hops,
     int learn
 ) {
+    double v_ms2 = g_hold_sample_var_ms2;   /* 標本の追加分散は1回の検定で消費する */
+    g_hold_sample_var_ms2 = 0.0;
     if (node == NULL || settle_latency_ms <= 0.0) return 0;
+    int prior = get_hold_prior(), stdz = get_hold_standardize();
+    if (!stdz) v_ms2 = 0.0;
 
     /* === グローバルな settlement baseline で seed ===
      * Phase0 で settlement レグのレイテンシは次数非依存・全 honest ノードでほぼ一定
@@ -1257,6 +1370,10 @@ static int hold_test_impl(
      * (b) 保持(2×)は seed に対し常に異常→baseline 更新されず汚染なし、を同時に解決。
      * 旧 per-node 学習方式は settlement サンプルが疎で大半が未検定&warmup後初出ノードが
      * 保持を学習して汚染、という二重の取りこぼしがあった。 */
+    if (node->settle_baseline_mean == 0.0 && prior && hold_prior_ready()) {
+        node->settle_baseline_mean = g_prior_mean;   /* 共通の事前分布から始める */
+        node->settle_baseline_var = hold_prior_var();
+    }
     if (node->settle_baseline_mean == 0.0) {
         double seed = (expected_settle_ms > 0.0) ? expected_settle_ms : 100.0;
         node->settle_baseline_mean = log(seed + 1.0);
@@ -1274,7 +1391,17 @@ static int hold_test_impl(
      * (1-α)分位点 settle_anom_q も RM 学習する(post-warmup は凍結=保持サンプルで汚染しない)。 */
     if (in_warmup) {   /* detector_in_warmup() の結果 (既定 payment->is_warmup) */
         if (!learn) return 0;
-        update_hold_baseline_lognormal(node, settle_latency_ms);
+        double xlog = log(settle_latency_ms + 1.0);
+        double vlog = hold_vlog(node, v_ms2);
+        if (prior) {
+            hold_prior_add(xlog, vlog);
+            node->settle_w_n++;
+            node->settle_w_sum += xlog;
+            node->settle_w_sumsq += xlog * xlog;
+            node->settle_w_vsum += vlog;
+        }
+        if (stdz) update_hold_baseline_std(node, xlog, vlog);
+        else update_hold_baseline_lognormal(node, settle_latency_ms);
         if (settle_qmode) {
             double log_lat = log(settle_latency_ms + 1.0);
             double sdw = sqrt(node->settle_baseline_var); if (sdw < 1e-6) sdw = 0.1;
@@ -1287,7 +1414,21 @@ static int hold_test_impl(
         return 0;
     }
 
-    double sd = sqrt(node->settle_baseline_var);
+    /* warmup 後の最初の検定で、基準値を共通の事前分布へ寄せ直す */
+    if (prior && !node->settle_rebased) {
+        node->settle_rebased = 1;
+        hold_prior_dump();
+        if (hold_prior_ready()) {
+            double K = get_hold_prior_k(), n = (double)node->settle_w_n;
+            double mu = (K * g_prior_mean + node->settle_w_sum) / (K + n);
+            double ss = node->settle_w_sumsq - 2.0 * mu * node->settle_w_sum + n * mu * mu;
+            double var = (K * hold_prior_var() + ss - node->settle_w_vsum) / (K + n);
+            node->settle_baseline_mean = mu;
+            node->settle_baseline_var = (var < HOLD_VAR_FLOOR) ? HOLD_VAR_FLOOR : var;
+        }
+    }
+    double vlog = hold_vlog(node, v_ms2);
+    double sd = sqrt(node->settle_baseline_var + vlog);   /* 標準化: 標本ごとの追加分散を足す (OFF なら 0) */
     if (sd < 1e-6) sd = 0.1; /* フォールバック */
     int anomalous;
     if (settle_qmode) {
@@ -1330,7 +1471,31 @@ static int hold_test_impl(
         if (node->settle_suspicion >= report_strikes) should_report = 1;
     } else if (learn) {
         if (node->settle_suspicion > 0) node->settle_suspicion--;
-        update_hold_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
+        int rl = get_hold_robust_learn();
+        if (rl == 0) {
+            if (stdz) update_hold_baseline_std(node, log(settle_latency_ms + 1.0), vlog);
+            else update_hold_baseline_lognormal(node, settle_latency_ms); /* 正常時のみ更新 */
+        } else if (rl == 2) {
+            /* 打ち切り学習: 上側 c で切った正規分布は 平均 -σφ(c)/Φ(c)・分散 σ²(1 - cφ/Φ - (φ/Φ)²) */
+            double c = get_hold_learn_z();
+            double x = log(settle_latency_ms + 1.0);
+            if ((x - node->settle_baseline_mean) / sd < c) {
+                double phi = exp(-0.5 * c * c) / sqrt(2.0 * M_PI);
+                double Phi = 0.5 * erfc(-c / sqrt(2.0));
+                double lam = phi / Phi;
+                double kappa = 1.0 - c * lam - lam * lam;
+                double xc = x + sd * lam;                 /* 平均の補正 */
+                double dev = xc - node->settle_baseline_mean;
+                node->settle_baseline_mean = 0.99 * node->settle_baseline_mean + 0.01 * xc;
+                if (stdz) {
+                    double v = 0.99 * node->settle_baseline_var + 0.01 * ((dev * dev) / kappa - vlog);
+                    node->settle_baseline_var = (v < HOLD_VAR_FLOOR) ? HOLD_VAR_FLOOR : v;
+                } else {
+                    node->settle_baseline_var  = 0.99 * node->settle_baseline_var  + 0.01 * (dev * dev) / kappa;
+                }
+            }
+        }
+        /* rl == 1: 凍結 (warmup 後は学習しない) */
     }
     return should_report;
 }

@@ -97,6 +97,12 @@ struct node {
   long   settle_learn_count;        // baseline 学習に使ったサンプル数(per-node warmup用)
   long   settle_test_count;         // 診断: post-warmup の settlement レグ検定総数
   long   settle_anomaly_count;      // 診断: そのうち異常だった回数
+  /* 共通の事前分布 (CLOTH_SETTLE_PRIOR): warmup 中の自分の標本 (log) の集計と、寄せ直し済みか */
+  long   settle_w_n;
+  double settle_w_sum;
+  double settle_w_sumsq;
+  double settle_w_vsum;             // 標本ごとの追加分散 (log 空間) の和 (CLOTH_SETTLE_STANDARDIZE)
+  int    settle_rebased;
 };
 
 /* a bidirectional payment channel of the payment-channel network open between two nodes */

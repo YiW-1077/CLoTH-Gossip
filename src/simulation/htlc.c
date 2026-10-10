@@ -597,7 +597,9 @@ static void handle_pair_flag(struct network* network, struct simulation* simulat
  * CLOTH_ESCROW_ANCHOR=key: 起点を送り手が鍵を渡した時刻にする。ぶれは混ざらないが、期限内に受領証を遅らせた分は
  *   記録なしで隠せる (D - E[r])。攻撃者は記録の残らない手口で足りるならそちらを使う。
  * CLOTH_ESCROW_HOLD_LEGS=n: 測る保持に片道 n 本ぶんのネットワークの遅れ (Tor ならぶれも大きい) を足す。
- *   起点=鍵 なら 1 (鍵が届くまで)、エスクローなし (CLOTH_ESCROW=0 でも効く) なら 2 (下流→本人, 本人→上流)。 */
+ *   起点=鍵 なら 1 (鍵が届くまで)、エスクローなし (CLOTH_ESCROW=0 でも効く) なら 2 (下流→本人, 本人→上流)。
+ * CLOTH_ESCROW_HOLD_LEGS_NORM=1: 片道ごとにそのリンクの本当の平均を引く (理想的なリンクごとの正規化の上限を見る試験用)。
+ *   =2: Tor を通るかどうかで分けた平均だけを引く (リンク固有の差は残る。ノードごとの性質から学べる範囲)。 */
 static double escrow_env(const char* name, double def) {
   const char* e = getenv(name);
   return (e != NULL && e[0] != '\0') ? atof(e) : def;
@@ -611,7 +613,7 @@ static int get_escrow(void) {
 struct escrow_params {
   double m, sigma_link, sigma_jitter, esc_ms, d_fixed, d_z, d_cap, inflate;
   double tor_frac, tor_ms, tor_sigma_link, tor_sigma_jitter, slow_frac, slow_ms, slow_sigma;
-  int d_mode, excuse, symmetric, mimic, tor_attacker, tor_max_degree, jitter_in_hold, anchor_key, hold_legs;
+  int d_mode, excuse, symmetric, mimic, tor_attacker, tor_max_degree, jitter_in_hold, anchor_key, hold_legs, legs_norm;
 };
 enum { ESCROW_D_FIXED = 0, ESCROW_D_ADAPTIVE = 1, ESCROW_D_REF = 2, ESCROW_D_REVERSE = 3 };
 static const struct escrow_params* escrow_params(void) {
@@ -648,6 +650,7 @@ static const struct escrow_params* escrow_params(void) {
   const char* anchor = getenv("CLOTH_ESCROW_ANCHOR");
   P.anchor_key = (anchor != NULL && strcmp(anchor, "key") == 0);  /* key = 送り手が鍵を渡した時刻を保持の起点にする */
   P.hold_legs = (int)escrow_env("CLOTH_ESCROW_HOLD_LEGS", 0.0);
+  P.legs_norm = (int)escrow_env("CLOTH_ESCROW_HOLD_LEGS_NORM", 0.0);  /* 1 = リンクの本当の平均 / 2 = Tor かどうかの平均を引く */
   return &P;
 }
 static double escrow_hash_u01(unsigned long a, unsigned long b, unsigned long salt) {
@@ -705,6 +708,8 @@ static double escrow_proc_of(long id) { return (escrow_proc != NULL && id >= 0 &
 struct escrow_link {
   double r;        /* この受け渡しの往復 (水増し込み) */
   double leg;      /* この決済での片道のネットワークの遅れ */
+  double leg_mean; /* そのリンクの片道の平均 */
+  double leg_var;  /* 片道のばらつき (分散, ms²): HOLD_LEGS_NORM=1 ならリンクの本当の値、それ以外は Tor かどうかの区分の値 */
   double er_true;  /* リンクの本来の予想往復 */
   double er;       /* 送り手が学習している予想往復 (保持の起点に使う) */
   double D;        /* 期限 */
@@ -729,6 +734,24 @@ static void escrow_link_eval(long recv_id, long offer_id, long pid, int recv_mal
                    (unsigned long)recv_id * 1000003UL + (unsigned long)offer_id, 13UL)) + infl;
   L->leg = 0.5 * net * exp(sj * escrow_hash_normal((unsigned long)pid,
                    (unsigned long)recv_id * 1000003UL + (unsigned long)offer_id, 31UL));
+  if (P->legs_norm == 2)   /* Tor かどうかで分けた平均 (ノードごとの性質から学べる範囲) */
+    L->leg_mean = 0.5 * (P->m * exp(0.5 * P->sigma_link * P->sigma_link)
+                         + (tor ? P->tor_ms * exp(0.5 * P->tor_sigma_link * P->tor_sigma_link) : 0.0)) * exp(0.5 * sj * sj);
+  else
+    L->leg_mean = 0.5 * net * exp(0.5 * sj * sj);
+  {
+    double ej = exp(0.5 * sj * sj), ej2 = exp(2.0 * sj * sj);
+    if (P->legs_norm == 1) {
+      L->leg_var = 0.25 * net * net * (ej2 - ej * ej);
+    } else {   /* 区分の中でリンクごとの差と1回ごとのぶれを合わせた分散 */
+      double ea = P->m * exp(0.5 * P->sigma_link * P->sigma_link), ea2 = P->m * P->m * exp(2.0 * P->sigma_link * P->sigma_link);
+      double eb = tor ? P->tor_ms * exp(0.5 * P->tor_sigma_link * P->tor_sigma_link) : 0.0;
+      double eb2 = tor ? P->tor_ms * P->tor_ms * exp(2.0 * P->tor_sigma_link * P->tor_sigma_link) : 0.0;
+      double m1 = 0.5 * (ea + eb) * ej;
+      double m2 = 0.25 * (ea2 + 2.0 * ea * eb + eb2) * ej2;
+      L->leg_var = m2 - m1 * m1;
+    }
+  }
   /* 送り手が期限と予想往復を何から学ぶか */
   double bb = b, add = infl;                         /* adaptive / fixed: この向きの受領証 (水増し込み) */
   if (P->d_mode == ESCROW_D_REF) {
@@ -2097,15 +2120,20 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               escrow_link_eval(cand, hop_dn->to_node_id, payment->id, dn_node->is_malicious, &L);
               if (L.r > L.D) settle_lat += L.D + L.e - L.er;
           }
+          double legs_var = 0.0;   /* この標本の片道のばらつき (標本ごとの標準化に渡す) */
           if (escrow_params()->hold_legs > 0) {
               /* 測る保持に含まれる片道の遅れ: 1本目 = 下流 (送り手) → 本人、2本目 = 本人 → 上流 */
               struct escrow_link L;
+              int norm = escrow_params()->legs_norm;
               escrow_link_eval(cand, hop_dn->to_node_id, payment->id, 0, &L);
-              settle_lat += L.leg;
+              settle_lat += L.leg - (norm ? L.leg_mean : 0.0);
+              legs_var += L.leg_var;
               if (escrow_params()->hold_legs >= 2) {
                   escrow_link_eval(hop_up->from_node_id, cand, payment->id, 0, &L);
-                  settle_lat += L.leg;
+                  settle_lat += L.leg - (norm ? L.leg_mean : 0.0);
+                  legs_var += L.leg_var;
               }
+              if (settle_lat < 1.0) settle_lat = 1.0;
           }
           if (get_escrow() && escrow_params()->jitter_in_hold && !escrow_params()->anchor_key &&
               !lies_on_this_payment(dn_node, payment)) {
@@ -2119,6 +2147,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。
            * (4a) の標本は片方が嘘なので学習しない版で検定する。 */
+          hold_set_sample_var(legs_var);
           int should_report = fav_test
               ? on_hold_hypothesis_test_nolearn(
                     dn_node, settle_lat,
