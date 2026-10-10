@@ -2155,6 +2155,18 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               : on_hold_hypothesis_test(
                     dn_node, settle_lat,
                     detector_in_warmup(payment, (long)simulation->processed_payments), avg_iv, nh);
+          {
+              /* 診断 (env CLOTH_SETTLE_ZLOG): warmup 後の検定ごとの z を書き出す
+               * 決済,ノード,次数,悪意,この決済の保持者か,(4a)か,そのノードの検定回数,z,σ,報告したか */
+              static FILE* zf = NULL; static int zinit = 0;
+              if (!zinit) { zinit = 1; const char* zp = getenv("CLOTH_SETTLE_ZLOG");
+                            if (zp != NULL && zp[0] != '\0') zf = fopen(zp, "w"); }
+              if (zf != NULL && !detector_in_warmup(payment, (long)simulation->processed_payments))
+                  fprintf(zf, "%ld,%ld,%ld,%d,%d,%d,%ld,%.4f,%.5f,%d\n", payment->id, cand,
+                          (dn_node->open_edges != NULL) ? array_len(dn_node->open_edges) : 0L,
+                          dn_node->is_malicious ? 1 : 0, (payment->grief_hold_node_id == cand) ? 1 : 0,
+                          fav_test, dn_node->settle_test_count, hold_last_z(), hold_last_sd(), should_report);
+          }
           if (should_report && cand != payment->sender && cand != payment->receiver &&
               is_node_observed_by_judges(network, cand) &&
               !has_attack_reporter(payment, cand)) {   /* dedup: 同一決済で同一ノードは1回 */

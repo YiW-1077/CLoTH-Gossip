@@ -1249,6 +1249,40 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
  *   標本の少ないノードが、遅れがほぼ一定のシミュ向けの決め打ちの初期値 (100ms・σ0.1) のまま検定され続けるのを防ぐ。
  * 標準化: hold_set_sample_var() で渡された「その標本が通ったネットワークの片道のばらつき」を、検定の分散に標本ごとに足す
  *   (log 空間へはデルタ法 Var(log X) ≈ Var(X)/E[X]² で換算)。ノード自身の分散は (偏差² − 追加分散) で学ぶ。 */
+/* === hold 検知器の多重検定の補正 (CLOTH_SETTLE_FWER, 既定 0) ===
+ * 0 = 従来: 次数のヒンジ超過分で σ を掛け算で広げる (= z の閾値を 1+k·ln(1+超過) 倍に上げる)。
+ * 1 = ボンフェローニ (次数): σ は広げず、p の閾値を α / (1 + max(0, 次数 − D)) にする。
+ * 2 = ボンフェローニ (検定回数): σ は広げず、p の閾値を α / (そのノードの warmup 後の検定回数) にする。
+ * CLOTH_SETTLE_HUB_STRIKES=n (既定 0=使わない): 次数 > D のノードは異常 n 回で報告する (分布の裾の形によらない補正)。
+ * 診断 CLOTH_SETTLE_ZLOG: 検定ごとの z (膨張前) を htlc.c が書き出す (hold_last_z)。 */
+static int get_hold_fwer() {
+    static int v = -1;
+    if (v >= 0) return v;
+    char *env = getenv("CLOTH_SETTLE_FWER");
+    v = (env != NULL) ? atoi(env) : 0;
+    if (v < 0 || v > 2) v = 0;
+    return v;
+}
+static int get_hold_hub_strikes() {
+    char *env = getenv("CLOTH_SETTLE_HUB_STRIKES");
+    int v = (env != NULL) ? atoi(env) : 0;
+    return (v > 0) ? v : 0;
+}
+static double hold_degree_excess(const struct node* node) {
+    long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
+    double excess = (double)deg - get_hold_degree_min();
+    return (excess > 0.0) ? excess : 0.0;
+}
+static double hold_p_threshold(const struct node* node, double alpha) {
+    int mode = get_hold_fwer();
+    if (mode == 1) return alpha / (1.0 + hold_degree_excess(node));
+    if (mode == 2) return alpha / (double)(node->settle_test_count + 1);
+    return alpha;
+}
+static double g_hold_last_z = 0.0, g_hold_last_sd = 0.0;
+double hold_last_z(void) { return g_hold_last_z; }
+double hold_last_sd(void) { return g_hold_last_sd; }
+
 #define HOLD_VAR_FLOOR 1e-4
 static int get_hold_prior() {
     static int v = -1;
@@ -1334,7 +1368,7 @@ static void update_hold_baseline_std(struct node* node, double xlog, double vlog
 static double hold_sigma_eff(const struct node* node, double sd, int n_hops) {
     double sigma_eff = sd;
     double inflate = 1.0;
-    double k_deg = get_hold_degree_sigma();
+    double k_deg = (get_hold_fwer() == 0) ? get_hold_degree_sigma() : 0.0;   /* FWER≥1 は閾値で補正する */
     if (k_deg > 0.0) {
         long deg = (node->open_edges != NULL) ? array_len(node->open_edges) : 0;
         double excess = (double)deg - get_hold_degree_min();
@@ -1447,7 +1481,9 @@ static int hold_test_impl(
         double sigma_eff = hold_sigma_eff(node, sd, n_hops);
         double p_value = calculate_p_value_log_normal(
             settle_latency_ms, node->settle_baseline_mean, sigma_eff);
-        anomalous = (p_value < p_threshold);
+        anomalous = (p_value < hold_p_threshold(node, p_threshold));
+        g_hold_last_z = (log(settle_latency_ms + 1.0) - node->settle_baseline_mean) / sd;   /* 膨張前の z (診断) */
+        g_hold_last_sd = sd;
     }
 
     node->settle_test_count++;
@@ -1465,6 +1501,7 @@ static int hold_test_impl(
             if (v >= 1) report_strikes = v;
         }
     }
+    if (get_hold_hub_strikes() > 0 && hold_degree_excess(node) > 0.0) report_strikes = get_hold_hub_strikes();
     int should_report = 0;
     if (anomalous) {
         node->settle_suspicion++;
@@ -1534,7 +1571,9 @@ int on_hold_pair_test(struct node* a, struct node* b, double sum_ms, int in_warm
     }
     if (mean_sum <= 0.0) return 0;
     double p_value = calculate_p_value_log_normal(sum_ms, log(mean_sum + 1.0), sigma);
-    return (p_value < get_pvalue_threshold());
+    double thr = get_pvalue_threshold();   /* 2人のうち厳しいほうの閾値 */
+    double ta = hold_p_threshold(a, thr), tb = hold_p_threshold(b, thr);
+    return (p_value < ((ta < tb) ? ta : tb));
 }
 
 /* === Attack Report Tracking: per-payment reporter registry === */

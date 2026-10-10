@@ -326,6 +326,10 @@ int on_hold_hypothesis_test(
  * CLOTH_SETTLE_STANDARDIZE=1 のときだけ使われ、次の検定で消費される。 */
 void hold_set_sample_var(double var_ms2);
 
+/* 直前の hold 検定の z (次数による膨張の前) と、そのときの σ (診断ログ用)。 */
+double hold_last_z(void);
+double hold_last_sd(void);
+
 /* 判定はするが学習しない版。正常判定でも baseline 更新・suspicion 減算をしない。
  * 申告が食い違った標本(どちらかが嘘)で null を汚さないために使う。 */
 int on_hold_hypothesis_test_nolearn(
