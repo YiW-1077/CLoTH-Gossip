@@ -1254,7 +1254,10 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
  * 1 = ボンフェローニ (次数): σ は広げず、p の閾値を α / (1 + max(0, 次数 − D)) にする。
  * 2 = ボンフェローニ (検定回数): σ は広げず、p の閾値を α / (そのノードの warmup 後の検定回数) にする。
  * CLOTH_SETTLE_HUB_STRIKES=n (既定 0=使わない): 次数 > D のノードは異常 n 回で報告する (分布の裾の形によらない補正)。
- * 診断 CLOTH_SETTLE_ZLOG: 検定ごとの z (膨張前) を htlc.c が書き出す (hold_last_z)。 */
+ * 診断 CLOTH_SETTLE_ZLOG: 検定ごとの z (膨張前) を htlc.c が書き出す (hold_last_z)。
+ * 既定を 0 のままにする理由 (2026-10-11, 3シード全グリッド): 遅れ一様・攻撃の遅れ固定の世界では 1 にしても
+ * n≤6400 は全く同じで、n=12800 で正直な大ハブの FP が 4→38 に増え grief も +0.7%。1 の得は遅れにばらつきの
+ * ある世界 (Tor・ばらつき40 で grief 約半減) と攻撃の遅れが対数正規の世界 (n=12800 で −16%) で出る。 */
 static int get_hold_fwer() {
     static int v = -1;
     if (v >= 0) return v;

@@ -90,9 +90,14 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 #   ATTEST_PAIR_REVOKE    1 = 相手が後から個別検定で確定したら (5) の報告を取り消して評判を戻す
 #   ATTEST_PAIR_RATE_EXCL_EXPLAINED 1 = 割合の分母から説明済みのペア数を引く
 #   ATTEST_DISPUTE_FLAGS  1 = 食い違ったリンクをそのままペア記録にする(エスクロー方式のモデル, 4b の代わり)
+#   SETTLE_FWER  hold検知の多重検定の補正。既定 0。
+#                0 = 次数σ膨張（ヒンジ型） σ_eff = σ·(1 + k·ln(1 + max(0, d−D)))
+#                1 = ボンフェローニ(次数): σ は広げず p の閾値を α/(1 + max(0, d−D)) にする
+#                    (遅れにばらつきのある世界向け。この既定の世界では n=12800 で正直ハブの FP が 4→38 に増え得なし, 10/11)
+#                2 = ボンフェローニ(検定回数): α/(そのノードの検定回数)。検証用
 #   SETTLE_DEGREE_SIGMA / SETTLE_DEGREE_MIN
-#       hold検知の次数σ膨張（ヒンジ型） σ_eff = σ·(1 + k·ln(1 + max(0, d−D)))
-#       次数 D 以下は膨張ゼロ。D=0 でヒンジ導入前の連続な ln(1+d) に戻る。
+#       k は SETTLE_FWER=0 のときだけ効く。D はどちらでも使う(次数 D 以下は補正ゼロ)。
+#       D=0 でヒンジ導入前の連続な ln(1+d) に戻る。
 #   SETTLE_VAR_INIT  null の初期分散。空 = コード既定(0.01, σ=0.10)。0.0009 で σ=0.03
 #       (σ=0.03 は recall を1ノード拾う代わりに代表条件で誤検知を出すため不採用)
 #   SETTLE_QUANTILE_NULL 1 で旧 per-node 分位点 null に切替
@@ -109,6 +114,7 @@ ATTEST_PAIR_MIN_RATE=0.2
 ATTEST_PAIR_REVOKE=0
 ATTEST_PAIR_RATE_EXCL_EXPLAINED=0
 ATTEST_DISPUTE_FLAGS=0
+SETTLE_FWER=0
 SETTLE_DEGREE_SIGMA=0.20
 SETTLE_DEGREE_MIN=150
 SETTLE_VAR_INIT=
@@ -241,8 +247,8 @@ else
     echo "[Config] 代役ハブ OFF (SUBSTITUTE_COUNT=0 指定・全モードrealistic baseline)。"
 fi
 
-# 決済(hold)検知の null 模型。既定は hold も対数正規 z検定＋次数σ膨張(k=0.20)で fail検知と
-# 統一(FWER対策=次数σ膨張でbusyハブのFPを抑制)。settleは次数非依存なので fail の k=0.04 より
+# 決済(hold)検知の null 模型。既定は hold も対数正規 z検定で fail検知と統一。
+# FWER対策=次数σ膨張でbusyハブのFPを抑制 (SETTLE_FWER=0)。settleは次数非依存なので fail の k=0.04 より
 # 大きい k が必要で、n=12800 で k≈0.12-0.20 のとき per-node 分位点null と precision/recall が
 # 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2)のみに適用。
 # 旧 per-node 分位点null に戻したい場合は env SETTLE_QUANTILE_NULL=1。
@@ -254,7 +260,9 @@ else
     # 次数σ膨張はヒンジ型 σ_eff=σ(1+k·ln(1+max(0,deg-D)))。D=CLOTH_SETTLE_DEGREE_MIN (既定150)
     # 以下のノードは膨張ゼロ=生σ。取りこぼし攻撃者(次数<=84)には狭い null、多検定ノード
     # (次数>=150)には厚い保護を同時に与える。D=0 でヒンジ導入前の挙動に戻る。
-    DETECT_ENV_DEFENSE="CLOTH_SETTLE_DEGREE_SIGMA=$SETTLE_DEGREE_SIGMA CLOTH_SETTLE_DEGREE_MIN=$SETTLE_DEGREE_MIN"
+    # SETTLE_FWER=1 で σ を広げず p の閾値を α/(1+max(0,deg-D)) にする (ボンフェローニ(次数))。
+    # コード既定 (0) と同じ値でも、ログに残すため明示的に渡す。
+    DETECT_ENV_DEFENSE="CLOTH_SETTLE_FWER=$SETTLE_FWER CLOTH_SETTLE_DEGREE_SIGMA=$SETTLE_DEGREE_SIGMA CLOTH_SETTLE_DEGREE_MIN=$SETTLE_DEGREE_MIN"
     # 2026-10-06: 報告の帰属は既定で**相互証明**(被疑者自身の申告を使わない)。
     # 両側の嘘・黙秘に不感。旧方式に戻すには env CLOTH_REPORT_ATTEST=0。
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_REPORT_ATTEST=$REPORT_ATTEST"
@@ -268,7 +276,8 @@ else
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_PAIR_MIN_PARTNERS=$ATTEST_PAIR_MIN_PARTNERS CLOTH_ATTEST_PAIR_EXPLAIN=$ATTEST_PAIR_EXPLAIN CLOTH_ATTEST_PAIR_MIN_RATE=$ATTEST_PAIR_MIN_RATE"
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_PAIR_REVOKE=$ATTEST_PAIR_REVOKE CLOTH_ATTEST_PAIR_RATE_EXCL_EXPLAINED=$ATTEST_PAIR_RATE_EXCL_EXPLAINED CLOTH_ATTEST_DISPUTE_FLAGS=$ATTEST_DISPUTE_FLAGS"
     [ -n "$SETTLE_VAR_INIT" ] && DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_SETTLE_VAR_INIT=$SETTLE_VAR_INIT"
-    echo "[Config] hold検知=対数正規z検定+次数σ膨張(ヒンジ型)+相互証明帰属 (防御モードのみ): $DETECT_ENV_DEFENSE"
+    if [ "$SETTLE_FWER" = "0" ]; then _fwer_desc="次数σ膨張(ヒンジ型)"; elif [ "$SETTLE_FWER" = "2" ]; then _fwer_desc="ボンフェローニ(検定回数)"; else _fwer_desc="ボンフェローニ(次数)"; fi
+    echo "[Config] hold検知=対数正規z検定+${_fwer_desc}+相互証明帰属 (防御モードのみ): $DETECT_ENV_DEFENSE"
 fi
 
 # ---------------------------------------------------------------------------
