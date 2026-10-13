@@ -4,8 +4,14 @@
 # 取引数 N_PAYMENTS × 支払額 PAYMENT_AMOUNTS × p値 P_VALUES の全組み合わせで実行する。
 # 防御は method に固定対応: disable→no_defense(PRT/RBR off), method1/2→avoid_low_reputation(PRT/RBR on)。
 # 防御2モードには代役ハブ(what-if)を既定で注入する(下の SUBSTITUTE_COUNT 参照)。
-# Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]
+# Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir|local] [key=value ...]
 # Example: ./run_monitor_sweep.sh 42 /output/dir judging_strategy=method1
+# 出力先 (2026-10-13 方針: シミュのデータはローカルに残さない):
+#   第3引数を省略すると NAS (/Volumes/public1*/$NAS_SUBDIR/<timestamp>) に出す。見つからなければ止まる。
+#   output_base_dir は走っている間の作業場所で、終わった sim から NAS へ移し、全部移せたら消す。
+#   results_summary.csv は NAS 上の結果から作り、NAS の <timestamp>/ に置く。
+#   第3引数に local を渡したときだけ NAS を使わずローカルに残す。
+#   集計の作り直し: ./run_monitor_sweep.sh --regen-summary <NAS 上の <timestamp> dir>
 
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <seed[,seed...]> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]"
@@ -561,15 +567,31 @@ mkdir -p "$output_base" || {
 # Handle remote output directory (SMB conversion to local mount path)
 # ---------------------------------------------------------------------------
 remote_output_base=""
+# 既定の NAS の置き場所。二重マウントで /Volumes/public1-1 等になることがあるので、
+# /Volumes/public1* のうち書き込めるものを使う
+NAS_SUBDIR="thesis/2026bachelor-af23/AF23027王毅恒"
+if [[ "$remote_arg" == "local" ]]; then
+    remote_arg=""
+    echo "[Config] 出力はローカルのみ (第3引数 local)。NAS には送らない"
+elif [[ "$remote_arg" == smb://* ]]; then
+    echo "ERROR: SMB URI は使えない: $remote_arg"
+    echo "       マウントしてからローカルのパス (例 /Volumes/public1/...) を渡すこと。"
+    exit 1
+elif [[ -z "$remote_arg" ]]; then
+    for _m in /Volumes/public1 /Volumes/public1-*; do
+        if [[ -d "$_m/$NAS_SUBDIR" && -w "$_m/$NAS_SUBDIR" ]]; then remote_arg="$_m/$NAS_SUBDIR"; break; fi
+    done
+    if [[ -z "$remote_arg" ]]; then
+        echo "ERROR: NAS ($NAS_SUBDIR) が見つからないか書き込めない。"
+        echo "       open smb://morinolab@172.20.86.110/public1 でマウントするか、第3引数で置き場所を渡すこと"
+        echo "       (ローカルに残すなら第3引数に local)。"
+        exit 1
+    fi
+fi
 if [[ -n "$remote_arg" ]]; then
-    if [[ "$remote_arg" == smb://* ]]; then
-        echo "WARN: unsupported SMB URI format: $remote_arg"
-        echo "      mount SMB first and pass local mount path (e.g. /Volumes/public1/...)."
-        remote_arg=""
-    fi
-    if [[ -n "$remote_arg" ]]; then
-        remote_output_base="$remote_arg/$timestamp"
-    fi
+    remote_output_base="$remote_arg/$timestamp"
+    mkdir -p "$remote_output_base" || { echo "ERROR: NAS に出力先を作れない: $remote_output_base"; exit 1; }
+    echo "[Config] 出力先 NAS: $remote_output_base (終わった sim から移し、ローカルの作業場所は最後に消す)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -581,6 +603,16 @@ nas_error_log="/tmp/nas_transfer_errors_$$.log"
 echo 0 > "$nas_counter_transferred"
 echo 0 > "$nas_counter_failed"
 > "$nas_error_log"
+
+# $1 を引数に含むプロセスがまだあるか (パスの後ろが 空白・/・行末 のときだけ一致とみなす。
+# p_0_01 が p_0_015 等に誤って一致しないように)
+# パスは環境変数で渡す (awk -v で渡すと awk 自身のコマンド行に載り、常に「使用中」になる)
+function sim_dir_busy() {
+    ps -axo command= | SIM_DIR_PATH="$1" awk '{
+        p = ENVIRON["SIM_DIR_PATH"]; i = index($0, p)
+        if (i) { c = substr($0, i + length(p), 1); if (c == "" || c == " " || c == "/") f = 1 }
+    } END { exit !f }'
+}
 
 function move_completed_to_remote() {
     if [[ -z "$remote_output_base" ]]; then
@@ -624,10 +656,18 @@ function move_completed_to_remote() {
             continue
         fi
 
-        # environment ディレクトリが残っていても強制削除してから転送
+        # run-simulation.sh は progress=1 を書いた後に measure_payment_time.sh を回し、最後に
+        # environment を消す。まだその途中 (この dir を引数に持つプロセスがある) なら次回に回す。
+        # プロセスが終わっているのに environment が残っていれば (rm の失敗) 消してから転送する
+        if sim_dir_busy "$sim_dir"; then
+            continue
+        fi
         rm -rf "$sim_dir/environment" 2>/dev/null || true
 
-        if rsync -a --exclude='environment' "$sim_dir/" "$dest_dir/" 2>/tmp/nas_transfer_error.log; then
+        # 転送して、中身が一致することを確かめてからローカルを消す
+        # (SMB は権限・時刻の精度が違うので照合は -rlt と --modify-window で)
+        if rsync -a --exclude='environment' "$sim_dir/" "$dest_dir/" 2>/tmp/nas_transfer_error.log &&
+           [ -z "$(rsync -rlt --dry-run --itemize-changes --modify-window=2 --exclude='environment' "$sim_dir/" "$dest_dir/" 2>&1)" ]; then
             rm -rf "$sim_dir"
             mkdir -p "$sim_dir"
             echo "$progress" > "$sim_dir/progress.tmp"
@@ -968,8 +1008,31 @@ echo "=========================================="
 
 # ---------------------------------------------------------------------------
 # results_summary.csv 生成 (生成ロジックは上部 generate_summary_csv 関数に集約)
+# NAS を使うときは NAS 上の結果から作り、NAS の <timestamp>/ にも置く
 # ---------------------------------------------------------------------------
 generate_summary_csv
+
+# ---------------------------------------------------------------------------
+# ローカルの作業場所を消す (NAS を使うとき)。次を全部確かめてから:
+#   - 結果 dir がローカルに残っていない (全部 NAS へ移した)
+#   - NAS 上の結果 dir (summary.csv を持つ) が sim の数だけある
+#     (集計は NAS に無い dir をローカルの空の dir で埋めて N/A の行を出すので、行数だけでは足りない)
+#   - CSV の行数が sim の数と同じで、NAS 上の CSV がローカルと同じ
+# どれかが欠けたらローカルは残す
+# ---------------------------------------------------------------------------
+if [[ -n "$remote_output_base" ]]; then
+    _left=$(find "$output_base" -name cloth_input.txt ! -path '*/environment/*' 2>/dev/null | wc -l | tr -d ' ')
+    _on_nas=$(find "$remote_output_base" -name summary.csv ! -path '*/environment/*' 2>/dev/null | wc -l | tr -d ' ')
+    _rows=$(( $(wc -l < "$output_base/results_summary.csv" 2>/dev/null || echo 1) - 1 ))
+    if [ "$_left" -eq 0 ] && [ "$_on_nas" -eq "$total_simulations" ] && [ "$_rows" -eq "$total_simulations" ] &&
+       cmp -s "$output_base/results_summary.csv" "$remote_output_base/results_summary.csv"; then
+        rm -rf "$output_base"
+        echo "ローカルの作業場所を削除: $output_base (結果と CSV は $remote_output_base)"
+    else
+        echo "[WARN] ローカルの作業場所を残す: $output_base"
+        echo "       未転送 $_left / NAS 上の結果 $_on_nas / CSV 行 $_rows / sim 数 $total_simulations"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Timing summary
