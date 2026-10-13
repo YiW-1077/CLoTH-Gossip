@@ -24,8 +24,8 @@ struct network_params {
     double malicious_node_ratio;           // fraction of nodes that are malicious (0.0 to 1.0)
     double malicious_failure_probability;  // prob of HTLC failure when on malicious node
     unsigned int enable_network_attack_delay; // 1 to enable attack-time delay amplification
-    uint64_t attack_delay_start_time;         // attack-delay window start [ms]
-    uint64_t attack_delay_duration;           // attack-delay window duration [ms]
+    uint64_t attack_delay_start_time;         // attack-delay window start [ms] (読み込むだけで未使用: 攻撃は !is_warmup で掛かる)
+    uint64_t attack_delay_duration;           // attack-delay window duration [ms] (同上・未使用)
     double attack_delay_intensity;            // delay multiplier during attack window (>=1.0)
     double attack_delay_jitter;               // additive gaussian jitter to multiplier
 
@@ -170,7 +170,7 @@ struct simulation {
     struct heap *events;
     gsl_rng *random_generator;
     /* === Stage ④ Hypothesis Testing: Global payment counter === */
-    long processed_payments;  // Count of payments completed (for warm-up detection)
+    long processed_payments;  // Count of payments completed (warmup 判定は既定 is_warmup。これは CLOTH_DETECT_WARMUP_BY_COMPLETED=1 の旧判定でだけ使う)
     long total_payments;      // Total number of payments (for warm-up percentage calculation)
     /* === Stage ④ Warm-up: Delayed malicious node activation === */
     double delayed_malicious_ratio;  // Malicious ratio to activate after warm-up (10% of payments)

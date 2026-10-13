@@ -116,8 +116,9 @@ void share_judge_information_and_update_reputation(
 );
 
 /**
- * Report an attacked node from the one-hop upstream node to the judging layer.
- * This is invoked at the node that first observes the failure.
+ * Report an attacked node to the judging layer. reporter_node_id is the node filing the report:
+ * the upstream node of the anomalous hop (fail 検知器), the suspect's upstream neighbour hop_up
+ * (hold 検知器・相互証明), or the payment sender (ペア集計 (5)).
  * Returns 1 if the report was counted (judging/reputation enabled), 0 otherwise.
  */
 int report_attacked_node_to_judges(
@@ -196,8 +197,9 @@ void initialize_judge_trust_scores(struct network* network);
 void update_judge_trust_score(long judge_id, int is_correct);
 
 /**
- * Register node_id as having filed an attack report for payment.
- * Called when hypothesis test fires (should_report=1) on a failed payment.
+ * Register node_id in the payment's per-payment dedup list.
+ * fail 検知器は報告者を、hold 検知器とペア集計 (5) は被疑ノードの id を登録する
+ * (同じ決済で同じノードを2回報告しないため)。
  */
 void register_attack_reporter(struct payment* payment, long node_id);
 
@@ -213,8 +215,8 @@ int has_attack_reporter(struct payment* payment, long node_id);
  *
  *   計測・報告者 (reporter)  必ず PCN ノード。HTLC を実際に転送する立場で
  *       レイテンシを計測し、異常を検知したら判定ノードへ報告する。fail 検知器では
- *       異常ホップの上流ノード、hold 検知器では決済を受け取る上流ノード
- *       (prev_node_id) が該当する。コード上の識別子は reporter_* / *_reporters。
+ *       異常ホップの上流ノード、hold 検知器では被疑ノードの上流隣 (hop_up) が該当する
+ *       (保持時間は既定の相互証明で両隣の申告から構成する)。コード上の識別子は reporter_* / *_reporters。
  *
  *   判定ノード (judge)  報告されたデータをもとに検定で判定し、評判を更新する層。
  *       JudgeAgent として配置され、node->is_judge で識別する。
@@ -258,7 +260,7 @@ int has_attack_reporter(struct payment* payment, long node_id);
  *   fail 検知器 : CLOTH_NULL_DEGREE_SIGMA, CLOTH_NULL_QUANTILE, CLOTH_NULL_Q_STEP,
  *                 CLOTH_DETECT_KOFM, CLOTH_DETECT_WINDOW, CLOTH_DETECT_K,
  *                 CLOTH_ATTRIB_PER_HOP
- *   hold 検知器 : CLOTH_DETECT_GRIEF ("grief"=hold), CLOTH_SETTLE_* ("settle"=hold)
+ *   hold 検知器 : CLOTH_DETECT_GRIEF ("grief"=hold, 案B 専用), CLOTH_SETTLE_* ("settle"=hold)
  *   両方で共有   : CLOTH_PVALUE_THRESHOLD (α), CLOTH_DETECT_WARMUP_BY_COMPLETED
  *                 (+ 旧判定時のみ CLOTH_WARMUP_PAYMENTS)
  * =========================================================================== */
@@ -268,7 +270,7 @@ int has_attack_reporter(struct payment* payment, long node_id);
  * H0: latency is normal network congestion
  * H1: latency is intentional attack (too high)
  * Uses Z-test on log-transformed latency: Z = (ln(latency + 1) - μ) / σ
- * Returns p-value [0.0, 1.0]; p < 0.01 indicates likely attack
+ * Returns p-value [0.0, 1.0]; p < α (CLOTH_PVALUE_THRESHOLD, 既定 0.005) indicates likely attack
  */
 double calculate_p_value_log_normal(double observed_latency_ms, double baseline_mean, double baseline_std);
 
@@ -291,7 +293,8 @@ int detector_in_warmup(const struct payment* payment, long completed_payments);
 /**
  * fail 検知器: forward leg のホップ間レイテンシを対数正規 null で検定する。
  * htlc.c の receive_fail() (is_fail=1) と receive_success() (is_fail=0) の双方から
- * 経路上の全ホップについて呼ばれるが、報告 (戻り値 1) は is_fail=1 のときのみ。
+ * 経路上のホップについて呼ばれるが、報告 (戻り値 1) は is_fail=1 のときのみ。
+ * receive_fail の失敗ホップ (fallthrough 区間) は error.type==OFFLINENODE のときだけ検定する (8a66102)。
  * is_fail=0 の呼び出しは baseline 更新と Axis-2 カウンタ蓄積が目的。
  * 戻り値: 1=fail 型攻撃として報告すべき, 0=正常 / warmup 中 / 成功経路。
  */
@@ -307,7 +310,9 @@ int on_fail_hypothesis_test(
  * hold 検知器 (Phase 1): settlement (backward) レグでノードが success を上流へ
  * release するまでの区間レイテンシ(=preimage保持時間)を対数正規 null で検定する。
  * fail 検知器の baseline_* とは別系統(settle_baseline_*)を用い、保持攻撃者本人を
- * 直接特定する(下流帰属トリック不要 — 保持ノード自身が release を転送するため)。
+ * 直接特定する。既定の呼び出し元は receive_success の案A で、保持時間は相互証明
+ * hold[p]=recv[p-1]-send_back[p+1] (被疑者自身の申告を使わない) で構成して渡す。
+ * (案B = forward_success からの呼び出しでは保持ノード自身が release を転送する区間を測る)
  * hold 型は支払いを成功させるため fail 検知器には映らず、この検知器だけが拾える。
  * 戻り値: 1=hold 型攻撃として報告すべき, 0=正常 or warmup中。
  * in_warmup: detector_in_warmup() の結果。

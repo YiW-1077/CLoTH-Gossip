@@ -49,7 +49,7 @@ struct node {
   double reputation_score;          // [0.0, 1.0] - 1.0=trusted, 0.0=malicious
   int malicious_reports;            // count of detection incidents
   long attest_dispute_count;        // 相互証明の突き合わせ不一致に関与した回数 (偽報告の痕跡)
-  long nesting_violation_count;     // 入れ子制約(recv[i]>recv[i+1])違反で検定を飛ばした回数
+  long nesting_violation_count;     // 入れ子制約(recv[i]>recv[i+1])違反の回数 (既定 SILENCE_POLICY=1 では本人の記録を使わない扱いにして帰属は続ける)
   long silence_count;               // 自分の時刻記録を提出しなかった(黙秘した)回数
   /* 片側だけの食い違い(CLOTH_ATTEST_SINGLE_DISPUTE)の診断・ペア集計用 */
   long causality_violation_count;   // 自分の申告が「受け取る前に送った」になっていた回数
@@ -77,8 +77,8 @@ struct node {
   double baseline_mean;             // log-normal baseline mean (μ)
   double baseline_std;              // log-normal baseline std dev (σ) = sqrt(baseline_var)
   double baseline_var;              // log-normal baseline variance (σ²): EMA of squared deviation
-  int suspicion_score;              // cumulative anomaly score (3 strikes rule)
-  long payment_count;               // count of payments processed (for warm-up detection)
+  int suspicion_score;              // cumulative anomaly score (旧 計測・報告者 2-strike 用。既定の per-hop 1-strike では診断用)
+  long payment_count;               // count of payments processed (診断用。warmup 判定には使わない)
   uint32_t anomaly_window;          // k-of-m: bitmask of recent anomaly flags (newest=LSB)
   /* === FWER 対策実験用 (Axis-2 BH-FDR / Axis-3 better-null) ===
    * post-warmup の仮説検定回数と異常回数。ノード別の異常率 p_hat=anomaly/test を
@@ -94,7 +94,7 @@ struct node {
   double settle_baseline_var;       // σ² (squared-deviation EMA)
   double settle_anom_q;             // per-node heavy-tail null: warmup で学習する log-settle-latency の(1-α)分位点。CLOTH_SETTLE_NULL_QUANTILE 時に使用(post-warmupは凍結)。0=未学習
   int    settle_suspicion;          // 異常ランダムウォーク (CLOTH_SETTLE_REPORT_STRIKES 以上で報告。既定1)
-  long   settle_learn_count;        // baseline 学習に使ったサンプル数(per-node warmup用)
+  long   settle_learn_count;        // 未使用 (0 に初期化されるだけ)
   long   settle_test_count;         // 診断: post-warmup の settlement レグ検定総数
   long   settle_anomaly_count;      // 診断: そのうち異常だった回数
   /* 共通の事前分布 (CLOTH_SETTLE_PRIOR): warmup 中の自分の標本 (log) の集計と、寄せ直し済みか */

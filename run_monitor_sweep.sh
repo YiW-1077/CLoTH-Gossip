@@ -18,8 +18,10 @@ fi
 # ##                                                                        ##
 # ##   設 定 ブ ロ ッ ク  —  条件を変えるときはここだけを編集する              ##
 # ##                                                                        ##
-# ##   ここ以外に設定値は散らばっていない。環境変数は見ないので、ユーザの      ##
-# ##   シェルに export CLOTH_* が残っていても結果は化けない。                ##
+# ##   ここ以外に設定値は散らばっていない。ここの値は毎回明示的に渡すので、    ##
+# ##   シェルに同名の CLOTH_* が残っていても上書きされる。ただしここに無い     ##
+# ##   CLOTH_* (OBSERVE_DEGREE_MIN, HOLD_ROUNDTRIP 等) はシェルから引き継がれる ##
+# ##   ので、実行前に unset しておくこと。                                   ##
 # ##   (例外: 第4引数以降の judging_strategy= / p_list= は従来どおり有効)  ##
 # ############################################################################
 
@@ -46,7 +48,8 @@ ATTACK_SUCCESS_RATE=1.0         # 悪意ノードを通った決済が攻撃さ�
 #    (防御モードだけに掛けると対照条件が攻撃を受けず比較が壊れる)。
 #   FALSE_REPORT_MS    攻撃者が自分の申告時刻を偽る量[ms]。0 = 嘘なし。
 #                      受領時刻 +X / 送出時刻 -X と偽り見かけの保持を 2X 縮める。
-#                      目安: 50 = 冤罪を出せる最小値、100超で入れ子制約が破れ始める
+#                      目安 (旧方式 REPORT_ATTEST=0 での値): 50 = 冤罪を出せる最小値、
+#                      100超で入れ子制約が破れ始める。相互証明 (既定) では冤罪は出ない
 #   FALSE_REPORT_PROB  嘘をつく確率 [0,1]。1.0 = 攻撃のたびに毎回
 #   FALSE_REPORT_SIDE  偽る側 both(受領も送出も) / recv(受領だけ遅く) / send(送出だけ早く)。
 #                      片側だけだと食い違うリンクが1本になり、2本ルールでは本人と断定できない
@@ -219,7 +222,7 @@ echo "[Config] FWER対策: CLOTH_NULL_DEGREE_SIGMA=$CLOTH_NULL_DEGREE_SIGMA CLOT
 # 攻撃種別を全 sim へ継承。値は設定ブロック[2]。
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
-[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF=1   # mode2/3で決済検知器を自動ON
+[ "$ATTACK_MODE" != "1" ] && export CLOTH_DETECT_GRIEF=1   # 案B (CLOTH_HOLD_ROUNDTRIP=0) 用。既定の案A はこれによらず走る (過去 run と揃えるため渡す)
 echo "[Config] 攻撃手法 ATTACK_MODE=$ATTACK_MODE (1=hold-to-timeout 2=hold 3=mix)  DETECT_GRIEF=${CLOTH_DETECT_GRIEF:-0}  HOLD_RATIO=${CLOTH_GRIEF_HOLD_RATIO:-n/a}"
 
 # 攻撃モデル(偽報告・黙秘・時計ずれ・遅延分布)を全モードへ継承。値は設定ブロック[3]。
@@ -251,7 +254,7 @@ fi
 # FWER対策=次数σ膨張でbusyハブのFPを抑制 (SETTLE_FWER=0)。settleは次数非依存なので fail の k=0.04 より
 # 大きい k が必要で、n=12800 で k≈0.12-0.20 のとき per-node 分位点null と precision/recall が
 # 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2)のみに適用。
-# 旧 per-node 分位点null に戻したい場合は env SETTLE_QUANTILE_NULL=1。
+# 旧 per-node 分位点null に戻したい場合は設定ブロックの SETTLE_QUANTILE_NULL=1。
 # hold検知の null と帰属方式。値は設定ブロック[4]。防御モードにだけ per-run env として付ける。
 if [ "$SETTLE_QUANTILE_NULL" = "1" ]; then
     DETECT_ENV_DEFENSE="CLOTH_SETTLE_NULL_QUANTILE=true"
@@ -264,7 +267,7 @@ else
     # コード既定 (0) と同じ値でも、ログに残すため明示的に渡す。
     DETECT_ENV_DEFENSE="CLOTH_SETTLE_FWER=$SETTLE_FWER CLOTH_SETTLE_DEGREE_SIGMA=$SETTLE_DEGREE_SIGMA CLOTH_SETTLE_DEGREE_MIN=$SETTLE_DEGREE_MIN"
     # 2026-10-06: 報告の帰属は既定で**相互証明**(被疑者自身の申告を使わない)。
-    # 両側の嘘・黙秘に不感。旧方式に戻すには env CLOTH_REPORT_ATTEST=0。
+    # 両側の嘘・黙秘に不感。旧方式に戻すには設定ブロックの REPORT_ATTEST=0。
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_REPORT_ATTEST=$REPORT_ATTEST"
     # 相互証明の2ポリシー(いずれも既定1)。コード側の既定に任せるとログに残らず、
     # 後から「どの版で回したか」が追えないので明示的に渡して記録する。
@@ -779,7 +782,7 @@ echo "  攻撃成功率    : $ATTACK_SUCCESS_RATE"
 echo ""
 echo "スイープパラメータ:"
 echo "  取引回数       : ${N_PAYMENTS[*]}"
-echo "  平均支払額（msat） : ${PAYMENT_AMOUNTS[*]}"
+echo "  平均支払額（sat）  : ${PAYMENT_AMOUNTS[*]}"
 echo "  判定ノード数   : ${JUDGE_NODE_COUNTS[*]}"
 echo "  監視方法       : ${JUDGING_METHODS[*]}"
 echo "  防御モード     : method固定対応 (disable→no_defense, method1/2→avoid_low_reputation)"
@@ -839,13 +842,13 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                         strategy_val="method1"
                         judge_counts_iter=("${JUDGE_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
-                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
+                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役 + hold 検知の設定 (z検定・補正・相互証明。SETTLE_QUANTILE_NULL=1 なら分位点 null)
                         ;;
                     judge_method2)
                         strategy_val="method2"
                         judge_counts_iter=("${JUDGE_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
-                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役+per-node null(各々有効時のみ非空)
+                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役 + hold 検知の設定 (z検定・補正・相互証明。SETTLE_QUANTILE_NULL=1 なら分位点 null)
                         ;;
                     *)
                         echo "ERROR: Unknown monitoring method: $method"

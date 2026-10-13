@@ -33,9 +33,9 @@ static double get_pvalue_threshold() {
  * env CLOTH_NULL_DEGREE_SIGMA = k (既定 0.04 = ON)。n 増に伴う fail 検知器の FWER
  * (高次数ハブの誤報告) を抑え precision を保つ。n=12800 で precision 90->96% を実測。
  * env で上書き可、0 を明示すると無効=従来の単一対数正規 null。
- * ⚠️ hold 検知器はこの σ 膨張を使わない: settlement レグのレイテンシは次数非依存
- *    (Phase0 実測) なので degree を説明変数にする根拠がなく、代わりに per-node
- *    経験分位点 null (下の hold 版) を用いる。 */
+ * ⚠️ hold 検知器はこの k を使わない: hold は別系統の次数σ膨張 (CLOTH_SETTLE_DEGREE_SIGMA,
+ *    既定 k=0.20) を、次数が D=150 を超えた分だけ掛けるヒンジ型で使う (下の hold 版)。
+ *    fail 側はヒンジなしの連続形 ln(1+degree) のまま。 */
 static double get_fail_null_degree_sigma() {
     char *env = getenv("CLOTH_NULL_DEGREE_SIGMA");
     if (env == NULL) return 0.04;
@@ -48,7 +48,8 @@ static double get_fail_null_degree_sigma() {
  * 各ノードが自分の log-latency の (1-α) 分位点 anom_q を Robbins-Monro で学習し、
  * anomalous = (log_lat > anom_q) と判定する。これにより per-node の異常率が α に
  * 収束 → 多忙ハブも自分の本物の裾に合わせた高い閾値を学び FP が消える(degree不使用)。
- * 静かなノードは低い閾値のまま感度を保つ。hold 検知器では同方式を採用済み(下の hold 版)。 */
+ * 静かなノードは低い閾値のまま感度を保つ。hold 検知器の同方式は CLOTH_SETTLE_NULL_QUANTILE=true
+ * のときだけ (既定は対数正規 z 検定, 2026-08-02 に切替)。 */
 static int get_fail_null_quantile_mode() {
     char *env = getenv("CLOTH_NULL_QUANTILE");
     return (env != NULL && strcmp(env, "true") == 0) ? 1 : 0;
@@ -74,8 +75,9 @@ static int get_hold_null_quantile_mode() {
 }
 
 /* === hold 検知器の z検定用 次数σ膨張 (CLOTH_SETTLE_DEGREE_SIGMA=k, 既定0.20) ===
- * hold検知は既定で対数正規z検定(分位点null OFF)。fail検知器と同じ次数σ膨張
- * σ_eff = σ·(1+k·ln(1+deg)) を hold 側にも適用する。hold レイテンシ自体は次数非依存
+ * hold検知は既定で対数正規z検定(分位点null OFF)。fail検知器と同じ形の次数σ膨張を
+ * hold 側にも適用する (式は下の CLOTH_SETTLE_DEGREE_MIN でヒンジ型
+ * σ_eff = σ·(1+k·ln(1+max(0,deg−D))) に一般化済み。fail 側はヒンジなし)。hold レイテンシ自体は次数非依存
  * だが、高次数=高トラフィック=多重検定の露出が大きい(FWER膨張でFPを踏みやすい)ため、
  * 次数を露出の代理として閾値を広げ、busy な正直ハブの誤検知を抑える。0 で無効(生σ)。
  * 既定 k=0.20: hold は次数非依存ゆえ fail の k=0.04 より大きい k が必要で、n=12800 で
@@ -912,7 +914,7 @@ int report_attacked_node_to_judges(
     attacked_node->malicious_reports++;
 
     /* ② latency計測の起点を初回報告時刻に揃える。検出フラグ(recall集計)は
-     * malicious_reports>=1 で立つ(cloth.c:471)が、従来 first_detection_time は
+     * malicious_reports>=1 で立つ(cloth.c の flagged 判定)が、従来 first_detection_time は
      * 2件目のpenalty batch(update_node_reputation_on_detection)でしか記録されず、
      * 単発検出ノード(reports=1)が detection_latency 統計から脱落していた。
      * フラグと同じ起点で記録し、latencyを recall 集合と整合させる(挙動・rep値は不変)。 */
@@ -1240,7 +1242,8 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
  * settlement レグの転送レイテンシ(=preimage保持時間)を対数正規 null で検定する。
  * 入力は (ノード, 観測レイテンシ, warmup 判定, seed) のみで、そのノードが hold 型攻撃者
  * かどうかの事前ラベル (payment->grief_hold_node_id / node->is_malicious) は渡らない。
- * forward_success を処理する全ノードが同じ検定を受ける。
+ * 経路上の全中継ノードが同じ検定を受ける (既定の呼び出し元は receive_success の案A・相互証明、
+ * 案B (CLOTH_HOLD_ROUNDTRIP=0) では forward_success)。
  * learn=0 は「判定はするが学習しない」版: 正常判定でも baseline を更新せず、
  * suspicion も減らさない。申告が食い違った標本(片方は嘘)を null の学習に混ぜないため。 */
 /* === 共通の事前分布 (CLOTH_SETTLE_PRIOR) と標本ごとの標準化 (CLOTH_SETTLE_STANDARDIZE), どちらも既定 0 ===
