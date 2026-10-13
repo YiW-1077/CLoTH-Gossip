@@ -121,8 +121,8 @@ static double get_hold_degree_min() {
     return v;
 }
 
-/* === hold 検知器の warmup 後の学習 (CLOTH_SETTLE_ROBUST_LEARN, 既定 0) ===
- * 0 = 従来: 異常と判定されなかった標本を全部学習する。測る保持にぶれがあると、閾値に届かなかった
+/* === hold 検知器の warmup 後の学習 (CLOTH_SETTLE_ROBUST_LEARN, 既定 2 = 打ち切り, 2026-10-13) ===
+ * 0 = 旧挙動: 異常と判定されなかった標本を全部学習する。測る保持にぶれがあると、閾値に届かなかった
  *     攻撃の標本が学習されて基準値が上にずれ、その攻撃者を永久に見逃す (汚染)。
  * 1 = 凍結: warmup 後は学習しない (攻撃は warmup 後にしか起きないので汚染しない)。
  * 2 = 打ち切り: warmup 後は z (膨張前の σ) が CLOTH_SETTLE_LEARN_Z (既定 2) 未満の標本だけ学習する。
@@ -131,8 +131,8 @@ static int get_hold_robust_learn() {
     static int v = -1;
     if (v >= 0) return v;
     char *env = getenv("CLOTH_SETTLE_ROBUST_LEARN");
-    v = (env != NULL) ? atoi(env) : 0;
-    if (v < 0 || v > 2) v = 0;
+    v = (env != NULL) ? atoi(env) : 2;
+    if (v < 0 || v > 2) v = 2;
     return v;
 }
 static double get_hold_learn_z() {
@@ -1246,7 +1246,11 @@ static void update_hold_baseline_lognormal(struct node* node, double latency_ms)
  * 案B (CLOTH_HOLD_ROUNDTRIP=0) では forward_success)。
  * learn=0 は「判定はするが学習しない」版: 正常判定でも baseline を更新せず、
  * suspicion も減らさない。申告が食い違った標本(片方は嘘)を null の学習に混ぜないため。 */
-/* === 共通の事前分布 (CLOTH_SETTLE_PRIOR) と標本ごとの標準化 (CLOTH_SETTLE_STANDARDIZE), どちらも既定 0 ===
+/* === 共通の事前分布 (CLOTH_SETTLE_PRIOR, 既定 0) と標本ごとの標準化 (CLOTH_SETTLE_STANDARDIZE, 既定 1) ===
+ * 事前分布を 0 にした理由 (2026-10-13 ablation, n=12800・p=0.01・3金額×3シード): 学習3ノブ (打ち切り/事前分布/標準化)
+ *   を 2/1/1 にすると FP が 0/0/0 の 2 → 94 (全て次数≤150 の中小ノード)。事前分布だけ外した 2/0/1 は FP 0・recall と grief は
+ *   同じ。標準化は大ハブの FP を消す (打ち切りだけの 2/0/0 は FP 8)。ただし事前分布は遅れにばらつきのある世界で FP を減らす
+ *   ためのものなので、その世界を測るときは 1 を明示する。標準化は 0 を明示すると旧挙動 (追加分散なし) に戻る。
  * 事前分布: warmup 中の全ノードの標本 (log) から共通の平均・分散を学ぶ。warmup 後の最初の検定で、各ノードの基準値を
  *   (K × 共通の値 + 自分の warmup 標本) / (K + 標本数) に寄せ直す (K = CLOTH_SETTLE_PRIOR_K, 既定 20)。
  *   標本の少ないノードが、遅れがほぼ一定のシミュ向けの決め打ちの初期値 (100ms・σ0.1) のまま検定され続けるのを防ぐ。
@@ -1300,7 +1304,7 @@ static int get_hold_standardize() {
     static int v = -1;
     if (v >= 0) return v;
     char *env = getenv("CLOTH_SETTLE_STANDARDIZE");
-    return (v = (env != NULL && atoi(env) > 0) ? 1 : 0);
+    return (v = (env != NULL) ? (atoi(env) > 0 ? 1 : 0) : 1);
 }
 static double get_hold_prior_k() {
     char *env = getenv("CLOTH_SETTLE_PRIOR_K");

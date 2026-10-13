@@ -104,6 +104,13 @@ ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_tim
 #   SETTLE_VAR_INIT  null の初期分散。空 = コード既定(0.01, σ=0.10)。0.0009 で σ=0.03
 #       (σ=0.03 は recall を1ノード拾う代わりに代表条件で誤検知を出すため不採用)
 #   SETTLE_QUANTILE_NULL 1 で旧 per-node 分位点 null に切替
+#   SETTLE_ROBUST_LEARN  warmup 後の基準値の学習。2026-10-13 既定 2。
+#                        2 = 打ち切り: z<2 の標本だけ学習し切断正規の分を補正 (閾値に届かない攻撃標本で基準が汚れない)
+#                        0 = 旧: 異常でない標本を全部学習 / 1 = 凍結 (warmup 後は学習しない)
+#   SETTLE_PRIOR         1 = warmup の全ノードの標本から共通の事前分布を学び、warmup 後に各ノードの基準値を寄せ直す
+#                        (標本の少ないノードが決め打ちの初期値のまま検定されない)。既定 0 (2026-10-13 ablation:
+#                        n=12800・p=0.01 の3シードで 1 にすると FP 0→94・全て次数≤150 の中小ノード。0 で FP 0)
+#   SETTLE_STANDARDIZE   1 = 標本ごとに通ったネットワークのばらつきを検定の分散に足す。2026-10-13 既定 1。0 で旧挙動
 #   NULL_DEGREE_SIGMA / RATE_GATE_TAU  forward検知側の FWER 対策 (k / τ)
 REPORT_ATTEST=1
 ATTEST_SILENCE_POLICY=1
@@ -122,6 +129,9 @@ SETTLE_DEGREE_SIGMA=0.20
 SETTLE_DEGREE_MIN=150
 SETTLE_VAR_INIT=
 SETTLE_QUANTILE_NULL=0
+SETTLE_ROBUST_LEARN=2
+SETTLE_PRIOR=0
+SETTLE_STANDARDIZE=1
 NULL_DEGREE_SIGMA=0.04
 RATE_GATE_TAU=0.001
 
@@ -278,6 +288,7 @@ else
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_SINGLE_DISPUTE=$ATTEST_SINGLE_DISPUTE CLOTH_ATTEST_TRUST_SENDER=$ATTEST_TRUST_SENDER CLOTH_ATTEST_TRUST_RECEIVER=$ATTEST_TRUST_RECEIVER"
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_PAIR_MIN_PARTNERS=$ATTEST_PAIR_MIN_PARTNERS CLOTH_ATTEST_PAIR_EXPLAIN=$ATTEST_PAIR_EXPLAIN CLOTH_ATTEST_PAIR_MIN_RATE=$ATTEST_PAIR_MIN_RATE"
     DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_ATTEST_PAIR_REVOKE=$ATTEST_PAIR_REVOKE CLOTH_ATTEST_PAIR_RATE_EXCL_EXPLAINED=$ATTEST_PAIR_RATE_EXCL_EXPLAINED CLOTH_ATTEST_DISPUTE_FLAGS=$ATTEST_DISPUTE_FLAGS"
+    DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_SETTLE_ROBUST_LEARN=$SETTLE_ROBUST_LEARN CLOTH_SETTLE_PRIOR=$SETTLE_PRIOR CLOTH_SETTLE_STANDARDIZE=$SETTLE_STANDARDIZE"
     [ -n "$SETTLE_VAR_INIT" ] && DETECT_ENV_DEFENSE="$DETECT_ENV_DEFENSE CLOTH_SETTLE_VAR_INIT=$SETTLE_VAR_INIT"
     if [ "$SETTLE_FWER" = "0" ]; then _fwer_desc="次数σ膨張(ヒンジ型)"; elif [ "$SETTLE_FWER" = "2" ]; then _fwer_desc="ボンフェローニ(検定回数)"; else _fwer_desc="ボンフェローニ(次数)"; fi
     echo "[Config] hold検知=対数正規z検定+${_fwer_desc}+相互証明帰属 (防御モードのみ): $DETECT_ENV_DEFENSE"
