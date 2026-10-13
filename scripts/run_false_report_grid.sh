@@ -6,12 +6,15 @@
 #   (a) 自分への嫌疑を縮める(自己免罪) (b) 下流隣接ノードを陥れる(冤罪)
 # ことができる。これを CLOTH_FALSE_REPORT_MS[ms] で注入し、帰属方式を変えて比較する。
 #
-#   CLOTH_REPORT_ATTEST=0 : 現行。被疑ノード自身の申告 RT を使って Δ=RT[i]-RT[i+1]。
-#   CLOTH_REPORT_ATTEST=1 : 相互証明。被疑ノードの申告を使わず両隣の申告だけで
-#                           hold[p] = recv[p-1] - send_back[p+1] を構成し、
-#                           同一イベントの二者申告が許容差を超えたらそのリンクを破棄。
+#   CLOTH_REPORT_ATTEST=0 : 旧方式。被疑ノード自身の申告 RT を使って Δ=RT[i]-RT[i+1]。
+#   CLOTH_REPORT_ATTEST=1 : 相互証明 (既定)。被疑ノードの申告を使わず両隣の申告だけで
+#                           hold[p] = recv[p-1] - send_back[p+1] を構成する。同一イベントの
+#                           二者申告が許容差を超えたときの扱いは DISPUTE_POLICY / SINGLE_DISPUTE /
+#                           TRUST_SENDER・TRUST_RECEIVER に従う (10/09 以降の既定は 4a+端点信頼+ペア集計)。
+#                           ⚠️ このスクリプトは SINGLE_DISPUTE・TRUST_* を渡さないのでコードの既定で走る。
+#                           10/06 の結果を再現するなら 0 を明示すること。
 #   CLOTH_CLOCK_SKEW_MS=E : 各ノードの固定時計オフセット(-E..+E)。相互証明は
-#                           ノードをまたぐ突き合わせなので E に敏感、現行方式は
+#                           ノードをまたぐ突き合わせなので E に敏感、旧方式は
 #                           自ノード内の差分なので理屈上は不感。
 #
 # Usage: ./scripts/run_false_report_grid.sh <out_dir> [seed]
@@ -70,8 +73,8 @@ run_once() {
         env GSL_RNG_SEED="$seed" \
             CLOTH_N_ADDITIONAL_NODES=6000 CLOTH_N_PAYMENTS="$N" \
             CLOTH_MALICIOUS_NODE_RATIO="$RATIO" CLOTH_MALICIOUS_FAILURE_PROBABILITY=1.0 \
-            CLOTH_MONITORING_STRATEGY=method2 CLOTH_MONITOR_NODE_LIMIT=10 CLOTH_TOP_HUB_COUNT=10 \
-            CLOTH_ENABLE_PRT=true CLOTH_ENABLE_RBR=true CLOTH_ENABLE_MONITOR_MOVEMENT=false \
+            CLOTH_JUDGING_STRATEGY=method2 CLOTH_JUDGE_NODE_LIMIT=10 CLOTH_TOP_HUB_COUNT=10 \
+            CLOTH_ENABLE_PRT=true CLOTH_ENABLE_RBR=true CLOTH_ENABLE_JUDGE_MOVEMENT=false \
             CLOTH_ENABLE_NETWORK_ATTACK_DELAY=true CLOTH_ATTACK_DELAY_INTENSITY=2.0 \
             CLOTH_ATTACK_MODE=2 CLOTH_DETECT_GRIEF=1 \
             CLOTH_SETTLE_DEGREE_SIGMA=0.20 CLOTH_NULL_DEGREE_SIGMA=0.04 CLOTH_RATE_GATE_TAU=0.001 \
