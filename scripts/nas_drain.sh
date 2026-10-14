@@ -5,7 +5,7 @@
 # (scripts/run_*_grid.sh は 2026-10-14 から自分で NAS へ移す: scripts/nas_lib.sh)
 #
 # Usage: scripts/nas_drain.sh <local_base> <nas_base> <watch_pattern>
-#   local_base 以下の結果 dir (cloth_input.txt を持つ dir。environment/ の中は除く) を
+#   local_base 以下の結果 dir (cloth_input.txt を持つ dir。environment/ の中には入らない) を
 #   nas_base 以下の同じ相対パスへ移す。watch_pattern (pgrep -f の正規表現) に一致する
 #   プロセスが全部終わるまで回り、最後にもう一度移してから、結果 dir が残っていなければ
 #   ログ等の残りも NAS へ写してローカルの local_base を消す。
@@ -53,7 +53,7 @@ drain_once() {
         else
             echo "[ERROR] rsync/照合に失敗: $rel (ローカルに残す)"; n_err=$((n_err + 1))
         fi
-    done < <(find "$local_base" -name cloth_input.txt ! -path '*/environment/*' -print0 2>/dev/null)
+    done < <(find "$local_base" -type d -name environment -prune -o -name cloth_input.txt -print0 2>/dev/null)
 }
 
 echo "$(date '+%F %T') 開始: $local_base -> $nas_base (監視: $pattern)"
@@ -65,7 +65,7 @@ done
 sleep 5
 drain_once
 
-left=$(find "$local_base" -name cloth_input.txt ! -path '*/environment/*' 2>/dev/null | wc -l | tr -d ' ')
+left=$(find "$local_base" -type d -name environment -prune -o -name cloth_input.txt -print 2>/dev/null | wc -l | tr -d ' ')
 if [ "$left" -eq 0 ] && [ "$n_err" -eq 0 ]; then
     # 残り (スイープのログ等) を写す。移した dir の目印と、移した後に作られた中身のない
     # results_summary.csv (集計は NAS から作り直す) は写さない

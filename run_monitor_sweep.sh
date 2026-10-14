@@ -610,12 +610,15 @@ function sim_dir_busy() {
     } END { exit !f }'
 }
 
+# 作業場所を探す find は environment/ (各 sim のプロジェクトの複製、1 本あたり約 1.6 万ファイル) に
+# 入らないよう -prune で刈る。! -path は結果から外すだけで中までたどるので、sweep を何本も並べると
+# find だけで CPU を食い尽くしていた (2026-10-14、macOS 27 の find は 1 回で数コア使う)。
 function move_completed_to_remote() {
     if [[ -z "$remote_output_base" ]]; then
         return 0
     fi
 
-    mapfile -t simulation_progress_files < <(find "$output_base" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
+    mapfile -t simulation_progress_files < <(find "$output_base" -type d -name environment -prune -o -type f -name "progress.tmp" -print 2>/dev/null)
 
     for file in "${simulation_progress_files[@]}"; do
         sim_dir="$(dirname "$file")"
@@ -699,7 +702,7 @@ function nas_drainer() {
             if [ "$v" = "1" ] || [ "$v" = "failed" ]; then
                 n_done=$((n_done + 1))
             fi
-        done < <(find "$output_base" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
+        done < <(find "$output_base" -type d -name environment -prune -o -type f -name "progress.tmp" -print 2>/dev/null)
         sleep 2
     done
     move_completed_to_remote   # 最終ドレイン (ループ終了直前に完了した分を確実に送る)
@@ -739,7 +742,7 @@ function display_progress() {
     # python3/bc/ファイル毎 cat を排し bash 組み込み(+整数演算)に置換したので、
     # CPU飽和下でもほぼ 0.1s 刻みで更新が回る。
     while [ "$n_done" -lt "$total_simulations" ]; do
-        mapfile -t simulation_progress_files < <(find "$output_base" -type f -name "progress.tmp" ! -path "*/environment/*" 2>/dev/null)
+        mapfile -t simulation_progress_files < <(find "$output_base" -type d -name environment -prune -o -type f -name "progress.tmp" -print 2>/dev/null)
 
         n_done=0
         n_failed=0
@@ -1017,7 +1020,7 @@ generate_summary_csv
 # どれかが欠けたらローカルは残す
 # ---------------------------------------------------------------------------
 if [[ -n "$remote_output_base" ]]; then
-    _left=$(find "$output_base" -name cloth_input.txt ! -path '*/environment/*' 2>/dev/null | wc -l | tr -d ' ')
+    _left=$(find "$output_base" -type d -name environment -prune -o -name cloth_input.txt -print 2>/dev/null | wc -l | tr -d ' ')
     _on_nas=$(find "$remote_output_base" -name summary.csv ! -path '*/environment/*' 2>/dev/null | wc -l | tr -d ' ')
     _rows=$(( $(wc -l < "$output_base/results_summary.csv" 2>/dev/null || echo 1) - 1 ))
     if [ "$_left" -eq 0 ] && [ "$_on_nas" -eq "$total_simulations" ] && [ "$_rows" -eq "$total_simulations" ] &&
