@@ -10,11 +10,10 @@
 #  軸2 攻撃ノード割合 (malicious_node_ratio): 0.15(従来) → 0.10 → 0.05 → 0.02
 #  軸3 取引数 n_payments
 #
-# 条件は run_monitor_sweep.sh の防御セル(method2 / avoid_low_reputation)に合わせるが、
-# 交絡を避けるため代役ハブ(SUBSTITUTE)は OFF に固定する:
-#   代役注入は「悪意ハブ(degree>=100)ごとに1個」なので、攻撃割合を変えるとトポロジ
-#   パッチ自体が変わってしまい、検出率の変化が分布/割合由来か代役由来か分離できない。
-#   → 本グリッドの数値は代役ONのsweep結果とは直接比較しないこと。
+# 条件は run_monitor_sweep.sh の防御セル(method2 / avoid_low_reputation)に合わせ、代役ハブも
+# sweep と同じく既定で入れる (2026-10-14 に OFF 固定から変更。研究の主な条件を代役ありにそろえるため)。
+# ⚠️ 代役注入は「悪意ハブ(degree>=100)ごとに1個」なので、攻撃割合を変えるとトポロジのパッチ自体も
+#    変わる。割合の効果だけを見たいときは SUBSTITUTE_COUNT=0 で回すこと (代役ありでは割合と代役の数が交絡する)。
 #
 # Usage: ./scripts/run_attack_realism_grid.sh <out_dir> [seed] [dists] [ratios] [ns]
 # Example: ./scripts/run_attack_realism_grid.sh ~/CLionProjects/result/realism_grid 42
@@ -44,6 +43,9 @@ SIGMA="${CLOTH_ATTACK_DELAY_SIGMA:-1.0}"
 # 平均保持時間そのものを変えたいときは INTENSITY を上げる (2.0 = 従来の +100ms 相当)。
 # 分布軸は平均保存なので、平均の効果はこのノブでしか動かない。
 INTENSITY="${INTENSITY:-2.0}"
+# 代役ハブ (what-if): run_monitor_sweep.sh の防御モードと同じ既定 (悪意のハブ (次数 100 以上) 1 つにつき
+# 正直な代役を 1 つ・オラクル配置)。このグリッドは method2 (防御モード) だけなので全セルに入る。0 で無効
+SUBSTITUTE_COUNT="${SUBSTITUTE_COUNT:-1}"
 
 # --- work dir テンプレート ----------------------------------------------------
 # ⚠️ work dir はセルごとに分ける必要がある。本体の generate_random_payments() は
@@ -80,7 +82,7 @@ echo "   seed          : $seed"
 echo "   分布          : ${DISTS[*]}  (lognormal σ=$SIGMA)"
 echo "   攻撃ノード割合: ${RATIOS[*]}"
 echo "   取引数        : ${NS[*]}"
-echo "   固定条件      : method2 / p=$P_VALUE / amount=$AVG_PMT / hold攻撃(mode2) / 代役OFF"
+echo "   固定条件      : method2 / p=$P_VALUE / amount=$AVG_PMT / hold攻撃(mode2) / 代役ハブ=$SUBSTITUTE_COUNT"
 echo "   並列          : $max_processes"
 echo "   出力          : $RESULT_BASE"
 echo "============================================================"
@@ -112,7 +114,7 @@ run_cell_once() {
             CLOTH_SETTLE_DEGREE_SIGMA=0.20 \
             CLOTH_NULL_DEGREE_SIGMA=0.04 CLOTH_RATE_GATE_TAU=0.001 \
             CLOTH_PVALUE_THRESHOLD="$P_VALUE" \
-            CLOTH_SUBSTITUTE_COUNT=0 \
+            CLOTH_SUBSTITUTE_COUNT="$SUBSTITUTE_COUNT" CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0 \
             CLOTH_ATTACK_DELAY_DIST="$dist" CLOTH_ATTACK_DELAY_SIGMA="$SIGMA" \
             nice -n 4 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
     ) 2>/dev/null

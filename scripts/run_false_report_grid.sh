@@ -35,6 +35,9 @@ max_processes="${MAX_PROCESSES:-8}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 N="${N:-6400}"
 RATIO="${RATIO:-0.15}"
+# 代役ハブ (what-if): run_monitor_sweep.sh の防御モードと同じ既定 (悪意のハブ (次数 100 以上) 1 つにつき
+# 正直な代役を 1 つ・オラクル配置)。このグリッドは method2 (防御モード) だけなので全セルに入る。0 で無効
+SUBSTITUTE_COUNT="${SUBSTITUTE_COUNT:-1}"
 
 # cell = ラベル:attest:lie_ms:skew_ms[:lie_prob[:silent_prob[:silence_policy[:dispute_policy]]]]
 CELLS=(
@@ -65,7 +68,7 @@ make_cell_work() {
 }
 
 echo "============================================================"
-echo " 偽報告耐性グリッド  seed=$seed  n=$N  ratio=$RATIO  並列=$max_processes"
+echo " 偽報告耐性グリッド  seed=$seed  n=$N  ratio=$RATIO  代役ハブ=$SUBSTITUTE_COUNT  並列=$max_processes"
 echo " cells: ${#CELLS[@]}"
 echo "============================================================"
 
@@ -83,7 +86,7 @@ run_once() {
             CLOTH_ENABLE_NETWORK_ATTACK_DELAY=true CLOTH_ATTACK_DELAY_INTENSITY=2.0 \
             CLOTH_ATTACK_MODE=2 CLOTH_DETECT_GRIEF=1 \
             CLOTH_SETTLE_DEGREE_SIGMA=0.20 CLOTH_NULL_DEGREE_SIGMA=0.04 CLOTH_RATE_GATE_TAU=0.001 \
-            CLOTH_PVALUE_THRESHOLD=0.001 CLOTH_SUBSTITUTE_COUNT=0 \
+            CLOTH_PVALUE_THRESHOLD=0.001 CLOTH_SUBSTITUTE_COUNT="$SUBSTITUTE_COUNT" CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0 \
             CLOTH_ATTACK_DELAY_DIST=lognormal CLOTH_ATTACK_DELAY_SIGMA=1.0 \
             CLOTH_REPORT_ATTEST="$att" CLOTH_FALSE_REPORT_MS="$lie" CLOTH_CLOCK_SKEW_MS="$sk" \
             CLOTH_FALSE_REPORT_PROB="$pr" CLOTH_SILENT_REPORT_PROB="$sq" CLOTH_ATTEST_SILENCE_POLICY="$sp" CLOTH_ATTEST_DISPUTE_POLICY="$dp" ${VAR_INIT:+CLOTH_SETTLE_VAR_INIT=$VAR_INIT} \

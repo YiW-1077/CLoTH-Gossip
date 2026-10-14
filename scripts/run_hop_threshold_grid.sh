@@ -35,6 +35,9 @@ P_VALUE="${P_VALUE:-0.001}"
 AVG_PMT=100
 DIST="${DIST:-lognormal}"
 SIGMA="${SIGMA:-1.0}"
+# 代役ハブ (what-if): run_monitor_sweep.sh の防御モードと同じ既定 (悪意のハブ (次数 100 以上) 1 つにつき
+# 正直な代役を 1 つ・オラクル配置)。このグリッドは method2 (防御モード) だけなので全セルに入る。0 で無効
+SUBSTITUTE_COUNT="${SUBSTITUTE_COUNT:-1}"
 
 # arm = ラベル:k_deg:k_hop[:D]  (D=CLOTH_SETTLE_DEGREE_MIN, 省略時0=従来の ln(1+deg))
 # (env ARMS_LIST/RATIOS_LIST/NS_LIST でカンマ区切り上書き可)
@@ -73,7 +76,7 @@ make_cell_work() {
 echo "============================================================"
 echo " 経路長ベース閾値グリッド  seed=$seed  攻撃=$DIST(σ=$SIGMA)"
 echo "   arms  : ${ARMS[*]}"
-echo "   ratios: ${RATIOS[*]}   n: ${NS[*]}   並列: $max_processes"
+echo "   ratios: ${RATIOS[*]}   n: ${NS[*]}   代役ハブ: $SUBSTITUTE_COUNT   並列: $max_processes"
 echo "   出力  : $RESULT_BASE"
 echo "============================================================"
 
@@ -94,7 +97,7 @@ run_cell_once() {
             CLOTH_SETTLE_DEGREE_SIGMA="$kdeg" CLOTH_SETTLE_HOP_SIGMA="$khop" \
             CLOTH_SETTLE_DEGREE_MIN="$dmin" \
             CLOTH_NULL_DEGREE_SIGMA=0.04 CLOTH_RATE_GATE_TAU=0.001 \
-            CLOTH_PVALUE_THRESHOLD="$P_VALUE" CLOTH_SUBSTITUTE_COUNT=0 \
+            CLOTH_PVALUE_THRESHOLD="$P_VALUE" CLOTH_SUBSTITUTE_COUNT="$SUBSTITUTE_COUNT" CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0 \
             CLOTH_ATTACK_DELAY_DIST="$DIST" CLOTH_ATTACK_DELAY_SIGMA="$SIGMA" \
             nice -n 4 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
     ) 2>/dev/null

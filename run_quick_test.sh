@@ -13,6 +13,9 @@ BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
 # (sweep 側 run_monitor_sweep.sh と同期: hold(2)。変える場合は両方揃えること)
 ATTACK_MODE=2
 GRIEF_HOLD_RATIO=0.5    # ATTACK_MODE=3 のときの hold 割合 [0,1]
+# 代役ハブ (what-if): run_monitor_sweep.sh と同じく、判定をする方式 (judging_strategy が disabled 以外) の
+# シナリオにだけ入れる (悪意のハブ (次数 100 以上) 1 つにつき 1 個・オラクル配置)。0 で無効
+SUBSTITUTE_COUNT=1
 # ============================================================
 export CLOTH_ATTACK_MODE="$ATTACK_MODE"
 [ "$ATTACK_MODE" = "3" ] && export CLOTH_GRIEF_HOLD_RATIO="$GRIEF_HOLD_RATIO"
@@ -95,7 +98,13 @@ judging_strategy=$monitoring"
   # build/config/ へコピーした設定 (CMakeLists.txt:9 でルート直下 cloth_input.txt 由来)
   # が読まれ、本スクリプトが $BASE_CONFIG に書いたシナリオ設定が反映されない。
   # ルートで実行すれば $BASE_CONFIG と config/data/ が直接使われる。
-  ( cd "$PROJECT_ROOT" && GSL_RNG_SEED=42 "$BUILD_DIR/CLoTH_Gossip" "$outdir/" ) 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
+  # 代役なしのシナリオでも空で渡し、シェルに残った CLOTH_SUBSTITUTE_COUNT を引き継がない
+  local sub_env="CLOTH_SUBSTITUTE_COUNT="
+  if [ "$monitoring" != "disabled" ] && [ "$SUBSTITUTE_COUNT" -gt 0 ]; then
+    sub_env="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0"
+  fi
+  echo "[Config] 代役ハブ: ${sub_env}"
+  ( cd "$PROJECT_ROOT" && env $sub_env GSL_RNG_SEED=42 "$BUILD_DIR/CLoTH_Gossip" "$outdir/" ) 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
   
   echo "Metrics:"
   cat "$outdir/baseline_metrics.csv" | awk -F',' '{print "  Success: " $4 "%, Avg Delay: " $5}'
