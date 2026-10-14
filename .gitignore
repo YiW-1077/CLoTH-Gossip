@@ -80,3 +80,6 @@ tasks.json
 
 # Python のキャッシュ
 __pycache__/
+
+# run_quick_test.sh が作る sweep の一時コピー (強制終了で残ったとき用)
+/_quick_test_sweep.*.sh
