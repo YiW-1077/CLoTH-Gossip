@@ -7,22 +7,32 @@ FP は実数で出す (0/1/2 の小標本なので % にしない)。
 Usage: python3 scripts/summarize_hinge_verification.py
 """
 import csv
+import glob
 import os
+import sys
 
-# (ラベル, 攻撃モデル, seed, n帯, results_hop.csv のパス)
+SUB = "thesis/2026bachelor-af23/AF23027王毅恒"
+# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
+NAS = next((f"{m}/{SUB}" for m in sorted(glob.glob("/Volumes/public1*")) if os.path.isdir(f"{m}/{SUB}")), None)
+if NAS is None:
+    sys.exit("NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする")
+
+# (ラベル, 攻撃モデル, seed, n帯, results_hop.csv の NAS からの相対パス)
+# run_hop_threshold_grid.sh <out_dir> の結果は NAS の <out_dir の名前>/ に置かれる。
+# ここに並べた 2026-10-06 の run は /tmp に出していて再起動で消えた (NAS にも無い) ので、今は全部「見つかりません」になる。
 SOURCES = [
-    ("lognormal", 42,  "1600/6400", "/tmp/hop_grid/results_hop.csv"),
-    ("lognormal", 42,  "1600/6400", "/tmp/hinge_grid/results_hop.csv"),
-    ("lognormal", 42,  "12800",     "/tmp/hop_grid_n12800/results_hop.csv"),
-    ("lognormal", 42,  "12800",     "/tmp/hinge_grid_n12800/results_hop.csv"),
-    ("lognormal", 7,   "1600/6400", "/tmp/ver_ln_seed7/results_hop.csv"),
-    ("lognormal", 123, "1600/6400", "/tmp/ver_ln_seed123/results_hop.csv"),
-    ("lognormal", 7,   "12800",     "/tmp/ver_ln12800_seed7/results_hop.csv"),
-    ("lognormal", 123, "12800",     "/tmp/ver_ln12800_seed123/results_hop.csv"),
-    ("fixed",     42,  "6400",      "/tmp/ver_fx_seed42/results_hop.csv"),
-    ("fixed",     7,   "6400",      "/tmp/ver_fx_seed7/results_hop.csv"),
-    ("fixed",     123, "6400",      "/tmp/ver_fx_seed123/results_hop.csv"),
-    ("fixed",     42,  "12800",     "/tmp/ver_fx12800_seed42/results_hop.csv"),
+    ("lognormal", 42,  "1600/6400", "hop_grid/results_hop.csv"),
+    ("lognormal", 42,  "1600/6400", "hinge_grid/results_hop.csv"),
+    ("lognormal", 42,  "12800",     "hop_grid_n12800/results_hop.csv"),
+    ("lognormal", 42,  "12800",     "hinge_grid_n12800/results_hop.csv"),
+    ("lognormal", 7,   "1600/6400", "ver_ln_seed7/results_hop.csv"),
+    ("lognormal", 123, "1600/6400", "ver_ln_seed123/results_hop.csv"),
+    ("lognormal", 7,   "12800",     "ver_ln12800_seed7/results_hop.csv"),
+    ("lognormal", 123, "12800",     "ver_ln12800_seed123/results_hop.csv"),
+    ("fixed",     42,  "6400",      "ver_fx_seed42/results_hop.csv"),
+    ("fixed",     7,   "6400",      "ver_fx_seed7/results_hop.csv"),
+    ("fixed",     123, "6400",      "ver_fx_seed123/results_hop.csv"),
+    ("fixed",     42,  "12800",     "ver_fx12800_seed42/results_hop.csv"),
 ]
 ARMS = ["deg020", "hinge300"]
 
@@ -37,6 +47,7 @@ def num(x):
 def main():
     buckets = {}
     for model, seed, ngrp, path in SOURCES:
+        path = os.path.join(NAS, path)
         if not os.path.exists(path):
             print(f"[warn] 見つかりません: {path}")
             continue

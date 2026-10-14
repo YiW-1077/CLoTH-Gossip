@@ -13,6 +13,10 @@
 # 既に ~100% で天井に当たっており、閾値を動かしても差が出ないため。
 #
 # Usage: ./scripts/run_hop_threshold_grid.sh <out_dir> [seed]
+#   結果は NAS (REMOTE_OUTPUT_DIR、省略で /Volumes/public1*/.../<out_dir の名前>) に置く。out_dir は走っている
+#   間の作業場所で、終わったセルから NAS へ移す。集計 results_hop.csv は NAS の結果から作って NAS に置き、
+#   out_dir にも写す。REMOTE_OUTPUT_DIR=local のときだけローカルに残す。
+#   置き場所にもうセルがあると止まる。続きから回すときは RESUME=1 (scripts/nas_lib.sh)。
 # =============================================================================
 set -u
 
@@ -22,6 +26,8 @@ seed="${2:-42}"
 
 BIN="$project_root/cmake-build-debug/CLoTH_Gossip"
 [ -x "$BIN" ] || { echo "ERROR: binary not found: $BIN"; exit 1; }
+source "$project_root/scripts/nas_lib.sh"
+nas_setup "$out_base" || exit 1
 
 max_processes="${MAX_PROCESSES:-8}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
@@ -68,7 +74,7 @@ echo "============================================================"
 echo " 経路長ベース閾値グリッド  seed=$seed  攻撃=$DIST(σ=$SIGMA)"
 echo "   arms  : ${ARMS[*]}"
 echo "   ratios: ${RATIOS[*]}   n: ${NS[*]}   並列: $max_processes"
-echo "   出力  : $out_base"
+echo "   出力  : $RESULT_BASE"
 echo "============================================================"
 
 run_cell_once() {
@@ -96,21 +102,26 @@ run_cell_once() {
 
 run_cell() {
     local arm="$1" kdeg="$2" khop="$3" dmin="$4" ratio="$5" n="$6"
-    local cell="$out_base/arm=$arm/ratio=$ratio/n=$n"
+    local rel="arm=$arm/ratio=$ratio/n=$n"
+    local cell="$out_base/$rel"
     local attempt=1 rc=1
     cell_ok() {
-        [ -f "$cell/summary.csv" ] || return 1
-        local tp; tp=$(grep "^total_payments," "$cell/summary.csv" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]')
+        [ -f "$1/summary.csv" ] || return 1
+        local tp; tp=$(grep "^total_payments," "$1/summary.csv" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]')
         [ "$tp" = "$n" ]
     }
-    if [ "${RESUME:-1}" = "1" ] && cell_ok; then echo "  [skip] $arm r=$ratio n=$n"; return 0; fi
+    if [ "${RESUME:-0}" = "1" ]; then
+        if cell_ok "$cell"; then echo "  [skip] $arm r=$ratio n=$n"; nas_cell_done "$cell"; return 0; fi
+        if [ -n "$NAS_DEST" ] && cell_ok "$NAS_DEST/$rel"; then echo "  [skip] $arm r=$ratio n=$n (NAS)"; return 0; fi
+    fi
     while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
         run_cell_once "$arm" "$kdeg" "$khop" "$dmin" "$ratio" "$n"; rc=$?
-        if [ $rc -eq 0 ] && cell_ok; then break; fi
+        if [ $rc -eq 0 ] && cell_ok "$cell"; then break; fi
         echo "  [retry $attempt/$MAX_ATTEMPTS] $arm r=$ratio n=$n"; attempt=$((attempt + 1))
     done
-    if [ $rc -eq 0 ] && cell_ok; then rm -rf "$cell/_work"; echo "  [done] $arm r=$ratio n=$n"
-    else echo "  [FAIL] $arm r=$ratio n=$n (see $cell/cloth.log)"; fi
+    if [ $rc -eq 0 ] && cell_ok "$cell"; then rm -rf "$cell/_work"; echo "  [done] $arm r=$ratio n=$n"
+    else echo "  [FAIL] $arm r=$ratio n=$n (see ${NAS_DEST:-$out_base}/$rel/cloth.log)"; fi
+    nas_cell_done "$cell"
 }
 
 for a in "${ARMS[@]}"; do
@@ -125,14 +136,15 @@ done
 wait
 echo "完了。集計します..."
 
-summary_csv="$out_base/results_hop.csv"
+# 集計は結果の置き場所 (NAS を使うときは NAS) から読み、そこに書く
+summary_csv="$RESULT_BASE/results_hop.csv"
 {
   echo "arm,k_deg,k_hop,degree_min,malicious_ratio,n_payments,observable_attacked,detected_attackers,detection_rate_pct,precision_pct,false_positives,total_flagged,success_rate_pct,grief_delay_total_ms"
   for a in "${ARMS[@]}"; do
     IFS=':' read -r arm kdeg khop dmin <<< "$a"; dmin="${dmin:-0}"
     for ratio in "${RATIOS[@]}"; do
       for n in "${NS[@]}"; do
-        cell="$out_base/arm=$arm/ratio=$ratio/n=$n"; sm="$cell/summary.csv"; bm="$cell/baseline_metrics.csv"
+        cell="$RESULT_BASE/arm=$arm/ratio=$ratio/n=$n"; sm="$cell/summary.csv"; bm="$cell/baseline_metrics.csv"
         [ -f "$sm" ] || continue
         g() { grep "^$1," "$sm" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]'; }
         b() { awk -F',' -v k="$1" 'NR==1{for(i=1;i<=NF;i++) if($i==k) c=i} NR==2 && c{print $c}' "$bm" 2>/dev/null; }
@@ -142,4 +154,5 @@ summary_csv="$out_base/results_hop.csv"
   done
 } > "$summary_csv"
 echo "集計: $summary_csv"
+nas_finish results_hop.csv
 column -s, -t "$summary_csv"

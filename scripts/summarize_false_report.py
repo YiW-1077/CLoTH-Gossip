@@ -6,11 +6,30 @@
   検出/観測攻撃者  : 本物の攻撃者を取りこぼしていないか(自己免罪されていないか)。
   不一致(dispute) : 相互証明の突き合わせで食い違ったリンクへの関与回数。
                      悪意ノードに偏れば「嘘の痕跡」として二次検知に使える。
-Usage: python3 scripts/summarize_false_report.py [grid_dir]
+Usage: python3 scripts/summarize_false_report.py <grid_dir>
+  grid_dir = run_false_report_grid.sh の結果の置き場所。名前だけなら NAS の下を探す。
 """
 import csv
+import glob
 import os
 import sys
+
+SUB = "thesis/2026bachelor-af23/AF23027王毅恒"
+# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
+NAS = next((f"{m}/{SUB}" for m in sorted(glob.glob("/Volumes/public1*")) if os.path.isdir(f"{m}/{SUB}")), None)
+
+
+def grid_path(a):
+    """グリッドの置き場所。セルの summary.csv があればそこを使う。無ければ (名前だけ、または集計 CSV しか
+    残らないローカルの作業場所) 同じ名前の NAS の置き場所を使う (run_*_grid.sh の既定の出力先)。"""
+    a = a.rstrip("/")
+    if glob.glob(os.path.join(a, "**", "summary.csv"), recursive=True):
+        return a
+    p = os.path.join(NAS, os.path.basename(a)) if NAS else None
+    if p and os.path.isdir(p):
+        print(f"[NAS] {p}")
+        return p
+    sys.exit(f"見つからない: {a}" + ("" if NAS else " (NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする)"))
 
 CELLS = [
     ("cur_lie0", "現行", 0, 0), ("att_lie0", "相互証明", 0, 0),
@@ -53,7 +72,9 @@ def disputes(d):
 
 
 def main():
-    g = sys.argv[1] if len(sys.argv) > 1 else "/tmp/fr_grid"
+    if len(sys.argv) < 2:
+        sys.exit("usage: python3 scripts/summarize_false_report.py <grid_dir (名前だけなら NAS の下)>")
+    g = grid_path(sys.argv[1])
     print("偽報告(自分の申告を水増し)に対する耐性   [seed42 / lognormal / n=6400 / ratio0.15]\n")
     print(f"{'帰属方式':<10s}{'嘘[ms]':>8s}{'時計ずれ':>9s}"
           f"{'冤罪FP':>8s}{'検出/観測':>12s}{'recall%':>9s}{'precision%':>12s}"

@@ -18,6 +18,9 @@
 #                           自ノード内の差分なので理屈上は不感。
 #
 # Usage: ./scripts/run_false_report_grid.sh <out_dir> [seed]
+#   結果は NAS (REMOTE_OUTPUT_DIR、省略で /Volumes/public1*/.../<out_dir の名前>) に置く。out_dir は走っている
+#   間の作業場所で、終わったセルから NAS へ移す。REMOTE_OUTPUT_DIR=local のときだけローカルに残す。
+#   置き場所にもうセルがあると止まる。続きから回すときは RESUME=1 (scripts/nas_lib.sh)。
 # =============================================================================
 set -u
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,6 +28,8 @@ out_base="${1:?usage: $0 <out_dir> [seed]}"
 seed="${2:-42}"
 BIN="$project_root/cmake-build-debug/CLoTH_Gossip"
 [ -x "$BIN" ] || { echo "ERROR: binary not found"; exit 1; }
+source "$project_root/scripts/nas_lib.sh"
+nas_setup "$out_base" || exit 1
 
 max_processes="${MAX_PROCESSES:-8}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
@@ -89,16 +94,20 @@ run_once() {
 run_cell() {
     local lbl="$1" att="$2" lie="$3" sk="$4" pr="$5" sq="$6" sp="$7" dp="$8"
     local cell="$out_base/$lbl" a=1 rc=1
-    ok() { [ -f "$cell/summary.csv" ] && \
-           [ "$(grep '^total_payments,' "$cell/summary.csv" 2>/dev/null | cut -d, -f2 | tr -d ' ')" = "$N" ]; }
-    if [ "${RESUME:-1}" = "1" ] && ok; then echo "  [skip] $lbl"; return 0; fi
+    ok() { [ -f "$1/summary.csv" ] && \
+           [ "$(grep '^total_payments,' "$1/summary.csv" 2>/dev/null | cut -d, -f2 | tr -d ' ')" = "$N" ]; }
+    if [ "${RESUME:-0}" = "1" ]; then
+        if ok "$cell"; then echo "  [skip] $lbl"; nas_cell_done "$cell"; return 0; fi
+        if [ -n "$NAS_DEST" ] && ok "$NAS_DEST/$lbl"; then echo "  [skip] $lbl (NAS)"; return 0; fi
+    fi
     while [ "$a" -le "$MAX_ATTEMPTS" ]; do
         run_once "$lbl" "$att" "$lie" "$sk" "$pr" "$sq" "$sp" "$dp"; rc=$?
-        if [ $rc -eq 0 ] && ok; then break; fi
+        if [ $rc -eq 0 ] && ok "$cell"; then break; fi
         echo "  [retry $a] $lbl"; a=$((a+1))
     done
-    if [ $rc -eq 0 ] && ok; then rm -rf "$cell/_work"; echo "  [done] $lbl"
+    if [ $rc -eq 0 ] && ok "$cell"; then rm -rf "$cell/_work"; echo "  [done] $lbl"
     else echo "  [FAIL] $lbl"; fi
+    nas_cell_done "$cell"
 }
 
 for c in "${CELLS[@]}"; do
@@ -107,4 +116,5 @@ for c in "${CELLS[@]}"; do
     run_cell "$lbl" "$att" "$lie" "$sk" "$pr" "$sq" "$sp" "$dp" &
 done
 wait
-echo "完了。集計は scripts/summarize_false_report.py で行う。"
+nas_finish
+echo "完了。集計: python3 scripts/summarize_false_report.py $RESULT_BASE"

@@ -1,8 +1,8 @@
 #!/opt/homebrew/bin/bash
 # =============================================================================
 # 完了したシミュレーション結果を NAS へ順次移し、ローカルから消す。
-# run_monitor_sweep.sh を NAS なしで起動してしまった run や、scripts/run_*_grid.sh のように
-# 自前の転送を持たない run の横で回す。
+# run_monitor_sweep.sh を NAS なしで起動してしまった run のように、自前の転送を持たない run の横で回す。
+# (scripts/run_*_grid.sh は 2026-10-14 から自分で NAS へ移す: scripts/nas_lib.sh)
 #
 # Usage: scripts/nas_drain.sh <local_base> <nas_base> <watch_pattern>
 #   local_base 以下の結果 dir (cloth_input.txt を持つ dir。environment/ の中は除く) を

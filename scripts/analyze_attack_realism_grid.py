@@ -8,11 +8,30 @@
      → ばらつき導入で「サンプルが閾値未満」なのか「baseline が汚染されて閾値が
         上がった」のかを分離する (sub-threshold な保持は正常として baseline に入る)。
 Usage: python3 scripts/analyze_attack_realism_grid.py <grid_dir>
+  grid_dir = run_attack_realism_grid.sh の結果の置き場所。名前だけなら NAS の下を探す。
 """
 import csv
+import glob
 import os
 import statistics as st
 import sys
+
+SUB = "thesis/2026bachelor-af23/AF23027王毅恒"
+# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
+NAS = next((f"{m}/{SUB}" for m in sorted(glob.glob("/Volumes/public1*")) if os.path.isdir(f"{m}/{SUB}")), None)
+
+
+def grid_path(a):
+    """グリッドの置き場所。セルの summary.csv があればそこを使う。無ければ (名前だけ、または集計 CSV しか
+    残らないローカルの作業場所) 同じ名前の NAS の置き場所を使う (run_*_grid.sh の既定の出力先)。"""
+    a = a.rstrip("/")
+    if glob.glob(os.path.join(a, "**", "summary.csv"), recursive=True):
+        return a
+    p = os.path.join(NAS, os.path.basename(a)) if NAS else None
+    if p and os.path.isdir(p):
+        print(f"[NAS] {p}")
+        return p
+    sys.exit(f"見つからない: {a}" + ("" if NAS else " (NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする)"))
 
 
 def read_grid(path):
@@ -61,7 +80,9 @@ def per_node_diag(cell_dir):
 
 
 def main():
-    grid_dir = sys.argv[1] if len(sys.argv) > 1 else "/tmp/realism_grid"
+    if len(sys.argv) < 2:
+        sys.exit("usage: python3 scripts/analyze_attack_realism_grid.py <grid_dir (名前だけなら NAS の下)>")
+    grid_dir = grid_path(sys.argv[1])
     rows = read_grid(os.path.join(grid_dir, "results_grid.csv"))
     dists = sorted({r["dist"] for r in rows}, key=lambda d: ["fixed", "lognormal", "exponential", "pareto", "uniform"].index(d))
     ratios = sorted({r["malicious_ratio"] for r in rows}, key=float, reverse=True)

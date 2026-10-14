@@ -17,7 +17,11 @@
 #   → 本グリッドの数値は代役ONのsweep結果とは直接比較しないこと。
 #
 # Usage: ./scripts/run_attack_realism_grid.sh <out_dir> [seed] [dists] [ratios] [ns]
-# Example: ./scripts/run_attack_realism_grid.sh /tmp/realism_grid 42
+# Example: ./scripts/run_attack_realism_grid.sh ~/CLionProjects/result/realism_grid 42
+#   結果は NAS (REMOTE_OUTPUT_DIR、省略で /Volumes/public1*/.../<out_dir の名前>) に置く。out_dir は走っている
+#   間の作業場所で、終わったセルから NAS へ移す。集計 results_grid.csv は NAS の結果から作って NAS に置き、
+#   out_dir にも写す。REMOTE_OUTPUT_DIR=local のときだけローカルに残す。
+#   置き場所にもうセルがあると止まる。続きから回すときは RESUME=1 (scripts/nas_lib.sh)。
 # =============================================================================
 set -u
 
@@ -30,6 +34,8 @@ IFS=',' read -r -a NS     <<< "${5:-1600,6400}"
 
 BIN="$project_root/cmake-build-debug/CLoTH_Gossip"
 [ -x "$BIN" ] || { echo "ERROR: binary not found: $BIN (cmake --build cmake-build-debug)"; exit 1; }
+source "$project_root/scripts/nas_lib.sh"
+nas_setup "$out_base" || exit 1
 
 max_processes="${MAX_PROCESSES:-12}"
 P_VALUE="${P_VALUE:-0.001}"
@@ -76,7 +82,7 @@ echo "   攻撃ノード割合: ${RATIOS[*]}"
 echo "   取引数        : ${NS[*]}"
 echo "   固定条件      : method2 / p=$P_VALUE / amount=$AVG_PMT / hold攻撃(mode2) / 代役OFF"
 echo "   並列          : $max_processes"
-echo "   出力          : $out_base"
+echo "   出力          : $RESULT_BASE"
 echo "============================================================"
 
 # 本体は稀に SIGSEGV で落ちることがある (run-simulation.sh も max_attempts=5 で
@@ -114,34 +120,40 @@ run_cell_once() {
 
 run_cell() {
     local dist="$1" ratio="$2" n="$3"
-    local cell="$out_base/dist=$dist/ratio=$ratio/n=$n"
+    local rel="dist=$dist/ratio=$ratio/n=$n"
+    local cell="$out_base/$rel"
     local attempt=1 rc=1
     # 健全性: 実際に処理された非warmup決済数が指定 n と一致すること。
     # (payments.csv の取り違え・途中終了・0件終了をここで弾く)
     cell_ok() {
-        [ -f "$cell/summary.csv" ] || return 1
+        [ -f "$1/summary.csv" ] || return 1
         local tp
-        tp=$(grep "^total_payments," "$cell/summary.csv" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]')
+        tp=$(grep "^total_payments," "$1/summary.csv" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]')
         [ "$tp" = "$n" ]
     }
-    # 再開: 既に完走しているセルは再実行しない (RESUME=0 で無効化)
-    if [ "${RESUME:-1}" = "1" ] && cell_ok; then
-        echo "  [skip] dist=$dist ratio=$ratio n=$n (既存)"
-        return 0
+    # 再開: RESUME=1 のときだけ、既に完走しているセル (ローカルか NAS) は再実行しない
+    if [ "${RESUME:-0}" = "1" ]; then
+        if cell_ok "$cell"; then
+            echo "  [skip] dist=$dist ratio=$ratio n=$n (既存)"; nas_cell_done "$cell"; return 0
+        fi
+        if [ -n "$NAS_DEST" ] && cell_ok "$NAS_DEST/$rel"; then
+            echo "  [skip] dist=$dist ratio=$ratio n=$n (NAS に既存)"; return 0
+        fi
     fi
     while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
         run_cell_once "$dist" "$ratio" "$n"
         rc=$?
-        if [ $rc -eq 0 ] && cell_ok; then break; fi
+        if [ $rc -eq 0 ] && cell_ok "$cell"; then break; fi
         echo "  [retry $attempt/$MAX_ATTEMPTS rc=$rc] dist=$dist ratio=$ratio n=$n"
         attempt=$((attempt + 1))
     done
-    if [ $rc -eq 0 ] && cell_ok; then
+    if [ $rc -eq 0 ] && cell_ok "$cell"; then
         rm -rf "$cell/_work"
         echo "  [done] dist=$dist ratio=$ratio n=$n"
     else
-        echo "  [FAIL rc=$rc] dist=$dist ratio=$ratio n=$n (see $cell/cloth.log)"
+        echo "  [FAIL rc=$rc] dist=$dist ratio=$ratio n=$n (see ${NAS_DEST:-$out_base}/$rel/cloth.log)"
     fi
+    nas_cell_done "$cell"
 }
 
 started=0
@@ -159,13 +171,14 @@ wait
 echo "全 $started セル完了。集計します..."
 
 # --- 集計 -------------------------------------------------------------------
-summary_csv="$out_base/results_grid.csv"
+# 集計は結果の置き場所 (NAS を使うときは NAS) から読み、そこに書く
+summary_csv="$RESULT_BASE/results_grid.csv"
 {
   echo "dist,sigma,intensity,malicious_ratio,n_payments,total_malicious,observable_attacked,detected_attackers,detection_rate_pct,precision_pct,false_positives,n_successful,success_rate_pct,avg_delay_ms,attacks_triggered,payments_griefed,grief_delay_total_ms"
   for dist in "${DISTS[@]}"; do
     for ratio in "${RATIOS[@]}"; do
       for n in "${NS[@]}"; do
-        cell="$out_base/dist=$dist/ratio=$ratio/n=$n"
+        cell="$RESULT_BASE/dist=$dist/ratio=$ratio/n=$n"
         sm="$cell/summary.csv"; bm="$cell/baseline_metrics.csv"
         [ -f "$sm" ] || continue
         g() { grep "^$1," "$sm" 2>/dev/null | cut -d',' -f2 | tr -d '[:space:]'; }
@@ -178,4 +191,6 @@ summary_csv="$out_base/results_grid.csv"
 } > "$summary_csv"
 
 echo "集計: $summary_csv"
+nas_finish results_grid.csv
+echo "解析: python3 scripts/analyze_attack_realism_grid.py $RESULT_BASE"
 column -s, -t "$summary_csv"
