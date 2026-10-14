@@ -68,6 +68,19 @@ prt_threshold=30
 prt_abort_wait_time=1000
 rbr_reputation_weight=20.0'
 
+# baseline_metrics.csv の値を列の名前で引く (列の位置に頼らない)
+metric() { awk -F',' -v k="$2" 'NR==1{for(i=1;i<=NF;i++) if($i==k) c=i} NR==2 && c{print $c}' "$1/baseline_metrics.csv"; }
+
+# 成功率 (baseline_metrics.csv の success_rate は割合。悪意ノードが送金者の即失敗は分母から除く) と平均遅延を 1 行で出す
+print_metrics() {
+  local d=$1
+  awk -v r="$(metric "$d" success_rate)" -v ok="$(metric "$d" n_successful)" -v n="$(metric "$d" n_payments)" \
+      -v dl="$(metric "$d" avg_delay)" 'BEGIN{
+    den = (r > 0) ? int(ok / r + 0.5) : n            # 分母 = 全送金 - 悪意ノードが送金者の即失敗
+    printf "Success: %.2f%% (%d of %d; %d payments from malicious senders excluded), Avg Delay: %s ms\n", r * 100, ok, den, n - den, dl
+  }'
+}
+
 test_scenario() {
   local name=$1 malicious=$2 attack_success=$3 rbr=$4 rep=$5 monitoring=$6
   
@@ -110,8 +123,8 @@ judging_strategy=$monitoring"
   ( cd "$work" && env $sub_env GSL_RNG_SEED=42 "$BUILD_DIR/CLoTH_Gossip" "$outdir/" ) 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
   rm -rf "$work"
   
-  echo "Metrics:"
-  cat "$outdir/baseline_metrics.csv" | awk -F',' '{print "  Success: " $4 "%, Avg Delay: " $5}'
+  echo -n "Metrics: "
+  print_metrics "$outdir"
 }
 
 test_scenario "A" "0.0" "0.0" "false" "false" "disabled"
@@ -124,5 +137,5 @@ echo ""
 echo "Summary:"
 for s in A B C D E; do
   echo -n "Scenario $s: "
-  cat /tmp/scenario-$s/baseline_metrics.csv | tail -1 | awk -F',' '{printf "%.2f%% success\n", $4}'
+  print_metrics "/tmp/scenario-$s"
 done
