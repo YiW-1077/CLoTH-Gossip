@@ -2,7 +2,6 @@
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
-BASE_CONFIG="$PROJECT_ROOT/config/cloth_input.txt"
 BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
 
 # ============================================================
@@ -84,27 +83,32 @@ enable_reputation_system=$rep
 enable_rbr=$rbr
 judging_strategy=$monitoring"
   
-  echo "$config" > "$BASE_CONFIG"
-  
-  # ビルドは build ディレクトリで実行
-  ( cd "$BUILD_DIR" && cmake .. >/dev/null 2>&1 && make >/dev/null 2>&1 ) || { echo "build failed"; return 1; }
+  # ビルド。cmake-build-debug は CLion が作る Ninja 形式なので make ではなく cmake --build を使う
+  cmake --build "$BUILD_DIR" >/dev/null 2>&1 || { echo "build failed"; return 1; }
 
   local outdir="/tmp/scenario-$name"
   rm -rf "$outdir"
   mkdir -p "$outdir"
 
-  # 実行は PROJECT_ROOT をカレントにする。CLoTH_Gossip はカレントの config/cloth_input.txt
-  # (fallback: cloth_input.txt) を読むため、build ディレクトリで実行すると CMake が
-  # build/config/ へコピーした設定 (CMakeLists.txt:9 でルート直下 cloth_input.txt 由来)
-  # が読まれ、本スクリプトが $BASE_CONFIG に書いたシナリオ設定が反映されない。
-  # ルートで実行すれば $BASE_CONFIG と config/data/ が直接使われる。
+  # シナリオごとの作業場所で走らせる。CLoTH_Gossip はカレントの config/cloth_input.txt を読み、
+  # カレントに payments.csv を書くので、プロジェクト直下で走らせると git で管理している
+  # config/cloth_input.txt (sweep も元にする) をシナリオの設定で上書きしてしまっていた (2026-10-14 に修正)。
+  # 作業場所にはシナリオの設定と入力データ (symlink) だけを置き、終わったら消す。
+  local work="$outdir/_work" f
+  mkdir -p "$work/config/data"
+  echo "$config" > "$work/config/cloth_input.txt"
+  for f in nodes_ln.csv channels_ln.csv edges_ln.csv; do
+    ln -s "$PROJECT_ROOT/config/data/$f" "$work/config/data/$f"
+    ln -s "$PROJECT_ROOT/$f" "$work/$f"   # ランダム網の生成 (generate_network_from_file=false) はカレントの *_ln.csv を読む
+  done
   # 代役なしのシナリオでも空で渡し、シェルに残った CLOTH_SUBSTITUTE_COUNT を引き継がない
   local sub_env="CLOTH_SUBSTITUTE_COUNT="
   if [ "$monitoring" != "disabled" ] && [ "$SUBSTITUTE_COUNT" -gt 0 ]; then
     sub_env="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0"
   fi
   echo "[Config] 代役ハブ: ${sub_env}"
-  ( cd "$PROJECT_ROOT" && env $sub_env GSL_RNG_SEED=42 "$BUILD_DIR/CLoTH_Gossip" "$outdir/" ) 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
+  ( cd "$work" && env $sub_env GSL_RNG_SEED=42 "$BUILD_DIR/CLoTH_Gossip" "$outdir/" ) 2>&1 | grep -E "Time consumed|success_rate|n_successful" | tail -5
+  rm -rf "$work"
   
   echo "Metrics:"
   cat "$outdir/baseline_metrics.csv" | awk -F',' '{print "  Success: " $4 "%, Avg Delay: " $5}'
