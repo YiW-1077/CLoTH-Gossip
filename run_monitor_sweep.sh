@@ -63,9 +63,11 @@ ATTACK_SUCCESS_RATE=1.0         # 悪意ノードを通った決済が攻撃さ�
 #                      片側だけだと食い違うリンクが1本になり、2本ルールでは本人と断定できない
 #   SILENT_REPORT_PROB 攻撃者が自分の時刻記録を提出しない(黙秘)確率 [0,1]
 #   CLOCK_SKEW_MS      各ノードの固定時計オフセット幅[ms] (-E..+E)
-#   ATTACK_DELAY_DIST  注入遅延の分布 fixed(一律) / lognormal / exponential / pareto / uniform
-#                      いずれも平均保存＝平均注入遅延は fixed と同一で分散だけ変わる
+#   ATTACK_DELAY_DIST  注入遅延の分布 fixed(一律) / lognormal / exponential / pareto / uniform / range
+#                      range 以外は平均保存＝平均注入遅延は fixed と同一で分散だけ変わる
+#                      range は足す遅れを ATTACK_DELAY_MIN_MS〜MAX_MS の一様乱数にする (平均は保存しない)
 #   ATTACK_DELAY_SIGMA lognormal の log-σ
+#   ATTACK_DELAY_MIN_MS / ATTACK_DELAY_MAX_MS  range の範囲 [ms]
 # 代表的な条件: 既定=報告者は全員正直 / 偽報告=FALSE_REPORT_MS=100 /
 #               黙秘=SILENT_REPORT_PROB=1.0 / 現実寄り=ATTACK_DELAY_DIST=lognormal
 FALSE_REPORT_MS=0
@@ -75,6 +77,8 @@ SILENT_REPORT_PROB=0
 CLOCK_SKEW_MS=0
 ATTACK_DELAY_DIST=fixed
 ATTACK_DELAY_SIGMA=1.0
+ATTACK_DELAY_MIN_MS=100
+ATTACK_DELAY_MAX_MS=10000
 # 攻撃遅延の基本パラメータ(config へ渡す key=value)。倍率は attack_delay_intensity。
 ATTACK_DELAY_PARAMS_ON="enable_network_attack_delay=true  attack_delay_start_time=3000 attack_delay_duration=30000 attack_delay_intensity=2.0 attack_delay_jitter=0.0"
 
@@ -251,9 +255,11 @@ export CLOTH_SILENT_REPORT_PROB="$SILENT_REPORT_PROB"
 export CLOTH_CLOCK_SKEW_MS="$CLOCK_SKEW_MS"
 export CLOTH_ATTACK_DELAY_DIST="$ATTACK_DELAY_DIST"
 export CLOTH_ATTACK_DELAY_SIGMA="$ATTACK_DELAY_SIGMA"
+export CLOTH_ATTACK_DELAY_MIN_MS="$ATTACK_DELAY_MIN_MS"
+export CLOTH_ATTACK_DELAY_MAX_MS="$ATTACK_DELAY_MAX_MS"
 if [ "$FALSE_REPORT_MS" != "0" ] || [ "$SILENT_REPORT_PROB" != "0" ] || \
    [ "$CLOCK_SKEW_MS" != "0" ] || [ "$ATTACK_DELAY_DIST" != "fixed" ]; then
-    echo "[Config] ⚠️攻撃モデル拡張ON: 嘘=${FALSE_REPORT_MS}ms(確率${FALSE_REPORT_PROB}, 側=${FALSE_REPORT_SIDE}) 黙秘=${SILENT_REPORT_PROB} 時計ずれ=${CLOCK_SKEW_MS}ms 遅延分布=${ATTACK_DELAY_DIST}(σ=${ATTACK_DELAY_SIGMA})"
+    echo "[Config] ⚠️攻撃モデル拡張ON: 嘘=${FALSE_REPORT_MS}ms(確率${FALSE_REPORT_PROB}, 側=${FALSE_REPORT_SIDE}) 黙秘=${SILENT_REPORT_PROB} 時計ずれ=${CLOCK_SKEW_MS}ms 遅延分布=${ATTACK_DELAY_DIST}(σ=${ATTACK_DELAY_SIGMA}, range=${ATTACK_DELAY_MIN_MS}〜${ATTACK_DELAY_MAX_MS}ms)"
 else
     echo "[Config] 攻撃モデル: 偽報告なし/黙秘なし/時計ずれなし/遅延は一律(fixed) ※既定"
 fi

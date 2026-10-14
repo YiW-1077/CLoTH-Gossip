@@ -94,6 +94,9 @@ static void mark_no_response_failure(struct payment* payment, struct route_hop* 
  *   exponential : X~Exp(1)                  メモリレスな保持時間
  *   pareto      : X=xm·U^(-1/α), xm=(α-1)/α α=CLOTH_ATTACK_DELAY_ALPHA (既定 2.0, 重い裾)
  *   uniform     : X~U(0,2)                  有界なばらつき
+ *   range       : 倍率を使わず、足す遅れを [MIN, MAX] ms の一様乱数で直接決める (平均は保存しない)
+ *                 MIN=CLOTH_ATTACK_DELAY_MIN_MS (既定 100), MAX=CLOTH_ATTACK_DELAY_MAX_MS (既定 10000)。
+ *                 jitter も通さない。保持の長さそのものを広げたときの検証用
  * ⚠️ 注入点は apply_attack_delay_if_needed の全呼び出し箇所 (hold-to-timeout型のフォワード遅延と
  *    hold型の settle 保持、および悪意ノード経由時のフォワード遅延) で共通。hold モードでは
  *    1決済あたりフォワード側と settle 側で独立に2回サンプルされる。 */
@@ -102,6 +105,10 @@ static void mark_no_response_failure(struct payment* payment, struct route_hop* 
 #define ATTACK_DELAY_DIST_EXPONENTIAL 2
 #define ATTACK_DELAY_DIST_PARETO      3
 #define ATTACK_DELAY_DIST_UNIFORM     4
+#define ATTACK_DELAY_DIST_RANGE       5
+
+static double get_attack_delay_min_ms(void);
+static double get_attack_delay_max_ms(void);
 
 static int get_attack_delay_dist(void) {
   static int cached = -1;
@@ -112,14 +119,37 @@ static int get_attack_delay_dist(void) {
   else if (strcmp(e, "exponential") == 0 || strcmp(e, "exp") == 0) cached = ATTACK_DELAY_DIST_EXPONENTIAL;
   else if (strcmp(e, "pareto") == 0)                               cached = ATTACK_DELAY_DIST_PARETO;
   else if (strcmp(e, "uniform") == 0)                              cached = ATTACK_DELAY_DIST_UNIFORM;
+  else if (strcmp(e, "range") == 0)                                cached = ATTACK_DELAY_DIST_RANGE;
   else {
     fprintf(stderr, "WARNING: unknown CLOTH_ATTACK_DELAY_DIST='%s' -> fixed\n", e);
     cached = ATTACK_DELAY_DIST_FIXED;
   }
-  if (cached != ATTACK_DELAY_DIST_FIXED)
+  if (cached == ATTACK_DELAY_DIST_RANGE)
+    printf("[Config] 攻撃遅延分布 CLOTH_ATTACK_DELAY_DIST=range (足す遅れ = 一様乱数 %.0f〜%.0f ms、平均は保存しない)\n",
+           get_attack_delay_min_ms(), get_attack_delay_max_ms());
+  else if (cached != ATTACK_DELAY_DIST_FIXED)
     printf("[Config] 攻撃遅延分布 CLOTH_ATTACK_DELAY_DIST=%s (平均保持は fixed と同一・分散のみ変化)\n", e);
   return cached;
 }
+
+/* range の範囲 [MIN, MAX] ms。MIN>=0 かつ MIN<=MAX でなければ既定 (100, 10000) に戻す。 */
+static void load_attack_delay_range(double* lo, double* hi) {
+  static int loaded = 0;
+  static double c_lo = 100.0, c_hi = 10000.0;
+  if (!loaded) {
+    const char* a = getenv("CLOTH_ATTACK_DELAY_MIN_MS");
+    const char* b = getenv("CLOTH_ATTACK_DELAY_MAX_MS");
+    double v_lo = (a != NULL && a[0] != '\0') ? atof(a) : 100.0;
+    double v_hi = (b != NULL && b[0] != '\0') ? atof(b) : 10000.0;
+    if (v_lo >= 0.0 && v_lo <= v_hi) { c_lo = v_lo; c_hi = v_hi; }
+    else fprintf(stderr, "WARNING: CLOTH_ATTACK_DELAY_MIN_MS/MAX_MS が不正 (%g, %g) -> 100〜10000 ms\n", v_lo, v_hi);
+    loaded = 1;
+  }
+  *lo = c_lo; *hi = c_hi;
+}
+
+static double get_attack_delay_min_ms(void) { double lo, hi; load_attack_delay_range(&lo, &hi); return lo; }
+static double get_attack_delay_max_ms(void) { double lo, hi; load_attack_delay_range(&lo, &hi); return hi; }
 
 static double get_attack_delay_sigma(void) {
   static double cached = -1.0;
@@ -171,21 +201,28 @@ static uint64_t apply_attack_delay_if_needed(struct simulation* simulation,
     return base_delay;
   }
 
-  double multiplier = net_params.attack_delay_intensity;
-  /* ばらつきモデル有効時は超過分 (intensity-1) を平均1の確率変数でスケールする。
-   * intensity<=1.0 のときは超過分が無いのでサンプルせず従来どおり。 */
-  if (get_attack_delay_dist() != ATTACK_DELAY_DIST_FIXED) {
-    double excess = multiplier - 1.0;
-    if (excess > 0.0)
-      multiplier = 1.0 + excess * sample_attack_delay_factor(simulation);
-  }
-  if (net_params.attack_delay_jitter > 0.0) {
-    multiplier += gsl_ran_gaussian(simulation->random_generator, net_params.attack_delay_jitter);
-  }
-  if (multiplier < 1.0) multiplier = 1.0;
+  uint64_t adjusted_delay;
+  if (get_attack_delay_dist() == ATTACK_DELAY_DIST_RANGE) {
+    /* range: 倍率ではなく、足す遅れを [MIN, MAX] ms の一様乱数で直接決める (jitter も通さない) */
+    double lo = get_attack_delay_min_ms(), hi = get_attack_delay_max_ms();
+    adjusted_delay = base_delay + (uint64_t)llround(lo + (hi - lo) * gsl_rng_uniform(simulation->random_generator));
+  } else {
+    double multiplier = net_params.attack_delay_intensity;
+    /* ばらつきモデル有効時は超過分 (intensity-1) を平均1の確率変数でスケールする。
+     * intensity<=1.0 のときは超過分が無いのでサンプルせず従来どおり。 */
+    if (get_attack_delay_dist() != ATTACK_DELAY_DIST_FIXED) {
+      double excess = multiplier - 1.0;
+      if (excess > 0.0)
+        multiplier = 1.0 + excess * sample_attack_delay_factor(simulation);
+    }
+    if (net_params.attack_delay_jitter > 0.0) {
+      multiplier += gsl_ran_gaussian(simulation->random_generator, net_params.attack_delay_jitter);
+    }
+    if (multiplier < 1.0) multiplier = 1.0;
 
-  uint64_t adjusted_delay = (uint64_t)llround((double)base_delay * multiplier);
-  if (adjusted_delay < base_delay) adjusted_delay = base_delay;
+    adjusted_delay = (uint64_t)llround((double)base_delay * multiplier);
+    if (adjusted_delay < base_delay) adjusted_delay = base_delay;
+  }
 
   if (payment != NULL && adjusted_delay > base_delay) {
     payment->attack_delay_added_total += (adjusted_delay - base_delay);
