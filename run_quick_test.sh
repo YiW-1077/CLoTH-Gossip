@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-PROJECT_ROOT="/Users/oukihisashi/CLionProjects/CLoTH-Gossip"
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BASE_CONFIG="$PROJECT_ROOT/config/cloth_input.txt"
 BUILD_DIR="$PROJECT_ROOT/cmake-build-debug"
 

@@ -1,0 +1,9 @@
+# NAS の結果置き場の候補 (run_monitor_sweep.sh・scripts/run_*_grid.sh・集計スクリプトが使う)。
+# このファイルを nas.conf に写して、実際の置き場所を書く。nas.conf は .gitignore で除外してあり、公開しない。
+#   - 1行に候補を1つ。上から順に見て、存在して書き込める最初の dir を使う
+#   - glob を使える (同じ共有が二重マウントされて /Volumes/<共有>-1 等になったときのため)
+#   - # で始まる行と空行は読まない
+# nas.conf が無いときは、置き場所を毎回渡す (run_monitor_sweep.sh の第3引数・grid の REMOTE_OUTPUT_DIR)。
+# マウント: open smb://<ユーザー>@<NAS のアドレス>/<共有>
+/Volumes/<共有>/<結果の置き場>
+/Volumes/<共有>-*/<結果の置き場>

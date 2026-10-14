@@ -12,11 +12,9 @@ mkdir -p "$output_dir"
 remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
 remote_output_dir=""
 if [[ -n "$remote_arg" ]]; then
-    if [[ "$remote_arg" == smb://172.20.86.110/public1/* ]]; then
-        remote_arg="/Volumes/public1/${remote_arg#smb://172.20.86.110/public1/}"
-    elif [[ "$remote_arg" == smb://* ]]; then
+    if [[ "$remote_arg" == smb://* ]]; then
         echo "WARN: unsupported SMB URI format: $remote_arg"
-        echo "      mount SMB first and pass local mount path (e.g. /Volumes/public1/...)."
+        echo "      mount SMB first and pass local mount path (e.g. /Volumes/<share>/...)."
         remote_arg=""
     fi
     if [[ -n "$remote_arg" ]]; then

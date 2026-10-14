@@ -18,7 +18,7 @@
 #
 # Usage: ./scripts/run_attack_realism_grid.sh <out_dir> [seed] [dists] [ratios] [ns]
 # Example: ./scripts/run_attack_realism_grid.sh ~/CLionProjects/result/realism_grid 42
-#   結果は NAS (REMOTE_OUTPUT_DIR、省略で /Volumes/public1*/.../<out_dir の名前>) に置く。out_dir は走っている
+#   結果は NAS (REMOTE_OUTPUT_DIR、省略で <nas.conf の候補>/<out_dir の名前>) に置く。out_dir は走っている
 #   間の作業場所で、終わったセルから NAS へ移す。集計 results_grid.csv は NAS の結果から作って NAS に置き、
 #   out_dir にも写す。REMOTE_OUTPUT_DIR=local のときだけローカルに残す。
 #   置き場所にもうセルがあると止まる。続きから回すときは RESUME=1 (scripts/nas_lib.sh)。

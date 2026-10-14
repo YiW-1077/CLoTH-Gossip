@@ -1,8 +1,11 @@
 # =============================================================================
-# scripts/run_*_grid.sh の NAS 出力の共通部分 (source して使う)。
+# scripts/run_*_grid.sh の NAS 出力の共通部分 (source して使う)。nas_find_dir は run_monitor_sweep.sh も使う。
+#
+# NAS の置き場所の候補はプロジェクト直下の nas.conf に書く (書き方は nas.conf.example)。
+# nas.conf は実際のアドレスを含むので git に入れない (.gitignore)。
 #
 # 結果の置き場所は環境変数 REMOTE_OUTPUT_DIR で決める:
-#   省略  = /Volumes/public1*/$NAS_SUBDIR/<ローカルの出力先の名前> (見つからなければ止まる)
+#   省略  = <nas.conf の候補のうち見つかったもの>/<ローカルの出力先の名前> (見つからなければ止まる)
 #   パス  = そこ
 #   local = NAS を使わずローカルに残す
 # ローカルの出力先は走っている間の作業場所。終わったセルから NAS へ移し (写して照合してから
@@ -13,13 +16,34 @@
 # 後日回すと古いコードで作ったセルを黙って使い回し、そのまま集計してしまうため。
 # 続きから回すときだけ RESUME=1 を明示する。
 #
+#   nas_find_dir                  : nas.conf の候補のうち、ある書き込める最初の dir を出す
 #   nas_setup <local_out_base>    : NAS_DEST (空 = ローカルのみ) と RESULT_BASE (集計が読む所) を決める
 #   nas_cell_done <cell_dir>      : 終わったセル (成功でも失敗でも) を NAS の同じ相対パスへ移す
 #   nas_finish [<csv の名前>...]  : 集計 CSV をローカルへ写し、ローカルの作業場所を片付ける
 # =============================================================================
 
-NAS_SUBDIR="thesis/2026bachelor-af23/AF23027王毅恒"
+NAS_CONF="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/nas.conf"
 LOCAL_BASE=""; NAS_DEST=""; RESULT_BASE=""
+
+# nas.conf の候補 (1行1つ・glob 可・# で始まる行はコメント) を上から見て、ある書き込める最初の dir を出す。
+# glob は同じ共有が二重マウントされて /Volumes/<共有>-1 等になったときのため。無ければ理由を出して 1 を返す
+nas_find_dir() {
+    local line d
+    if [[ ! -f "$NAS_CONF" ]]; then
+        echo "ERROR: $NAS_CONF が無い。nas.conf.example を写して NAS の置き場所を書くこと" >&2
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        while IFS= read -r d; do
+            if [[ -d "$d" && -w "$d" ]]; then echo "$d"; return 0; fi
+        done < <(compgen -G "$line")
+    done < "$NAS_CONF"
+    echo "ERROR: NAS が見つからないか書き込めない (候補は $NAS_CONF)。NAS をマウントすること" >&2
+    return 1
+}
 
 # セル (cloth.log を持つ dir) の数。_work_template と各セルの _work は数えない
 _count_cells() {
@@ -27,23 +51,17 @@ _count_cells() {
 }
 
 nas_setup() {
-    local m n_local n_nas
+    local nas n_local n_nas
     LOCAL_BASE="${1%/}"
     case "${REMOTE_OUTPUT_DIR:-}" in
         local)
             echo "[Config] 出力はローカルのみ (REMOTE_OUTPUT_DIR=local)。NAS には送らない" ;;
         "")
-            # 二重マウントで /Volumes/public1-1 等になることがあるので、書き込めるものを使う
-            for m in /Volumes/public1 /Volumes/public1-*; do
-                if [[ -d "$m/$NAS_SUBDIR" && -w "$m/$NAS_SUBDIR" ]]; then
-                    NAS_DEST="$m/$NAS_SUBDIR/$(basename "$LOCAL_BASE")"; break
-                fi
-            done
-            if [[ -z "$NAS_DEST" ]]; then
-                echo "ERROR: NAS ($NAS_SUBDIR) が見つからないか書き込めない。"
-                echo "       open smb://morinolab@172.20.86.110/public1 でマウントするか、REMOTE_OUTPUT_DIR で置き場所を渡すこと"
+            if ! nas=$(nas_find_dir); then
+                echo "       (REMOTE_OUTPUT_DIR で置き場所を直接渡すか、local でローカルに残すこともできる)"
                 return 1
-            fi ;;
+            fi
+            NAS_DEST="$nas/$(basename "$LOCAL_BASE")" ;;
         smb://*)
             echo "ERROR: SMB URI は使えない: $REMOTE_OUTPUT_DIR (マウントしてから /Volumes/... のパスを渡すこと)"
             return 1 ;;

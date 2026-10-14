@@ -7,15 +7,15 @@ FP は実数で出す (0/1/2 の小標本なので % にしない)。
 Usage: python3 scripts/summarize_hinge_verification.py
 """
 import csv
-import glob
 import os
 import sys
 
-SUB = "thesis/2026bachelor-af23/AF23027王毅恒"
-# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
-NAS = next((f"{m}/{SUB}" for m in sorted(glob.glob("/Volumes/public1*")) if os.path.isdir(f"{m}/{SUB}")), None)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/nas_path.py
+from nas_path import NAS_HINT, find_nas
+
+NAS = find_nas()
 if NAS is None:
-    sys.exit("NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする")
+    sys.exit(NAS_HINT)
 
 # (ラベル, 攻撃モデル, seed, n帯, results_hop.csv の NAS からの相対パス)
 # run_hop_threshold_grid.sh <out_dir> の結果は NAS の <out_dir の名前>/ に置かれる。

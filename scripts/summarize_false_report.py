@@ -14,9 +14,10 @@ import glob
 import os
 import sys
 
-SUB = "thesis/2026bachelor-af23/AF23027王毅恒"
-# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
-NAS = next((f"{m}/{SUB}" for m in sorted(glob.glob("/Volumes/public1*")) if os.path.isdir(f"{m}/{SUB}")), None)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/nas_path.py
+from nas_path import NAS_HINT, find_nas
+
+NAS = find_nas()
 
 
 def grid_path(a):
@@ -29,7 +30,7 @@ def grid_path(a):
     if p and os.path.isdir(p):
         print(f"[NAS] {p}")
         return p
-    sys.exit(f"見つからない: {a}" + ("" if NAS else " (NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする)"))
+    sys.exit(f"見つからない: {a}" + ("" if NAS else f" ({NAS_HINT})"))
 
 CELLS = [
     ("cur_lie0", "現行", 0, 0), ("att_lie0", "相互証明", 0, 0),

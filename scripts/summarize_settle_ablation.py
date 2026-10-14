@@ -16,11 +16,12 @@ Usage: python3 scripts/summarize_settle_ablation.py
 """
 import csv, glob, os, collections, sys
 
-SUB = 'thesis/2026bachelor-af23/AF23027王毅恒'
-# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
-R = next((f'{m}/{SUB}' for m in sorted(glob.glob('/Volumes/public1*')) if os.path.isdir(f'{m}/{SUB}')), None)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/nas_path.py
+from nas_path import NAS_HINT, find_nas
+
+R = find_nas()
 if R is None:
-    sys.exit('NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする')
+    sys.exit(NAS_HINT)
 LOCAL_FIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'repro_out_fig')
 SEEDS = ['7', '42', '123']; AMTS = ['100', '500', '1000']
 LEAF = 'avoid_low_reputation/judge_method2/n_payment12800/avg_pmt_amt={a}/judge_count=10/p_0_01'

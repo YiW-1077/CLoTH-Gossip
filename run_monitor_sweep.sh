@@ -7,7 +7,8 @@
 # Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir|local] [key=value ...]
 # Example: ./run_monitor_sweep.sh 42 /output/dir judging_strategy=method1
 # 出力先 (2026-10-13 方針: シミュのデータはローカルに残さない):
-#   第3引数を省略すると NAS (/Volumes/public1*/$NAS_SUBDIR/<timestamp>) に出す。見つからなければ止まる。
+#   第3引数を省略すると NAS (<nas.conf の候補のうち見つかったもの>/<timestamp>) に出す。見つからなければ止まる。
+#   nas.conf はプロジェクト直下に置く置き場所の候補 (実際のアドレスを含むので git に入れない。書き方は nas.conf.example)。
 #   output_base_dir は走っている間の作業場所で、終わった sim から NAS へ移し、全部移せたら片付ける。
 #   results_summary.csv は NAS 上の結果から作り、NAS の <timestamp>/ に置く。ローカルの <timestamp>/ にも
 #   同じ CSV だけ残す (2026-10-14: CSV はローカルに残してよい、ただし NAS にも必ず置く)。
@@ -568,24 +569,18 @@ mkdir -p "$output_base" || {
 # Handle remote output directory (SMB conversion to local mount path)
 # ---------------------------------------------------------------------------
 remote_output_base=""
-# 既定の NAS の置き場所。二重マウントで /Volumes/public1-1 等になることがあるので、
-# /Volumes/public1* のうち書き込めるものを使う
-NAS_SUBDIR="thesis/2026bachelor-af23/AF23027王毅恒"
+# 既定の NAS の置き場所は nas.conf の候補から探す (scripts/nas_lib.sh の nas_find_dir)
+source "$project_root/scripts/nas_lib.sh"
 if [[ "$remote_arg" == "local" ]]; then
     remote_arg=""
     echo "[Config] 出力はローカルのみ (第3引数 local)。NAS には送らない"
 elif [[ "$remote_arg" == smb://* ]]; then
     echo "ERROR: SMB URI は使えない: $remote_arg"
-    echo "       マウントしてからローカルのパス (例 /Volumes/public1/...) を渡すこと。"
+    echo "       マウントしてからローカルのパス (例 /Volumes/<共有>/...) を渡すこと。"
     exit 1
 elif [[ -z "$remote_arg" ]]; then
-    for _m in /Volumes/public1 /Volumes/public1-*; do
-        if [[ -d "$_m/$NAS_SUBDIR" && -w "$_m/$NAS_SUBDIR" ]]; then remote_arg="$_m/$NAS_SUBDIR"; break; fi
-    done
-    if [[ -z "$remote_arg" ]]; then
-        echo "ERROR: NAS ($NAS_SUBDIR) が見つからないか書き込めない。"
-        echo "       open smb://morinolab@172.20.86.110/public1 でマウントするか、第3引数で置き場所を渡すこと"
-        echo "       (ローカルに残すなら第3引数に local)。"
+    if ! remote_arg=$(nas_find_dir); then
+        echo "       (第3引数で置き場所を直接渡すか、ローカルに残すなら第3引数に local)"
         exit 1
     fi
 fi

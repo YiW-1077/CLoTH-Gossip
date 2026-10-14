@@ -6,15 +6,15 @@ recall は分子/分母を合計してプール、FP は実数で出す。
 Usage: python3 scripts/summarize_degmin_comparison.py
 """
 import csv
-import glob
 import os
 import sys
 
-SUB = "thesis/2026bachelor-af23/AF23027王毅恒"
-# 二重マウントで /Volumes/public1-1 等になることがあるので、置き場所が見えるものを使う
-NAS = next((f"{m}/{SUB}" for m in sorted(glob.glob("/Volumes/public1*")) if os.path.isdir(f"{m}/{SUB}")), None)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/nas_path.py
+from nas_path import NAS_HINT, find_nas
+
+NAS = find_nas()
 if NAS is None:
-    sys.exit("NAS が見えない: open smb://morinolab@172.20.86.110/public1 でマウントする")
+    sys.exit(NAS_HINT)
 
 RATIO = "0.15"
 # (攻撃モデル, seed, n帯, NAS からの相対パス) — 複数 arm が同じファイルに入っていてよい

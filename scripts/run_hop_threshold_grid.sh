@@ -13,7 +13,7 @@
 # 既に ~100% で天井に当たっており、閾値を動かしても差が出ないため。
 #
 # Usage: ./scripts/run_hop_threshold_grid.sh <out_dir> [seed]
-#   結果は NAS (REMOTE_OUTPUT_DIR、省略で /Volumes/public1*/.../<out_dir の名前>) に置く。out_dir は走っている
+#   結果は NAS (REMOTE_OUTPUT_DIR、省略で <nas.conf の候補>/<out_dir の名前>) に置く。out_dir は走っている
 #   間の作業場所で、終わったセルから NAS へ移す。集計 results_hop.csv は NAS の結果から作って NAS に置き、
 #   out_dir にも写す。REMOTE_OUTPUT_DIR=local のときだけローカルに残す。
 #   置き場所にもうセルがあると止まる。続きから回すときは RESUME=1 (scripts/nas_lib.sh)。
