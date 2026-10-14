@@ -8,8 +8,9 @@
 # Example: ./run_monitor_sweep.sh 42 /output/dir judging_strategy=method1
 # 出力先 (2026-10-13 方針: シミュのデータはローカルに残さない):
 #   第3引数を省略すると NAS (/Volumes/public1*/$NAS_SUBDIR/<timestamp>) に出す。見つからなければ止まる。
-#   output_base_dir は走っている間の作業場所で、終わった sim から NAS へ移し、全部移せたら消す。
-#   results_summary.csv は NAS 上の結果から作り、NAS の <timestamp>/ に置く。
+#   output_base_dir は走っている間の作業場所で、終わった sim から NAS へ移し、全部移せたら片付ける。
+#   results_summary.csv は NAS 上の結果から作り、NAS の <timestamp>/ に置く。ローカルの <timestamp>/ にも
+#   同じ CSV だけ残す (2026-10-14: CSV はローカルに残してよい、ただし NAS にも必ず置く)。
 #   第3引数に local を渡したときだけ NAS を使わずローカルに残す。
 #   集計の作り直し: ./run_monitor_sweep.sh --regen-summary <NAS 上の <timestamp> dir>
 
@@ -591,7 +592,7 @@ fi
 if [[ -n "$remote_arg" ]]; then
     remote_output_base="$remote_arg/$timestamp"
     mkdir -p "$remote_output_base" || { echo "ERROR: NAS に出力先を作れない: $remote_output_base"; exit 1; }
-    echo "[Config] 出力先 NAS: $remote_output_base (終わった sim から移し、ローカルの作業場所は最後に消す)"
+    echo "[Config] 出力先 NAS: $remote_output_base (終わった sim から移し、最後はローカルに results_summary.csv だけ残す)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1013,7 +1014,7 @@ echo "=========================================="
 generate_summary_csv
 
 # ---------------------------------------------------------------------------
-# ローカルの作業場所を消す (NAS を使うとき)。次を全部確かめてから:
+# ローカルの作業場所を片付ける (NAS を使うとき)。results_summary.csv だけ残して他を消す。次を全部確かめてから:
 #   - 結果 dir がローカルに残っていない (全部 NAS へ移した)
 #   - NAS 上の結果 dir (summary.csv を持つ) が sim の数だけある
 #     (集計は NAS に無い dir をローカルの空の dir で埋めて N/A の行を出すので、行数だけでは足りない)
@@ -1026,8 +1027,8 @@ if [[ -n "$remote_output_base" ]]; then
     _rows=$(( $(wc -l < "$output_base/results_summary.csv" 2>/dev/null || echo 1) - 1 ))
     if [ "$_left" -eq 0 ] && [ "$_on_nas" -eq "$total_simulations" ] && [ "$_rows" -eq "$total_simulations" ] &&
        cmp -s "$output_base/results_summary.csv" "$remote_output_base/results_summary.csv"; then
-        rm -rf "$output_base"
-        echo "ローカルの作業場所を削除: $output_base (結果と CSV は $remote_output_base)"
+        find "$output_base" -mindepth 1 -maxdepth 1 ! -name results_summary.csv -exec rm -rf {} +
+        echo "ローカルの作業場所を片付けた: $output_base (残したのは results_summary.csv だけ。結果と CSV は $remote_output_base)"
     else
         echo "[WARN] ローカルの作業場所を残す: $output_base"
         echo "       未転送 $_left / NAS 上の結果 $_on_nas / CSV 行 $_rows / sim 数 $total_simulations"
