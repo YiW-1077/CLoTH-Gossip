@@ -70,12 +70,14 @@ ATTACK_SUCCESS_RATE=1.0         # 悪意ノードを通った決済が攻撃さ�
 #   ATTACK_DELAY_MIN_MS / ATTACK_DELAY_MAX_MS  range の範囲 [ms]
 # 代表的な条件: 既定=報告者は全員正直 / 偽報告=FALSE_REPORT_MS=100 /
 #               黙秘=SILENT_REPORT_PROB=1.0 / 現実寄り=ATTACK_DELAY_DIST=lognormal
+# 攻撃の遅れは range 100〜10000 ms で回す (シミュ本体の既定は fixed = 一律 +100 ms)。
+#   再ベースライン (data_rebaseline_20261013_201) は fixed なので、それと比べるときは ATTACK_DELAY_DIST=fixed に戻す。
 FALSE_REPORT_MS=0
 FALSE_REPORT_PROB=1.0
 FALSE_REPORT_SIDE=both
 SILENT_REPORT_PROB=0
 CLOCK_SKEW_MS=0
-ATTACK_DELAY_DIST=fixed
+ATTACK_DELAY_DIST=range
 ATTACK_DELAY_SIGMA=1.0
 ATTACK_DELAY_MIN_MS=100
 ATTACK_DELAY_MAX_MS=10000
