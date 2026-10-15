@@ -44,6 +44,9 @@ void channel_update_fail(struct event* event, struct simulation* simulation, str
 
 void channel_update_success(struct event* event, struct simulation* simulation, struct network* network);
 
+// 判定ノード経由の受け渡し・賢い嘘の検証用の記録を書く (CLOTH_JUDGE_COPY か CLOTH_FALSE_REPORT_SMART のときだけ)
+void judge_copy_write_outputs(char output_dir_name[]);
+
 // return `struct element* group_add_queue`
 struct element* request_group_update(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params, struct element* group_add_queue);
 

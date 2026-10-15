@@ -2008,6 +2008,7 @@ int main(int argc, char *argv[]) {
     write_stage4_comparison_csv(payments, network, output_dir_name, net_params);
   }
 
+  judge_copy_write_outputs(output_dir_name);   /* 検証用の記録 (ノブ OFF なら何も書かない) */
   write_output(network, payments, output_dir_name);
 
     list_free(group_add_queue);

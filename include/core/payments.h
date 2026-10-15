@@ -73,7 +73,10 @@ struct payment {
    * 記録する(-1=なし)。この値は攻撃注入側の内部状態で、検知器には渡らない。
    * 1経路につき1ノード(最後に hold を選んだノード)を保持。計測フェーズには十分。 */
   long grief_hold_node_id;
-  
+  /* この試行で保持者が足した遅れ [ms] (= settle_delay - settle_base)。攻撃注入側の内部状態で検知器には渡らない。
+   * 賢い嘘 (CLOTH_FALSE_REPORT_SMART) と判定ノード経由の受け渡し (CLOTH_JUDGE_COPY) の検証モデルだけが使う。 */
+  uint64_t grief_hold_extra_ms;
+
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments
   

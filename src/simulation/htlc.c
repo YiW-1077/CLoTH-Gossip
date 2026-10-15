@@ -395,6 +395,16 @@ static int get_false_report_side(void) {
   if (e != NULL && strcmp(e, "send") == 0) v = FALSE_REPORT_SIDE_SEND;
   return v;
 }
+/* 賢い嘘 (CLOTH_FALSE_REPORT_SMART, 既定 0)。1 のとき、嘘の量を固定の CLOTH_FALSE_REPORT_MS ではなく
+ * 「その決済で自分が攻撃として足した遅れ」(grief_hold_extra_ms) にする。CLOTH_FALSE_REPORT_MS は
+ * 嘘をつくかどうかのスイッチとしてだけ使う (正の値なら何でもよい)。片側の嘘で保持の攻撃分をちょうど消す量で、
+ * 保持より大きな嘘は「受け取る前に送った」(因果違反) で本人の記録が使えなくなるので、これが隠せる最大に近い。 */
+static int get_false_report_smart(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_FALSE_REPORT_SMART");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
 
 /* 片側だけの食い違い(1本のリンクだけ申告が合わない)の扱い (CLOTH_ATTEST_SINGLE_DISPUTE, 既定 2)。
  *   0 = 従来: 帰属を破棄する。
@@ -831,6 +841,92 @@ static int escrow_offerer_of(struct payment* pm, long node_id, long* offer_id) {
   return 0;
 }
 
+/* === 判定ノード経由の受け渡し (CLOTH_JUDGE_COPY, 既定 0) の検証モデル ===
+ * preimage を上流へ渡すとき、送り手は同じものの写しを判定ノードにも送る。受け手は署名つきの受領書を送り手に返し、
+ * 送り手はそれを判定ノードに転送する (受け手の署名なので送り手は偽造できない)。判定ノードは写しを受け取ってから
+ * T (CLOTH_JUDGE_COPY_T_MS, 既定 100) 以内に受領書が届かなければ、自分で受け手に preimage を渡して時刻を記録する。
+ * タイムアウトは罪の証拠にしない (判定ノードが渡すだけ)。保持の長さは判定ノードの時計の時刻だけで測る:
+ *     保持 = (本人の写しが判定ノードに届いた時刻) − (本人の受領書が届いた時刻。判定ノードが渡したならその時刻)
+ * 本人の申告は使わないので、申告時刻の嘘は効かない。攻撃者 (その決済の保持者で、嘘をつくと決まった本人) に残る手口は
+ *   受け取り側: 受領書を返すのを遅らせる → T を過ぎると判定ノードが渡した時刻が残るので、隠せるのは T まで
+ *   渡す側:     写しだけ先に送り、上流に渡すのを遅らせる → T を過ぎると判定ノードが上流に渡して攻撃が切れるので T まで
+ * で、攻撃で足した遅れ (grief_hold_extra_ms) を上限にできるだけ隠す (使う側は CLOTH_FALSE_REPORT_SIDE)。
+ * ネットワークの遅れは 0 とみなす (シミュの 1 ホップの遅れはほぼ一定で、他の結果と同じ世界で比べるため)。
+ * 判定ノードとのやり取りの遅れとそのばらつきは入れていない。シミュの時刻 (イベント) は変えない。
+ * 帰属は相互証明 (CLOTH_REPORT_ATTEST=1) の位置で行い、食い違いの処理 (4a・ペア集計など) は使わない。
+ * 攻撃ごとの記録は出力 dir の judge_copy_attacks.csv (この機能か賢い嘘を使うときだけ書く)。 */
+static int get_judge_copy(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_JUDGE_COPY");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+static double get_judge_copy_t_ms(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_JUDGE_COPY_T_MS");
+  v = 100.0;
+  if (e != NULL && e[0] != '\0') { double t = atof(e); if (t >= 0.0) v = t; }
+  return v;
+}
+struct jc_eval { double hidden_in, hidden_out; int delivered; };
+/* 位置 q の中継の保持を判定ノードの時計で測る。位置 k が preimage を受け取った本当の時刻は hop_settle_recv_times[k]
+ * (この機能を使うときは申告に嘘を乗せないので本当の時刻のまま)。ネットワークの遅れ 0 では、写しの時刻 = 本当に渡した時刻、
+ * 受領書の時刻 = 本当に受け取った時刻になるので、ずらせるのは保持者本人の手口の分だけ。戻り値 <= 0 は測れない。 */
+static double judge_copy_hold(struct network* network, struct payment* pm, int q, struct jc_eval* ev) {
+  ev->hidden_in = ev->hidden_out = 0.0; ev->delivered = 0;
+  uint64_t t_out = pm->hop_settle_recv_times[q - 1];   /* 本人が上流 (位置 q-1) に渡した時刻 */
+  uint64_t t_in  = pm->hop_settle_recv_times[q];       /* 本人が下流から受け取った時刻 */
+  if (t_out == 0 || t_in == 0 || t_out <= t_in) return 0.0;
+  struct route_hop* rh = (struct route_hop*)array_get(pm->route->route_hops, q);
+  struct node* nd = (rh != NULL) ? (struct node*)array_get(network->nodes, rh->from_node_id) : NULL;
+  if (nd != NULL && nd->id == pm->grief_hold_node_id && lies_on_this_payment(nd, pm)) {
+    double T = get_judge_copy_t_ms(), h = (double)pm->grief_hold_extra_ms;
+    int side = get_false_report_side();
+    if (side != FALSE_REPORT_SIDE_SEND) {   /* 受け取り側: 受領書を h 遅らせる */
+      ev->hidden_in = (h < T) ? h : T;
+      ev->delivered = (h > T);              /* 判定ノードが渡す */
+    }
+    if (side != FALSE_REPORT_SIDE_RECV) {   /* 渡す側: 写しを先に送る。判定ノードに先に渡されないよう T まで */
+      double r = h - ev->hidden_in;
+      ev->hidden_out = (r < T) ? r : T;
+    }
+  }
+  return (double)(t_out - t_in) - ev->hidden_in - ev->hidden_out;
+}
+/* 攻撃ごとの記録 (judge_copy_attacks.csv)。warmup 後に保持者が実際に遅れを足した決済 1 件につき 1 行。 */
+struct jc_record {
+  long pid, holder, degree;
+  double extra, hold_true, hold_meas, hidden_in, hidden_out;
+  int evaluated, delivered, fav_test, reported;
+};
+static struct jc_record* jc_recs = NULL;
+static long jc_n = 0, jc_cap = 0;
+static long jc_push(void) {
+  if (jc_n == jc_cap) {
+    long nc = jc_cap ? 2 * jc_cap : 1024;
+    struct jc_record* p = realloc(jc_recs, (size_t)nc * sizeof(struct jc_record));
+    if (p == NULL) return -1;
+    jc_recs = p; jc_cap = nc;
+  }
+  memset(&jc_recs[jc_n], 0, sizeof(struct jc_record));
+  return jc_n++;
+}
+void judge_copy_write_outputs(char output_dir_name[]) {
+  if (!get_judge_copy() && !get_false_report_smart()) return;
+  char fn[512];
+  snprintf(fn, sizeof fn, "%sjudge_copy_attacks.csv", output_dir_name);
+  FILE* f = fopen(fn, "w");
+  if (f == NULL) return;
+  fprintf(f, "payment_id,holder,degree,extra_ms,evaluated,hold_true_ms,hold_meas_ms,hidden_in_ms,hidden_out_ms,judge_delivered,fav_test,reported\n");
+  for (long k = 0; k < jc_n; k++) {
+    struct jc_record* r = &jc_recs[k];
+    fprintf(f, "%ld,%ld,%ld,%.0f,%d,%.0f,%.0f,%.0f,%.0f,%d,%d,%d\n", r->pid, r->holder, r->degree, r->extra,
+            r->evaluated, r->hold_true, r->hold_meas, r->hidden_in, r->hidden_out, r->delivered, r->fav_test, r->reported);
+  }
+  fclose(f);
+}
+
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
  * dir: +1 = 「遅く受け取った」方向に盛る, -1 = 「早く送った」方向に盛る。
  * 保持者は「遅く受け取って、すぐ送った」と偽ることで見かけの保持時間を 2X 縮める。
@@ -846,12 +942,13 @@ static uint64_t reported_time(struct node* nd, struct payment* pm, uint64_t true
       escrow_link_eval(nd->id, off, pm->id, 1, &L);
       adj += (long)(escrow_hide(&L, &via) + 0.5);
     }
-  } else if (lies_on_this_payment(nd, pm)) {
+  } else if (lies_on_this_payment(nd, pm) && !get_judge_copy()) {   /* 判定ノード経由では申告を使わないので嘘を乗せない */
     int side = get_false_report_side();
+    long amount = get_false_report_smart() ? (long)pm->grief_hold_extra_ms : get_false_report_ms();
     if (side == FALSE_REPORT_SIDE_BOTH ||
         (side == FALSE_REPORT_SIDE_RECV && dir > 0) ||
         (side == FALSE_REPORT_SIDE_SEND && dir < 0))
-      adj += dir * get_false_report_ms();
+      adj += dir * amount;
   }
   long t = (long)true_time + adj;
   return (t < 0) ? 0 : (uint64_t)t;
@@ -1493,6 +1590,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
           for (int i = 0; i <= payment->hop_settle_recv_capacity; i++)
               payment->hop_settle_send_times[i] = 0;
   }
+  payment->grief_hold_extra_ms = 0;   /* 保持者が足した遅れも試行ごとに消す */
 
   /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
    * 送信者の最初のホップ先が悪意ノードの場合も、中継 (forward_payment) と同様に
@@ -1906,6 +2004,19 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
      * 実装に対して厳密化したもの。 */
     if (node->first_attack_time == 0 && settle_delay > settle_base)
       node->first_attack_time = simulation->current_time;
+    payment->grief_hold_extra_ms = (settle_delay > settle_base) ? settle_delay - settle_base : 0;
+    /* 賢い嘘: 嘘の量 (足した遅れ) はここで決まるので、上で記録した受領の申告を記録し直す (乱数は使わない) */
+    if (get_false_report_smart() && get_hold_roundtrip() && payment->hop_settle_recv_times != NULL &&
+        payment->route != NULL && payment->route->route_hops != NULL && !stays_silent_on_payment(node, payment)) {
+      int nh_r = array_len(payment->route->route_hops);
+      for (int hi = 0; hi < nh_r && hi < payment->hop_settle_recv_capacity; hi++) {
+        struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
+        if (rh != NULL && rh->from_node_id == node->id) {
+          payment->hop_settle_recv_times[hi] = reported_time(node, payment, simulation->current_time, +1);
+          break;
+        }
+      }
+    }
   }
   next_event_time = simulation->current_time + settle_delay;
   /* 相互証明用: このノードが「上流へ preimage を送った」と申告する時刻。
@@ -1975,6 +2086,16 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
   payment = event->payment;
   node = array_get(network->nodes, event->node_id);
   event->payment->end_time = simulation->current_time;
+  {
+    static int jc_printed = 0;
+    if (!jc_printed && (get_judge_copy() || get_false_report_smart())) {
+      jc_printed = 1;
+      printf("[JudgeCopy] 判定ノード経由=%d T=%.0fms 賢い嘘=%d 嘘のスイッチ=%ldms 側=%s\n",
+             get_judge_copy(), get_judge_copy_t_ms(), get_false_report_smart(), get_false_report_ms(),
+             get_false_report_side() == FALSE_REPORT_SIDE_RECV ? "recv" :
+             get_false_report_side() == FALSE_REPORT_SIDE_SEND ? "send" : "both");
+    }
+  }
 
   add_attempt_history(payment, network, simulation->current_time, 1);
 
@@ -2009,6 +2130,19 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
        * 往復差分と違い順方向ホップのばらつきが混入しないためベースライン分散が膨らまず、
        * 保持者の取りこぼしが起きない。各異常ノード(=保持者)を報告(1決済1ノード dedup)。 */
       int anom_pos = -1;   /* この決済で直前に異常と判定した経路位置 (ペア検定の「説明済み」判定用) */
+      /* 判定ノード経由の受け渡し・賢い嘘の検証用の記録 (warmup 後に保持者が実際に遅れを足した決済だけ) */
+      long jc_rec = -1;
+      if ((get_judge_copy() || get_false_report_smart()) && payment->grief_hold_node_id >= 0 &&
+          payment->grief_hold_extra_ms > 0 && !detector_in_warmup(payment, (long)simulation->processed_payments)) {
+          jc_rec = jc_push();
+          if (jc_rec >= 0) {
+              struct node* hn = (struct node*)array_get(network->nodes, payment->grief_hold_node_id);
+              jc_recs[jc_rec].pid = payment->id;
+              jc_recs[jc_rec].holder = payment->grief_hold_node_id;
+              jc_recs[jc_rec].degree = (hn != NULL && hn->open_edges != NULL) ? array_len(hn->open_edges) : 0;
+              jc_recs[jc_rec].extra = (double)payment->grief_hold_extra_ms;
+          }
+      }
       for (int i = 0; i + 1 < nh; i++) {
           if (i + 1 >= payment->hop_settle_recv_capacity) break;
           uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
@@ -2078,7 +2212,14 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
            *   2本とも食い違う → 共通点の p が原因と断定して続行 (DISPUTE_POLICY)
            *   1本だけ食い違う → (4a) p に一番有利な時刻で検定 (SINGLE_DISPUTE, 0 のときだけ破棄)
            * (単独の嘘はここで「冤罪」ではなく「不一致」に変換される)。 */
-          if (get_report_attest()) {
+          struct jc_eval jce = {0.0, 0.0, 0};
+          double hold_true = 0.0;              /* 検証用の記録: 両隣の本当の時刻から出した保持 */
+          if (get_report_attest() && get_judge_copy()) {
+              /* 判定ノード経由の受け渡し: 判定ノードの時計だけで保持を測る (食い違いの処理は使わない) */
+              settle_lat = judge_copy_hold(network, payment, i + 1, &jce);
+              if (settle_lat <= 0.0) continue;
+              hold_true = settle_lat + jce.hidden_in + jce.hidden_out;
+          } else if (get_report_attest()) {
               /* i+2 == nh は受信者の送出申告スロット。受信者証明が無い(0)なら従来どおり判定不能。 */
               if (i + 2 > nh || i + 2 > payment->hop_settle_recv_capacity) continue;
               if (payment->hop_settle_send_times == NULL) continue;
@@ -2086,6 +2227,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               uint64_t sb_dn = payment->hop_settle_send_times[i + 2]; /* 下流の送信申告 */
               uint64_t rd2   = payment->hop_settle_recv_times[i + 1]; /* p 自身の受領申告 */
               if (sb_dn == 0) continue;            /* 隣人(下流)の記録が無ければ帰属不能 */
+              hold_true = (ru > sb_dn) ? (double)(ru - sb_dn) : 0.0;   /* 嘘をつくのは保持者だけなので両隣は本当 */
               int p_silent = (sb_p == 0 || rd2 == 0 || accused_unusable);
               int sd_pol = get_attest_single_dispute();
               /* 因果違反: 本人の申告が「受け取る前に送った」になっている = 本人の記録は使えない。
@@ -2212,6 +2354,12 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                           (dn_node->open_edges != NULL) ? array_len(dn_node->open_edges) : 0L,
                           dn_node->is_malicious ? 1 : 0, (payment->grief_hold_node_id == cand) ? 1 : 0,
                           fav_test, dn_node->settle_test_count, hold_last_z(), hold_last_sd(), should_report);
+          }
+          if (jc_rec >= 0 && cand == payment->grief_hold_node_id) {
+              struct jc_record* r = &jc_recs[jc_rec];
+              r->evaluated = 1; r->hold_true = hold_true; r->hold_meas = settle_lat;
+              r->hidden_in = jce.hidden_in; r->hidden_out = jce.hidden_out; r->delivered = jce.delivered;
+              r->fav_test = fav_test; r->reported = should_report;
           }
           if (should_report && cand != payment->sender && cand != payment->receiver &&
               is_node_observed_by_judges(network, cand) &&
