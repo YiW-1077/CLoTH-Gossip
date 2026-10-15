@@ -1087,7 +1087,13 @@ static int judge_all_nodes(void) {
     return v;
 }
 
+static int g_all_nodes_observed = 0;
+void set_all_nodes_observed(int on) { g_all_nodes_observed = on ? 1 : 0; }
+
 int is_node_observed_by_judges(struct network* network, long node_id) {
+    if (network != NULL && g_all_nodes_observed) {
+        return 1;   /* method3: 判定ノードは無いが、全ノードが検知の対象 */
+    }
     if (network == NULL || network->num_judges == 0) {
         return 0;
     }

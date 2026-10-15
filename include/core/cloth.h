@@ -31,7 +31,7 @@ struct network_params {
 
     /* === Stage ② Research: Judge Placement Parameters === */
     int hub_degree_threshold;              // minimum degree to be considered a hub (e.g., 50)
-    int judging_strategy;               // 1=method1, 2=method2
+    int judging_strategy;               // 1=method1, 2=method2, 3=method3 (判定ノードなし・経路上の告発をゴシップで共有)
     int top_hub_count;                     // for method2: number of top hubs to connect
     unsigned int enable_simple_progress_mode; // 1 to print colorized in-terminal progress
     unsigned int enable_simple_progress_window; // 1 to show live graph in a separate window

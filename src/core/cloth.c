@@ -1082,7 +1082,7 @@ void initialize_input_parameters(struct network_params *net_params, struct payme
   net_params->attack_delay_jitter = 0.0;
   /* === Stage ② Judge Placement Parameters === */
   net_params->hub_degree_threshold = 50;
-  net_params->judging_strategy = 0;  // 0=disabled, 1=method1, 2=method2
+  net_params->judging_strategy = 0;  // 0=disabled, 1=method1, 2=method2, 3=method3 (判定ノードなし)
   net_params->top_hub_count = 30;
   net_params->enable_simple_progress_mode = 0;
   net_params->enable_simple_progress_window = 0;
@@ -1228,6 +1228,8 @@ void read_input(struct network_params* net_params, struct payments_params* pay_p
         net_params->judging_strategy = 1;
       else if(strcmp(value, "method2")==0)
         net_params->judging_strategy = 2;
+      else if(strcmp(value, "method3")==0)
+        net_params->judging_strategy = 3;   /* 判定ノードなし (htlc.c の method3 参照) */
       else
         net_params->judging_strategy = 0;
     }
@@ -1563,6 +1565,7 @@ int main(int argc, char *argv[]) {
     if ((env_val = getenv("CLOTH_JUDGING_STRATEGY")) != NULL) {
       if      (strcmp(env_val, "method1") == 0) net_params.judging_strategy = 1;
       else if (strcmp(env_val, "method2") == 0) net_params.judging_strategy = 2;
+      else if (strcmp(env_val, "method3") == 0) net_params.judging_strategy = 3;
       else                                       net_params.judging_strategy = 0;
       printf("[Config] Override judging_strategy from env: %d\n", net_params.judging_strategy);
     }
@@ -1679,6 +1682,12 @@ int main(int argc, char *argv[]) {
       deploy_judges_method1(network, net_params.hub_degree_threshold, 5);  // leaf_threshold=5
     } else if (net_params.judging_strategy == 2) {
       deploy_judges_method2_enhanced(network, net_params.hub_degree_threshold, 5, net_params.top_hub_count);
+    } else if (net_params.judging_strategy == 3) {
+      /* method3: 判定ノードを置かない。全ノードが検知の対象 (method2 の全ノード観測と同じ範囲) */
+      set_all_nodes_observed(1);
+      printf("[Config] method3: 判定ノードなし・経路上の判定者が自分の基準値で検定・違う告発者 %s 人以上で確定・嘘の告発 (CLOTH_M3_FALSE_ACCUSE) %s\n",
+             getenv("CLOTH_M3_ACCUSERS") ? getenv("CLOTH_M3_ACCUSERS") : "2",
+             getenv("CLOTH_M3_FALSE_ACCUSE") ? getenv("CLOTH_M3_FALSE_ACCUSE") : "0");
     }
   }
 
@@ -2009,6 +2018,7 @@ int main(int argc, char *argv[]) {
   }
 
   judge_copy_write_outputs(output_dir_name);   /* 検証用の記録 (ノブ OFF なら何も書かない) */
+  method3_write_outputs(network, output_dir_name);   /* method3 のときだけ書く */
   write_output(network, payments, output_dir_name);
 
     list_free(group_add_queue);

@@ -927,6 +927,210 @@ void judge_copy_write_outputs(char output_dir_name[]) {
   fclose(f);
 }
 
+/* === method3 (judging_strategy=3): 判定ノードを使わない分散型の検知 ===
+ * preimage を送り返すとき各ノードが自分の時刻を書き込み (署名つき・他人は書き換えられない)、記録は送金者まで渡る。
+ * 経路上のノードは、自分より下流のノードの記録を見られる。そこで、対象ノード q の保持 (相互証明と同じく両隣の記録から
+ * 出す) を、q より上流にいる各ノード (送金者を含む) が「自分が見た分だけで学んだ q の普段の値」で検定する
+ * (判定者 × 対象ごとに検定の状態を持つ。検定の中身は method2 と同じ on_hold_hypothesis_test)。
+ * 異常なら判定者が q を告発し、告発はゴシップで全員に届く (遅れ 0 とみなす)。違う告発者が
+ * CLOTH_M3_ACCUSERS (既定 2) 人以上そろったら q を確定し、それまでの告発を method2 と同じ報告 (評判の罰) に流す。
+ * 確定後の異常はその都度報告する (1 決済 1 回)。悪意ノードは判定者になっても告発しない。
+ * 判定ノードの観測の集約 (share_judge_information) と fail 検知器の報告は使わない。
+ * 嘘のパターン (CLOTH_M3_FALSE_ACCUSE=1, 既定 0): その決済で実際に保持した攻撃者が、自分に preimage を渡した
+ * 下流の隣 (受取人のこともある) を告発する (なすりつけ)。時刻の記録は正直に書く。告発者は攻撃者 1 人なので、
+ * 確定には別の告発者が要る (k=2 の意味を測るためのノブ)。 */
+static int get_m3_false_accuse(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_FALSE_ACCUSE");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+static int get_m3_accusers_required(void) {
+  static int v = -1;
+  if (v >= 1) return v;
+  const char* e = getenv("CLOTH_M3_ACCUSERS");
+  v = 2;
+  if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 1) v = t; }
+  return v;
+}
+struct m3_target {            /* 対象ノードごとの告発の状態 (ゴシップで全員が同じものを見る) */
+  long* accusers; int n_acc, cap_acc;
+  int confirmed;
+  long n_pend, cap_pend;      /* 確定前の告発 (決済ごと) */
+  long* pend_pid; long* pend_reporter; uint64_t* pend_time;
+  uint64_t first_accuse_time, confirm_time;
+  long tests, anomalies, reports;
+  long false_accusations;     /* 嘘の告発を受けた回数 */
+};
+static struct m3_target* m3_t = NULL;
+static long m3_nn = 0;
+/* 判定者 × 対象 の検定の状態。on_hold_hypothesis_test に渡す影のノード (settle_* だけを使い、次数は対象のものを見る) */
+static uint64_t* m3_keys = NULL;
+static struct node** m3_vals = NULL;
+static long m3_cap = 0, m3_used = 0;
+static uint64_t m3_hash(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; return x ^ (x >> 31);
+}
+static void m3_insert(uint64_t key, struct node* v) {
+  uint64_t i = m3_hash(key) & (uint64_t)(m3_cap - 1);
+  while (m3_keys[i] != 0) i = (i + 1) & (uint64_t)(m3_cap - 1);
+  m3_keys[i] = key; m3_vals[i] = v; m3_used++;
+}
+static struct node* m3_shadow(long observer, struct node* target) {
+  uint64_t key = (((uint64_t)observer + 1) << 32) | (uint64_t)(target->id + 1);
+  if (m3_cap == 0 || (m3_used + 1) * 2 > m3_cap) {   /* 表を広げて入れ直す */
+    long oc = m3_cap; uint64_t* ok = m3_keys; struct node** ov = m3_vals;
+    m3_cap = oc ? oc * 2 : 1 << 16;
+    m3_keys = calloc((size_t)m3_cap, sizeof(uint64_t)); m3_vals = calloc((size_t)m3_cap, sizeof(struct node*));
+    m3_used = 0;
+    for (long k = 0; k < oc; k++) if (ok[k] != 0) m3_insert(ok[k], ov[k]);
+    free(ok); free(ov);
+  }
+  uint64_t i = m3_hash(key) & (uint64_t)(m3_cap - 1);
+  while (m3_keys[i] != 0) {
+    if (m3_keys[i] == key) return m3_vals[i];
+    i = (i + 1) & (uint64_t)(m3_cap - 1);
+  }
+  struct node* sh = calloc(1, sizeof(struct node));
+  sh->id = target->id;
+  sh->open_edges = target->open_edges;   /* 次数 (σ の膨張) は対象のものを使う。共有するだけで解放しない */
+  m3_insert(key, sh);
+  return sh;
+}
+static struct m3_target* m3_target_of(struct network* network, long id) {
+  if (m3_t == NULL) {
+    m3_nn = array_len(network->nodes);
+    m3_t = calloc((size_t)m3_nn, sizeof(struct m3_target));
+  }
+  return (id >= 0 && id < m3_nn) ? &m3_t[id] : NULL;
+}
+static void m3_add_accuser(struct m3_target* t, long who) {
+  for (int k = 0; k < t->n_acc; k++) if (t->accusers[k] == who) return;
+  if (t->n_acc == t->cap_acc) {
+    t->cap_acc = t->cap_acc ? 2 * t->cap_acc : 4;
+    t->accusers = realloc(t->accusers, (size_t)t->cap_acc * sizeof(long));
+  }
+  t->accusers[t->n_acc++] = who;
+}
+static void m3_report(struct network* network, struct m3_target* t, struct node* target, long reporter, long pid,
+                      uint64_t now, struct network_params net_params) {
+  report_attacked_node_to_judges(network, reporter, target->id, (uint64_t)pid, now, net_params);
+  target->hold_reports_main++;
+  t->reports++;
+}
+/* 対象への告発 1 件 (この決済の分) を処理する: 確定済みなら報告、未確定ならためて、告発者がそろえば確定して流す。 */
+static int m3_accuse_event(struct network* network, struct simulation* simulation, struct payment* payment,
+                           struct network_params net_params, struct m3_target* t, struct node* target, long reporter) {
+  if (t->first_accuse_time == 0) t->first_accuse_time = simulation->current_time;
+  if (t->confirmed) {
+    if (has_attack_reporter(payment, target->id)) return 0;
+    register_attack_reporter(payment, target->id);
+    m3_report(network, t, target, reporter, payment->id, simulation->current_time, net_params);
+    return 1;
+  }
+  /* 同じ決済の告発は 1 件だけためる (嘘の告発と正直な告発が同じ決済で重なったとき、確定で 2 回報告しない)。
+   * ためるのは決済の順なので、重なるなら直前の 1 件 */
+  int same_payment = (t->n_pend > 0 && t->pend_pid[t->n_pend - 1] == payment->id);
+  if (!same_payment) {
+    if (t->n_pend == t->cap_pend) {
+      t->cap_pend = t->cap_pend ? 2 * t->cap_pend : 4;
+      t->pend_pid = realloc(t->pend_pid, (size_t)t->cap_pend * sizeof(long));
+      t->pend_reporter = realloc(t->pend_reporter, (size_t)t->cap_pend * sizeof(long));
+      t->pend_time = realloc(t->pend_time, (size_t)t->cap_pend * sizeof(uint64_t));
+    }
+    t->pend_pid[t->n_pend] = payment->id; t->pend_reporter[t->n_pend] = reporter;
+    t->pend_time[t->n_pend] = simulation->current_time; t->n_pend++;
+  }
+  if (t->n_acc < get_m3_accusers_required()) return 0;
+  /* 違う告発者がそろった: 確定して、ためていた告発を報告に流す */
+  t->confirmed = 1;
+  t->confirm_time = simulation->current_time;
+  register_attack_reporter(payment, target->id);
+  for (long k = 0; k < t->n_pend; k++)
+    m3_report(network, t, target, t->pend_reporter[k], t->pend_pid[k], simulation->current_time, net_params);
+  return 1;
+}
+/* 嘘のパターン: この決済の保持者が、自分に preimage を渡した下流の隣を告発する (warmup 後に実際に遅れを足したときだけ)。 */
+static void method3_false_accuse(struct network* network, struct simulation* simulation, struct payment* payment,
+                                 struct network_params net_params) {
+  if (!get_m3_false_accuse() || payment->grief_hold_node_id < 0 || payment->grief_hold_extra_ms == 0) return;
+  if (detector_in_warmup(payment, (long)simulation->processed_payments)) return;
+  int nh = array_len(payment->route->route_hops);
+  for (int a = 1; a < nh; a++) {
+    struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, a);
+    if (rh == NULL || rh->from_node_id != payment->grief_hold_node_id) continue;
+    struct node* att = (struct node*)array_get(network->nodes, rh->from_node_id);
+    struct node* prev = (struct node*)array_get(network->nodes, rh->to_node_id);   /* preimage を渡してきた隣 */
+    if (att == NULL || !att->is_malicious || prev == NULL) return;
+    struct m3_target* t = m3_target_of(network, prev->id);
+    if (t == NULL) return;
+    t->false_accusations++;
+    m3_add_accuser(t, att->id);
+    m3_accuse_event(network, simulation, payment, net_params, t, prev, att->id);
+    return;
+  }
+}
+/* 位置 q の対象ノードの保持 settle_lat を、q より上流の各判定者が検定する。報告したら 1 を返す。 */
+static int method3_observe(struct network* network, struct simulation* simulation, struct payment* payment,
+                           struct network_params net_params, int q, struct node* target, double settle_lat,
+                           int fav_test, double avg_iv, int nh, double legs_var) {
+  struct m3_target* t = m3_target_of(network, target->id);
+  if (t == NULL) return 0;
+  int warm = detector_in_warmup(payment, (long)simulation->processed_payments);
+  int tested = 0, flagged = 0;
+  long reporter = -1;
+  for (int u = 0; u < q; u++) {
+    struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, u);
+    if (rh == NULL) continue;
+    struct node* obs = (struct node*)array_get(network->nodes, rh->from_node_id);
+    if (obs == NULL || obs->is_malicious) continue;   /* 悪意ノードは告発しない */
+    struct node* sh = m3_shadow(obs->id, target);
+    hold_set_sample_var(legs_var);
+    int r = fav_test ? on_hold_hypothesis_test_nolearn(sh, settle_lat, warm, avg_iv, nh)
+                     : on_hold_hypothesis_test(sh, settle_lat, warm, avg_iv, nh);
+    if (!warm) tested = 1;
+    if (r) {
+      flagged = 1;
+      m3_add_accuser(t, obs->id);
+      if (reporter < 0) reporter = obs->id;
+    }
+  }
+  if (tested) { t->tests++; target->settle_test_count++; }
+  if (!flagged) return 0;
+  t->anomalies++; target->settle_anomaly_count++;
+  if (target->id == payment->sender || target->id == payment->receiver) {
+    if (t->first_accuse_time == 0) t->first_accuse_time = simulation->current_time;
+    return 0;
+  }
+  return m3_accuse_event(network, simulation, payment, net_params, t, target, reporter);
+}
+void method3_write_outputs(struct network* network, char output_dir_name[]) {
+  if (m3_t == NULL) return;
+  char fn[512];
+  snprintf(fn, sizeof fn, "%smethod3_accusations.csv", output_dir_name);
+  FILE* f = fopen(fn, "w");
+  if (f == NULL) return;
+  fprintf(f, "node_id,is_malicious,degree,first_attack_time,tests,anomalies,distinct_accusers,confirmed,first_accuse_time,confirm_time,pending_at_confirm,reports,false_accusations,malicious_accusers\n");
+  for (long i = 0; i < m3_nn; i++) {
+    struct m3_target* t = &m3_t[i];
+    if (t->tests == 0 && t->anomalies == 0 && t->false_accusations == 0) continue;
+    struct node* nd = (struct node*)array_get(network->nodes, i);
+    long deg = (nd != NULL && nd->open_edges != NULL) ? array_len(nd->open_edges) : 0;
+    int mal_acc = 0;
+    for (int k = 0; k < t->n_acc; k++) {
+      struct node* an = (struct node*)array_get(network->nodes, t->accusers[k]);
+      if (an != NULL && an->is_malicious) mal_acc++;
+    }
+    fprintf(f, "%ld,%d,%ld,%llu,%ld,%ld,%d,%d,%llu,%llu,%ld,%ld,%ld,%d\n", i, (nd != NULL && nd->is_malicious) ? 1 : 0, deg,
+            (unsigned long long)((nd != NULL) ? nd->first_attack_time : 0), t->tests, t->anomalies, t->n_acc, t->confirmed,
+            (unsigned long long)t->first_accuse_time, (unsigned long long)t->confirm_time, t->confirmed ? t->n_pend : 0, t->reports,
+            t->false_accusations, mal_acc);
+  }
+  fclose(f);
+  printf("[method3] 判定者×対象の検定の状態 %ld 組・告発の記録 %s\n", m3_used, fn);
+}
+
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
  * dir: +1 = 「遅く受け取った」方向に盛る, -1 = 「早く送った」方向に盛る。
  * 保持者は「遅く受け取って、すぐ送った」と偽ることで見かけの保持時間を 2X 縮める。
@@ -2143,6 +2347,8 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               jc_recs[jc_rec].extra = (double)payment->grief_hold_extra_ms;
           }
       }
+      /* method3 の嘘のパターン (CLOTH_M3_FALSE_ACCUSE): 保持者が下流の隣を告発する */
+      if (net_params.judging_strategy == 3) method3_false_accuse(network, simulation, payment, net_params);
       for (int i = 0; i + 1 < nh; i++) {
           if (i + 1 >= payment->hop_settle_recv_capacity) break;
           uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
@@ -2332,6 +2538,13 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                   settle_lat += L.r - L.er;
                   if (settle_lat < 1.0) settle_lat = 1.0;
               }
+          }
+          /* method3: 判定ノードの共通の基準値ではなく、経路上の各判定者が自分の基準値で検定して告発する。
+           * ペア検定・従来の報告は使わない */
+          if (net_params.judging_strategy == 3) {
+              method3_observe(network, simulation, payment, net_params, i + 1, dn_node, settle_lat,
+                              fav_test, avg_iv, nh, legs_var);
+              continue;
           }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。
            * (4a) の標本は片方が嘘なので学習しない版で検定する。 */
@@ -2774,6 +2987,7 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
        *      (watches its assigned nodes; all nodes by default, degree floor via
        *      CLOTH_OBSERVE_DEGREE_MIN). */
       if (attacker_id >= 0 && payment->num_attack_reporters > 0 &&
+          net_params.judging_strategy != 3 &&   /* method3 は fail 検知器の報告を使わない (共通の基準値なので) */
           is_node_observed_by_judges(network, attacker_id)) {
           /* 診断計装: 報告された攻撃者の TP/FP 内訳を /tmp/cloth_attribution.csv に記録。
            * 専用 env CLOTH_ATTRIBUTION_LOG 設定時のみ有効 (cloth_debug_enabled() の重い

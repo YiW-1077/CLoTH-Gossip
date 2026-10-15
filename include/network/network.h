@@ -302,6 +302,8 @@ int detect_and_record_htlc_observation(struct network* network, long payment_id,
  * Used to gate attack reporting so only judge-observable nodes can be flagged.
  * This is what makes judging method1 and method2 produce different results. */
 int is_node_observed_by_judges(struct network* network, long node_id);
+/* method3 (判定ノードなし) 用: 1 にすると全ノードを検知の対象として扱う */
+void set_all_nodes_observed(int on);
 
 /* Debug logging toggle: returns nonzero when the CLOTH_DEBUG env var is set.
  * Used to gate hot-path diagnostic output (per-payment / per-detection logs)

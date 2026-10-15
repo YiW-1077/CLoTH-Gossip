@@ -1,9 +1,10 @@
 #!/opt/homebrew/bin/bash
 # 判定手法スイープシミュレーション（並列実行）
-# 3手法 (judge_disable=no_defense baseline / judge_method1 / judge_method2) を
+# 4手法 (judge_disable=no_defense baseline / judge_method1 / judge_method2 / judge_method3) を
 # 取引数 N_PAYMENTS × 支払額 PAYMENT_AMOUNTS × p値 P_VALUES の全組み合わせで実行する。
-# 防御は method に固定対応: disable→no_defense(PRT/RBR off), method1/2→avoid_low_reputation(PRT/RBR on)。
-# 防御2モードには代役ハブ(what-if)を既定で注入する(下の SUBSTITUTE_COUNT 参照)。
+# judge_method3 = 判定ノードなし・経路上の判定者の告発をゴシップで共有 (htlc.c の method3 参照)。
+# 防御は method に固定対応: disable→no_defense(PRT/RBR off), method1/2/3→avoid_low_reputation(PRT/RBR on)。
+# 防御モード (method1/2/3) には代役ハブ(what-if)を既定で注入する(下の SUBSTITUTE_COUNT 参照)。
 # Usage: ./run_monitor_sweep.sh <seed> <output_base_dir> [remote_output_dir|local] [key=value ...]
 # Example: ./run_monitor_sweep.sh 42 /output/dir judging_strategy=method1
 # 出力先 (2026-10-13 方針: シミュのデータはローカルに残さない):
@@ -37,7 +38,7 @@ fi
 N_PAYMENTS=(50 100 200 400 800 1600 3200 6400 12800)   # 取引数
 PAYMENT_AMOUNTS=(100 500 1000)                          # 送金額[sat]
 P_VALUES=(0.01 0.005 0.001)                             # 検定の有意水準
-JUDGING_METHODS=(judge_disable judge_method1 judge_method2)
+JUDGING_METHODS=(judge_disable judge_method1 judge_method2 judge_method3)
 JUDGE_NODE_COUNTS=(10)        # 判定ノード数
 NODE_SCALES=6000                # 追加ノード数
 TOP_HUB_COUNT=10
@@ -208,12 +209,15 @@ for ((i=4; i<=$#; i++)); do
             method2)
                 JUDGING_METHODS_OVERRIDE="judge_method2"
                 ;;
+            method3)
+                JUDGING_METHODS_OVERRIDE="judge_method3"
+                ;;
             all)
-                JUDGING_METHODS_OVERRIDE="judge_disable judge_method1 judge_method2"
+                JUDGING_METHODS_OVERRIDE="judge_disable judge_method1 judge_method2 judge_method3"
                 ;;
             *)
                 echo "ERROR: Invalid judging_strategy: $strategy_value"
-                echo "Valid options: disabled, method1, method2, all"
+                echo "Valid options: disabled, method1, method2, method3, all"
                 exit 1
                 ;;
         esac
@@ -266,8 +270,8 @@ else
     echo "[Config] 攻撃モデル: 偽報告なし/黙秘なし/時計ずれなし/遅延は一律(fixed) ※既定"
 fi
 
-# 代役ハブ。値は設定ブロック[5]。防御モード(method1/2)にだけ per-run env として付ける。
-SUB_ENV_DEFENSE=""   # 防御モード(method1/2)にだけ付けるenv。disableには付けない。
+# 代役ハブ。値は設定ブロック[5]。防御モード(method1/2/3)にだけ per-run env として付ける。
+SUB_ENV_DEFENSE=""   # 防御モード(method1/2/3)にだけ付けるenv。disableには付けない。
 if [ "$SUBSTITUTE_COUNT" -gt 0 ] 2>/dev/null; then
     SUB_ENV_DEFENSE="CLOTH_SUBSTITUTE_COUNT=$SUBSTITUTE_COUNT CLOTH_SUBSTITUTE_MIN_DEGREE=$SUBSTITUTE_MIN_DEGREE CLOTH_SUBSTITUTE_MAX_LINKS=$SUBSTITUTE_MAX_LINKS CLOTH_SUBSTITUTE_ON_DETECTION=$SUBSTITUTE_ON_DETECTION"
     if [ "$SUBSTITUTE_ON_DETECTION" = "1" ]; then sub_mode_lbl="検知トリガ(非オラクル)"; else sub_mode_lbl="オラクル配置(init時から有効)"; fi
@@ -279,7 +283,7 @@ fi
 # 決済(hold)検知の null 模型。既定は hold も対数正規 z検定で fail検知と統一。
 # FWER対策=次数σ膨張でbusyハブのFPを抑制 (SETTLE_FWER=0)。settleは次数非依存なので fail の k=0.04 より
 # 大きい k が必要で、n=12800 で k≈0.12-0.20 のとき per-node 分位点null と precision/recall が
-# 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2)のみに適用。
+# 一致することを確認(2026-08-02, seed7/42/123)。防御モード(method1/2/3)のみに適用。
 # 旧 per-node 分位点null に戻したい場合は設定ブロックの SETTLE_QUANTILE_NULL=1。
 # hold検知の null と帰属方式。値は設定ブロック[4]。防御モードにだけ per-run env として付ける。
 if [ "$SETTLE_QUANTILE_NULL" = "1" ]; then
@@ -315,7 +319,7 @@ fi
 # ---------------------------------------------------------------------------
 
 # 防御モードは method に固定対応 (enqueue ループ内 defense_modes_iter):
-#   judge_disable → no_defense / judge_method1・method2 → avoid_low_reputation
+#   judge_disable → no_defense / judge_method1・method2・method3 → avoid_low_reputation
 
 # Apply JUDGING_METHODS override if specified
 if [[ -n "$JUDGING_METHODS_OVERRIDE" ]]; then
@@ -341,7 +345,7 @@ fi
 #   ⚠️ この修正後のバイナリで再実行した sweep でのみ小 n が正常 (no_defense=被害最大・
 #   grief_change が -45%→大nの-80%へ単調収束)。旧バイナリの既存 sweep 出力は小 n が
 #   依然 stale (no_def=0→N/A や +数百%) なので、正しい値には要再実行。
-# 行は n→amount→p→method でソート (同一条件の disable/method1/method2 が隣接=改善を縦読み)。
+# 行は n→amount→p→method でソート (同一条件の disable/method1/method2/method3 が隣接=改善を縦読み)。
 # ===========================================================================
 
 # summary.csv から指定キーの値を取り出すヘルパー
@@ -441,6 +445,7 @@ generate_summary_csv() {
                             judge_method_short="disable"
                             [[ "$method" == "judge_method1" ]] && judge_method_short="method1"
                             [[ "$method" == "judge_method2" ]] && judge_method_short="method2"
+                            [[ "$method" == "judge_method3" ]] && judge_method_short="method3"
 
                             n_transactions="N/A"; n_successful="N/A"; n_failed="N/A"
                             success_rate_pct="N/A"; avg_delay_ms="N/A"; attacks_triggered="0"
@@ -530,7 +535,7 @@ generate_summary_csv() {
         fchg = pc($c["avg_fee_msat"], bf[k]);
         print $c["n_transactions"],$c["payment_amount_sat"],$c["defense_strategy"],$c["judge_method"],$c["p_value"],$c["judge_count"],$c["attacks_triggered"],$c["payments_griefed"],$c["grief_delay_total_ms"],gchg,$c["n_successful"],$c["n_failed"],$c["success_rate_pct"],schg,$c["avg_delay_ms"],dchg,$c["detection_rate_pct"],$c["detected_attackers"],$c["observable_attacked"],$c["rbr_penalized_nodes"],$c["detection_precision_pct"],$c["avg_fee_msat"],$c["avg_fee_rate_pct"],fchg,$c["payment_amount_msat"];
       }' "$raw_tmp" "$raw_tmp" > "$reord_tmp"; then
-        # 行ソート: n(数値)→amount(数値)→p(数値)→method(disable<method1<method2)
+        # 行ソート: n(数値)→amount(数値)→p(数値)→method(disable<method1<method2<method3)
         { head -1 "$reord_tmp"; tail -n +2 "$reord_tmp" | sort -t, -k1,1n -k2,2n -k5,5n -k4,4; } > "$csv_output"
         rm -f "$raw_tmp" "$reord_tmp"
         echo "Summary CSV: $csv_output (改善デルタ列付き, 行=n→amount→p→method)"
@@ -843,7 +848,7 @@ echo "  取引回数       : ${N_PAYMENTS[*]}"
 echo "  平均支払額（sat）  : ${PAYMENT_AMOUNTS[*]}"
 echo "  判定ノード数   : ${JUDGE_NODE_COUNTS[*]}"
 echo "  監視方法       : ${JUDGING_METHODS[*]}"
-echo "  防御モード     : method固定対応 (disable→no_defense, method1/2→avoid_low_reputation)"
+echo "  防御モード     : method固定対応 (disable→no_defense, method1/2/3→avoid_low_reputation)"
 echo "  p値（閾値）    : ${P_VALUES[*]}"
 echo ""
 p_combo_count=$(( ${#P_VALUES[@]} > 0 ? ${#P_VALUES[@]} : 1 ))
@@ -884,7 +889,7 @@ for n_payment in "${N_PAYMENTS[@]}"; do
             for method in "${JUDGING_METHODS[@]}"; do
 
                 # Pair no_defense with monitoring disabled, and defense with monitoring enabled
-                # 代役ハブenv: baseline(disable)には付けず、防御2モード(method1/2)にのみ付ける。
+                # 代役ハブenv: baseline(disable)には付けず、防御モード(method1/2/3)にのみ付ける。
                 sub_env=""
                 case "$method" in
                     judge_disable)
@@ -907,6 +912,13 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                         judge_counts_iter=("${JUDGE_NODE_COUNTS[@]}")
                         defense_modes_iter=(avoid_low_reputation)
                         sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"       # 防御モードに代役 + hold 検知の設定 (z検定・補正・相互証明。SETTLE_QUANTILE_NULL=1 なら分位点 null)
+                        ;;
+                    judge_method3)
+                        # 判定ノードなし。judge_count は出力 dir の形をそろえるためだけ (判定ノードは置かれない)
+                        strategy_val="method3"
+                        judge_counts_iter=("${JUDGE_NODE_COUNTS[@]}")
+                        defense_modes_iter=(avoid_low_reputation)
+                        sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"
                         ;;
                     *)
                         echo "ERROR: Unknown monitoring method: $method"

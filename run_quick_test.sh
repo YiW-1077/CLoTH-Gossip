@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# クイックテスト: run_monitor_sweep.sh と同じ条件で、1 セルだけを 3 方式 (防御なし / method1 / method2) で回し、
+# クイックテスト: run_monitor_sweep.sh と同じ条件で、1 セルだけを 4 方式 (防御なし / method1 / method2 / method3) で回し、
 # 結果を 1 つの表にする。
 #
 # sweep の一時コピーを作り、軸のうち 取引数・金額・有意水準 の 3 行だけを書き換えて回す。
 # 攻撃・検知・代役ハブ・PRT/RBR などの条件は sweep の設定ブロックそのままなので、sweep とずれない
 # (設定ブロックを変えると、クイックテストも自動でその条件になる)。
 # 結果はローカルの /tmp/cloth_quick_test/ に置く (NAS には送らない。走らせるたびに消して作り直す)。
-# 並列は 3 本。ほかのシミュと合わせて 12 本以内に収めること。
+# 並列は 4 本。ほかのシミュと合わせて 12 本以内に収めること。
 #
 # Usage: ./run_quick_test.sh [seed (既定 7)] [取引数 n (既定 400)]
 #   攻撃の遅れも sweep の設定ブロックに従う (今は range = 100 ms〜10 s の一様乱数)。
@@ -45,7 +45,7 @@ done
 rm -rf "$OUT"
 mkdir -p "$OUT"
 log="$OUT/sweep.log"
-echo "クイックテスト: seed=$SEED n=$N 金額=$AMOUNT sat p=$PVALUE (sweep と同じ条件・3 方式)。ログ: $log"
+echo "クイックテスト: seed=$SEED n=$N 金額=$AMOUNT sat p=$PVALUE (sweep と同じ条件・4 方式)。ログ: $log"
 start=$(date +%s)
 if ! "$tmp" "$SEED" "$OUT" local > "$log" 2>&1; then
   echo "ERROR: sweep が失敗した。ログの末尾:"; tail -20 "$log" | tr '\r' '\n' | tail -20
@@ -89,5 +89,5 @@ for row in [head] + rows:
     print("  ".join(pad(x, ws[j], j > 0) for j, x in enumerate(row)))
 PY
 echo ""
-echo "変化 = 防御なしとの累積グリーフィング遅延の比較。代役ハブ (what-if) は method1・method2 にだけ入る (sweep と同じ)。"
+echo "変化 = 防御なしとの累積グリーフィング遅延の比較。代役ハブ (what-if) は method1・method2・method3 にだけ入る (sweep と同じ)。"
 echo "結果: $(dirname "$csv")  ($(( $(date +%s) - start )) 秒)"
