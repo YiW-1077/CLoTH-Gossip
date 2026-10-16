@@ -503,6 +503,7 @@ struct array* dijkstra(long source, long target, uint64_t amount, struct network
     for(j=0; j<array_len(best_node->open_edges); j++) {
       edge = array_get(best_node->open_edges, j);
       edge = array_get(network->edges, edge->counter_edge_id);
+      if(edge->is_closed) continue;   // 途中で閉じたチャンネル (method3 の申し立て)。既定では誰も閉じない
 
       if(routing_method == CLOTH_ORIGINAL){
           double edge_probability, tmp_probability, edge_weight, tmp_weight, current_prob;
