@@ -854,7 +854,7 @@ static int escrow_offerer_of(struct payment* pm, long node_id, long* offer_id) {
  * ネットワークの遅れは 0 とみなす (シミュの 1 ホップの遅れはほぼ一定で、他の結果と同じ世界で比べるため)。
  * 判定ノードとのやり取りの遅れとそのばらつきは入れていない。シミュの時刻 (イベント) は変えない。
  * 帰属は相互証明 (CLOTH_REPORT_ATTEST=1) の位置で行い、食い違いの処理 (4a・ペア集計など) は使わない。
- * 攻撃ごとの記録は出力 dir の judge_copy_attacks.csv (この機能か賢い嘘を使うときだけ書く)。 */
+ * 攻撃ごとの記録は出力 dir の judge_copy_attacks.csv (この機能か賢い嘘か method3 の記録の書き換えを使うときだけ書く)。 */
 static int get_judge_copy(void) {
   static int v = -1;
   if (v >= 0) return v;
@@ -912,8 +912,9 @@ static long jc_push(void) {
   memset(&jc_recs[jc_n], 0, sizeof(struct jc_record));
   return jc_n++;
 }
+static int get_m3_tamper(void);
 void judge_copy_write_outputs(char output_dir_name[]) {
-  if (!get_judge_copy() && !get_false_report_smart()) return;
+  if (!get_judge_copy() && !get_false_report_smart() && !get_m3_tamper()) return;
   char fn[512];
   snprintf(fn, sizeof fn, "%sjudge_copy_attacks.csv", output_dir_name);
   FILE* f = fopen(fn, "w");
@@ -948,7 +949,10 @@ void judge_copy_write_outputs(char output_dir_name[]) {
  *   嘘の告発は、その決済の正直な判定者の検定が終わってから処理する (同じ決済で確定した嘘つきの告発を捨てられる)。
  * 既定を k=1 + 対策 2 にした理由: 嘘をつくのは保持した本人なので、同じ決済の正直な判定者が 1 人でも異常と見れば
  * その場で嘘つきが確定し、嘘は全部捨てられる (3 シード × 9 取引数で、嘘ありの結果が嘘なしと同じになった)。
- * k=1 では対策 1 と 2 の結果は同じ。保持せずに嘘だけをつく悪意ノードは想定しない (それには k=1 が一番弱い)。 */
+ * k=1 では対策 1 と 2 の結果は同じ。保持せずに嘘だけをつく悪意ノードは想定しない (それには k=1 が一番弱い)。
+ * 記録の書き換え (CLOTH_M3_TAMPER=1, 既定 0。method3 のときだけ): 時刻に署名がないので、保持した攻撃者が
+ * 下流の隣 B (受取人のこともある) の「自分に preimage を渡した時刻」を足した遅れの分だけ遅く書き換え、
+ * 自分の受け取り時刻も同じだけ遅く書く。記録は食い違わず、B が保持したように見える (B が受取人なら遅れは消える)。 */
 static int get_m3_false_accuse(void) {
   static int v = -1;
   if (v >= 0) return v;
@@ -971,6 +975,13 @@ static int get_m3_distrust(void) {
   if (v < 0 || v > 2) v = 2;
   return v;
 }
+static int get_m3_tamper(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_TAMPER");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+static long m3_tamper_count = 0;   /* 書き換えた決済の数 */
 struct m3_ev {                /* 対策 2 用: 決済ごとの告発 (告発者つき) */
   long pid;
   int reported;
@@ -1264,6 +1275,7 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
   }
   fclose(f);
   printf("[method3] 判定者×対象の検定の状態 %ld 組・告発の記録 %s\n", m3_used, fn);
+  if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件\n", m3_tamper_count);
 }
 
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
@@ -2356,6 +2368,24 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
         }
       }
     }
+    /* method3 の記録の書き換え: 下流の隣の送出時刻と自分の受領時刻を、足した遅れの分だけ遅くする */
+    if (get_m3_tamper() && net_params.judging_strategy == 3 && node->is_malicious &&
+        payment->grief_hold_extra_ms > 0 && get_hold_roundtrip() &&
+        payment->hop_settle_recv_times != NULL && payment->hop_settle_send_times != NULL &&
+        payment->route != NULL && payment->route->route_hops != NULL) {
+      int nh_r = array_len(payment->route->route_hops);
+      for (int hi = 0; hi < nh_r && hi < payment->hop_settle_recv_capacity; hi++) {   /* 送出の記録は容量+1 枠 */
+        struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
+        if (rh != NULL && rh->from_node_id == node->id) {
+          if (payment->hop_settle_send_times[hi + 1] != 0 && payment->hop_settle_recv_times[hi] != 0) {
+            payment->hop_settle_send_times[hi + 1] += payment->grief_hold_extra_ms;   /* 下流の隣 (hi+1 == nh は受取人) */
+            payment->hop_settle_recv_times[hi] += payment->grief_hold_extra_ms;
+            m3_tamper_count++;
+          }
+          break;
+        }
+      }
+    }
   }
   next_event_time = simulation->current_time + settle_delay;
   /* 相互証明用: このノードが「上流へ preimage を送った」と申告する時刻。
@@ -2471,7 +2501,7 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
       int anom_pos = -1;   /* この決済で直前に異常と判定した経路位置 (ペア検定の「説明済み」判定用) */
       /* 判定ノード経由の受け渡し・賢い嘘の検証用の記録 (warmup 後に保持者が実際に遅れを足した決済だけ) */
       long jc_rec = -1;
-      if ((get_judge_copy() || get_false_report_smart()) && payment->grief_hold_node_id >= 0 &&
+      if ((get_judge_copy() || get_false_report_smart() || get_m3_tamper()) && payment->grief_hold_node_id >= 0 &&
           payment->grief_hold_extra_ms > 0 && !detector_in_warmup(payment, (long)simulation->processed_payments)) {
           jc_rec = jc_push();
           if (jc_rec >= 0) {
@@ -2675,8 +2705,13 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           /* method3: 判定ノードの共通の基準値ではなく、経路上の各判定者が自分の基準値で検定して告発する。
            * ペア検定・従来の報告は使わない */
           if (net_params.judging_strategy == 3) {
-              method3_observe(network, simulation, payment, net_params, i + 1, dn_node, settle_lat,
-                              fav_test, avg_iv, nh, legs_var);
+              int m3r = method3_observe(network, simulation, payment, net_params, i + 1, dn_node, settle_lat,
+                                        fav_test, avg_iv, nh, legs_var);
+              if (jc_rec >= 0 && cand == payment->grief_hold_node_id) {   /* 攻撃ごとの記録 (検証用) */
+                  struct jc_record* r = &jc_recs[jc_rec];
+                  r->evaluated = 1; r->hold_true = hold_true; r->hold_meas = settle_lat;
+                  r->fav_test = fav_test; r->reported = m3r;
+              }
               continue;
           }
           /* fail と同じく per-hop で検定(保持ノード本人の backward レイテンシを直接)。
