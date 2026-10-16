@@ -935,12 +935,20 @@ void judge_copy_write_outputs(char output_dir_name[]) {
  * 出す) を、q より上流にいる各ノード (送金者を含む) が「自分が見た分だけで学んだ q の普段の値」で検定する
  * (判定者 × 対象ごとに検定の状態を持つ。検定の中身は method2 と同じ on_hold_hypothesis_test)。
  * 異常なら判定者が q を告発し、告発はゴシップで全員に届く (遅れ 0 とみなす)。違う告発者が
- * CLOTH_M3_ACCUSERS (既定 2) 人以上そろったら q を確定し、それまでの告発を method2 と同じ報告 (評判の罰) に流す。
+ * CLOTH_M3_ACCUSERS (既定 1) 人以上そろったら q を確定し、それまでの告発を method2 と同じ報告 (評判の罰) に流す。
  * 確定後の異常はその都度報告する (1 決済 1 回)。悪意ノードは判定者になっても告発しない。
  * 判定ノードの観測の集約 (share_judge_information) と fail 検知器の報告は使わない。
  * 嘘のパターン (CLOTH_M3_FALSE_ACCUSE=1, 既定 0): その決済で実際に保持した攻撃者が、自分に preimage を渡した
  * 下流の隣 (受取人のこともある) を告発する (なすりつけ)。時刻の記録は正直に書く。告発者は攻撃者 1 人なので、
- * 確定には別の告発者が要る (k=2 の意味を測るためのノブ)。 */
+ * k=2 なら確定には別の告発者が要る。
+ * 嘘の告発への対策 (CLOTH_M3_DISTRUST_CONFIRMED, 既定 2。0 = 使わない):
+ *   1 = 確定した (攻撃者と判断された) 告発者の新しい告発は数えない。
+ *   2 = 1 に加えて、告発者が確定したら、それまでの告発も数えない (報告は取り消して評判を戻す)。
+ *       告発者の確定が外れたら、その告発はまた数える。
+ *   嘘の告発は、その決済の正直な判定者の検定が終わってから処理する (同じ決済で確定した嘘つきの告発を捨てられる)。
+ * 既定を k=1 + 対策 2 にした理由: 嘘をつくのは保持した本人なので、同じ決済の正直な判定者が 1 人でも異常と見れば
+ * その場で嘘つきが確定し、嘘は全部捨てられる (3 シード × 9 取引数で、嘘ありの結果が嘘なしと同じになった)。
+ * k=1 では対策 1 と 2 の結果は同じ。保持せずに嘘だけをつく悪意ノードは想定しない (それには k=1 が一番弱い)。 */
 static int get_m3_false_accuse(void) {
   static int v = -1;
   if (v >= 0) return v;
@@ -951,10 +959,23 @@ static int get_m3_accusers_required(void) {
   static int v = -1;
   if (v >= 1) return v;
   const char* e = getenv("CLOTH_M3_ACCUSERS");
-  v = 2;
+  v = 1;
   if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 1) v = t; }
   return v;
 }
+static int get_m3_distrust(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_DISTRUST_CONFIRMED");
+  v = (e != NULL && e[0] != '\0') ? atoi(e) : 2;
+  if (v < 0 || v > 2) v = 2;
+  return v;
+}
+struct m3_ev {                /* 対策 2 用: 決済ごとの告発 (告発者つき) */
+  long pid;
+  int reported;
+  long* acc; int n_acc, cap_acc;
+};
 struct m3_target {            /* 対象ノードごとの告発の状態 (ゴシップで全員が同じものを見る) */
   long* accusers; int n_acc, cap_acc;
   int confirmed;
@@ -963,6 +984,10 @@ struct m3_target {            /* 対象ノードごとの告発の状態 (ゴシ
   uint64_t first_accuse_time, confirm_time;
   long tests, anomalies, reports;
   long false_accusations;     /* 嘘の告発を受けた回数 */
+  long ignored;               /* 対策: 確定した告発者の分として数えなかった告発 */
+  long revoked, unconfirms;   /* 対策 2: 取り消した報告・確定が外れた回数 */
+  struct m3_ev* ev; long n_ev, cap_ev;   /* 対策 2: この対象への告発 (決済ごと) */
+  long* tg; int n_tg, cap_tg;            /* 対策 2: このノードが告発した相手 */
 };
 static struct m3_target* m3_t = NULL;
 static long m3_nn = 0;
@@ -1053,6 +1078,97 @@ static int m3_accuse_event(struct network* network, struct simulation* simulatio
     m3_report(network, t, target, t->pend_reporter[k], t->pend_pid[k], simulation->current_time, net_params);
   return 1;
 }
+/* 告発者 a の告発を数えるか (対策: 確定した告発者の告発は数えない) */
+static int m3_counts(long a) {
+  return !(a >= 0 && a < m3_nn && m3_t[a].confirmed);
+}
+static void m3_add_id(long** arr, int* n, int* cap, long v) {
+  for (int k = 0; k < *n; k++) if ((*arr)[k] == v) return;
+  if (*n == *cap) { *cap = *cap ? 2 * *cap : 4; *arr = realloc(*arr, (size_t)*cap * sizeof(long)); }
+  (*arr)[(*n)++] = v;
+}
+/* 対策 2: 対象 x の確定と報告を「いま数える告発」だけで決め直す。確定が変わったら 1 を返す。
+ * 確定する = 数える告発者が k 人以上。報告する決済 = 確定していて、数える告発者が 1 人以上いる決済。
+ * 報告が要らなくなった決済は取り消して評判を戻し (revoke_reports_from_judges)、また要るようになった決済は報告し直す。 */
+static int m3_sync(struct network* network, struct simulation* simulation, struct payment* payment,
+                   struct network_params net_params, long x) {
+  struct m3_target* t = &m3_t[x];
+  struct node* nd = (struct node*)array_get(network->nodes, x);
+  if (nd == NULL) return 0;
+  int eff = 0;
+  for (int k = 0; k < t->n_acc; k++) if (t->accusers[k] != x && m3_counts(t->accusers[k])) eff++;
+  int want = (eff >= get_m3_accusers_required());
+  long to_revoke = 0;
+  for (long j = 0; j < t->n_ev; j++) {
+    struct m3_ev* e = &t->ev[j];
+    long rep = -1;
+    for (int k = 0; k < e->n_acc && rep < 0; k++) if (e->acc[k] != x && m3_counts(e->acc[k])) rep = e->acc[k];
+    int wr = want && rep >= 0;
+    if (wr && !e->reported) {
+      m3_report(network, t, nd, rep, e->pid, simulation->current_time, net_params);
+      if (e->pid == payment->id) register_attack_reporter(payment, x);
+      e->reported = 1;
+    } else if (!wr && e->reported) {
+      e->reported = 0;
+      to_revoke++;
+    }
+  }
+  if (to_revoke > 0) {
+    revoke_reports_from_judges(network, x, to_revoke, net_params);
+    nd->hold_reports_main -= to_revoke;
+    t->reports -= to_revoke;
+    t->revoked += to_revoke;
+  }
+  if (want == t->confirmed) return 0;
+  if (want) {
+    if (t->confirm_time == 0) {   /* 最初の確定: そのとき流した報告の数を残す (出力の pending_at_confirm) */
+      t->confirm_time = simulation->current_time;
+      t->n_pend = 0;
+      for (long j = 0; j < t->n_ev; j++) t->n_pend += t->ev[j].reported;
+    }
+  }
+  else t->unconfirms++;
+  t->confirmed = want;
+  return 1;
+}
+/* 対策 2: 対象への告発 1 件 (この決済の分、告発者は acc[0..n-1]) を記録し、確定の変化を告発した相手へ順に伝える。 */
+static void m3_accuse_v2(struct network* network, struct simulation* simulation, struct payment* payment,
+                         struct network_params net_params, struct m3_target* t, struct node* target,
+                         const long* acc, int n) {
+  if (t->first_accuse_time == 0) t->first_accuse_time = simulation->current_time;
+  struct m3_ev* e = (t->n_ev > 0 && t->ev[t->n_ev - 1].pid == payment->id) ? &t->ev[t->n_ev - 1] : NULL;
+  if (e == NULL) {   /* 決済の順にためるので、同じ決済なら直前の 1 件 */
+    if (t->n_ev == t->cap_ev) {
+      t->cap_ev = t->cap_ev ? 2 * t->cap_ev : 4;
+      t->ev = realloc(t->ev, (size_t)t->cap_ev * sizeof(struct m3_ev));
+    }
+    e = &t->ev[t->n_ev++];
+    memset(e, 0, sizeof *e);
+    e->pid = payment->id;
+  }
+  for (int k = 0; k < n; k++) {
+    if (!m3_counts(acc[k])) t->ignored++;
+    m3_add_id(&e->acc, &e->n_acc, &e->cap_acc, acc[k]);
+    m3_add_accuser(t, acc[k]);
+    struct m3_target* ta = m3_target_of(network, acc[k]);
+    if (ta != NULL) m3_add_id(&ta->tg, &ta->n_tg, &ta->cap_tg, target->id);
+  }
+  /* 確定が変わったノードがいれば、そのノードが告発した相手も決め直す (いつまでも揺れないように回数に上限) */
+  static long* wl = NULL; static long wl_cap = 0;
+  long wl_n = 0, steps = 0;
+  if (wl_cap == 0) { wl_cap = 64; wl = malloc((size_t)wl_cap * sizeof(long)); }
+  wl[wl_n++] = target->id;
+  while (wl_n > 0) {
+    long x = wl[--wl_n];
+    if (++steps > 1000000) { fprintf(stderr, "[method3] 確定の決め直しが収束しない (打ち切り)\n"); break; }
+    if (!m3_sync(network, simulation, payment, net_params, x)) continue;
+    struct m3_target* tx = &m3_t[x];
+    for (int k = 0; k < tx->n_tg; k++) {
+      if (wl_n == wl_cap) { wl_cap *= 2; wl = realloc(wl, (size_t)wl_cap * sizeof(long)); }
+      wl[wl_n++] = tx->tg[k];
+    }
+  }
+}
 /* 嘘のパターン: この決済の保持者が、自分に preimage を渡した下流の隣を告発する (warmup 後に実際に遅れを足したときだけ)。 */
 static void method3_false_accuse(struct network* network, struct simulation* simulation, struct payment* payment,
                                  struct network_params net_params) {
@@ -1068,6 +1184,13 @@ static void method3_false_accuse(struct network* network, struct simulation* sim
     struct m3_target* t = m3_target_of(network, prev->id);
     if (t == NULL) return;
     t->false_accusations++;
+    int lv = get_m3_distrust();
+    if (lv == 2) {
+      long a1 = att->id;
+      m3_accuse_v2(network, simulation, payment, net_params, t, prev, &a1, 1);
+      return;
+    }
+    if (lv == 1 && !m3_counts(att->id)) { t->ignored++; return; }   /* 確定した嘘つきの告発は数えない */
     m3_add_accuser(t, att->id);
     m3_accuse_event(network, simulation, payment, net_params, t, prev, att->id);
     return;
@@ -1080,8 +1203,9 @@ static int method3_observe(struct network* network, struct simulation* simulatio
   struct m3_target* t = m3_target_of(network, target->id);
   if (t == NULL) return 0;
   int warm = detector_in_warmup(payment, (long)simulation->processed_payments);
-  int tested = 0, flagged = 0;
-  long reporter = -1;
+  int tested = 0;
+  long flg[q > 0 ? q : 1];   /* 異常と見た判定者 (経路の上流から順) */
+  int nf = 0;
   for (int u = 0; u < q; u++) {
     struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, u);
     if (rh == NULL) continue;
@@ -1092,19 +1216,28 @@ static int method3_observe(struct network* network, struct simulation* simulatio
     int r = fav_test ? on_hold_hypothesis_test_nolearn(sh, settle_lat, warm, avg_iv, nh)
                      : on_hold_hypothesis_test(sh, settle_lat, warm, avg_iv, nh);
     if (!warm) tested = 1;
-    if (r) {
-      flagged = 1;
-      m3_add_accuser(t, obs->id);
-      if (reporter < 0) reporter = obs->id;
-    }
+    if (r) flg[nf++] = obs->id;
   }
   if (tested) { t->tests++; target->settle_test_count++; }
-  if (!flagged) return 0;
+  if (nf == 0) return 0;
   t->anomalies++; target->settle_anomaly_count++;
+  int lv = get_m3_distrust();
   if (target->id == payment->sender || target->id == payment->receiver) {
+    for (int k = 0; k < nf; k++) m3_add_accuser(t, flg[k]);
     if (t->first_accuse_time == 0) t->first_accuse_time = simulation->current_time;
     return 0;
   }
+  if (lv == 2) {
+    m3_accuse_v2(network, simulation, payment, net_params, t, target, flg, nf);
+    return has_attack_reporter(payment, target->id);
+  }
+  long reporter = -1;
+  for (int k = 0; k < nf; k++) {
+    if (lv == 1 && !m3_counts(flg[k])) { t->ignored++; continue; }   /* 確定した告発者の告発は数えない */
+    m3_add_accuser(t, flg[k]);
+    if (reporter < 0) reporter = flg[k];
+  }
+  if (reporter < 0) return 0;
   return m3_accuse_event(network, simulation, payment, net_params, t, target, reporter);
 }
 void method3_write_outputs(struct network* network, char output_dir_name[]) {
@@ -1113,7 +1246,7 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
   snprintf(fn, sizeof fn, "%smethod3_accusations.csv", output_dir_name);
   FILE* f = fopen(fn, "w");
   if (f == NULL) return;
-  fprintf(f, "node_id,is_malicious,degree,first_attack_time,tests,anomalies,distinct_accusers,confirmed,first_accuse_time,confirm_time,pending_at_confirm,reports,false_accusations,malicious_accusers\n");
+  fprintf(f, "node_id,is_malicious,degree,first_attack_time,tests,anomalies,distinct_accusers,confirmed,first_accuse_time,confirm_time,pending_at_confirm,reports,false_accusations,malicious_accusers,ignored_accusations,revoked_reports,unconfirms\n");
   for (long i = 0; i < m3_nn; i++) {
     struct m3_target* t = &m3_t[i];
     if (t->tests == 0 && t->anomalies == 0 && t->false_accusations == 0) continue;
@@ -1124,10 +1257,10 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
       struct node* an = (struct node*)array_get(network->nodes, t->accusers[k]);
       if (an != NULL && an->is_malicious) mal_acc++;
     }
-    fprintf(f, "%ld,%d,%ld,%llu,%ld,%ld,%d,%d,%llu,%llu,%ld,%ld,%ld,%d\n", i, (nd != NULL && nd->is_malicious) ? 1 : 0, deg,
+    fprintf(f, "%ld,%d,%ld,%llu,%ld,%ld,%d,%d,%llu,%llu,%ld,%ld,%ld,%d,%ld,%ld,%ld\n", i, (nd != NULL && nd->is_malicious) ? 1 : 0, deg,
             (unsigned long long)((nd != NULL) ? nd->first_attack_time : 0), t->tests, t->anomalies, t->n_acc, t->confirmed,
             (unsigned long long)t->first_accuse_time, (unsigned long long)t->confirm_time, t->confirmed ? t->n_pend : 0, t->reports,
-            t->false_accusations, mal_acc);
+            t->false_accusations, mal_acc, t->ignored, t->revoked, t->unconfirms);
   }
   fclose(f);
   printf("[method3] 判定者×対象の検定の状態 %ld 組・告発の記録 %s\n", m3_used, fn);
@@ -2349,8 +2482,6 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               jc_recs[jc_rec].extra = (double)payment->grief_hold_extra_ms;
           }
       }
-      /* method3 の嘘のパターン (CLOTH_M3_FALSE_ACCUSE): 保持者が下流の隣を告発する */
-      if (net_params.judging_strategy == 3) method3_false_accuse(network, simulation, payment, net_params);
       for (int i = 0; i + 1 < nh; i++) {
           if (i + 1 >= payment->hop_settle_recv_capacity) break;
           uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
@@ -2646,6 +2777,10 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                   dn_node->pair_endpoint_skips++;       /* 相手が受取人: 外側の基準点が無い */
           }
       }
+
+      /* method3 の嘘のパターン (CLOTH_M3_FALSE_ACCUSE): 保持者が下流の隣を告発する。
+       * この決済の正直な判定者の検定のあとに処理する (同じ決済で確定した嘘つきの告発を対策で捨てられるように) */
+      if (net_params.judging_strategy == 3) method3_false_accuse(network, simulation, payment, net_params);
 
       /* エスクロー方式: 受け渡しごとのタイムアウト (判定ノードへのエスカレーション) を記録する。
        * 受け手 = hop k の from (中継), 送り手 = hop k の to。送金者が受け手の k=0 は除く。
