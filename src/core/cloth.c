@@ -1690,7 +1690,7 @@ int main(int argc, char *argv[]) {
              getenv("CLOTH_M3_FALSE_ACCUSE") ? getenv("CLOTH_M3_FALSE_ACCUSE") : "0",
              getenv("CLOTH_M3_DISTRUST_CONFIRMED") ? getenv("CLOTH_M3_DISTRUST_CONFIRMED") : "2",
              getenv("CLOTH_M3_TAMPER") ? getenv("CLOTH_M3_TAMPER") : "0",
-             getenv("CLOTH_M3_APPEAL") ? getenv("CLOTH_M3_APPEAL") : "0");
+             getenv("CLOTH_M3_APPEAL") ? getenv("CLOTH_M3_APPEAL") : "3");
     }
   }
 

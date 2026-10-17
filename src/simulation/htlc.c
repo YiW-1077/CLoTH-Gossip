@@ -982,7 +982,7 @@ static int get_m3_tamper(void) {
   return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
 }
 static long m3_tamper_count = 0;   /* 書き換えた決済の数 */
-/* 申し立て (CLOTH_M3_APPEAL, 既定 0 = 使わない。対策 2 のときだけ効く):
+/* 申し立て (CLOTH_M3_APPEAL, 既定 3。0 = 使わない。対策 2 のときだけ効く):
  *   確定したノード x は 1 回だけ「冤罪だ」と申し立てられる (本物の攻撃者も申し立てる)。相手は x が確定した決済で
  *   x の上流の隣 u (x の記録を書き換えられる位置)。申し立てると x と u のチャンネルを閉じ、x の罰を止めて
  *   (報告を取り消して評判を戻す)、x と u の両方を監視する。
@@ -999,15 +999,19 @@ static long m3_tamper_count = 0;   /* 書き換えた決済の数 */
  *       (既定 5) は前もっての割合とその重み (中継しない相手 (送金者など) は θ のまま)。下流の隣の異常は数えるだけで、
  *       その隣はふつうどおり告発する (有罪のノードの下流の隣の異常だけは、1・2 と同じく有罪のノードの分にする)。
  *       扱う決済が多いハブは、下流の隣で別の攻撃者が攻撃しても割合は小さい (嘘なしの seed 7・n=12800 で中央 2%・
- *       最大 12%。攻撃者自身は中継の 86% で攻撃する)。 */
+ *       最大 12%。攻撃者自身は中継の 86% で攻撃する)。
+ *   既定を 3 にした理由 (金額 100・p 0.001・3 シード、n=12800、申し立てなし → 3): 記録の書き換え (CLOTH_M3_TAMPER) では
+ *   +43.7% (防御なしより悪い) → -49.4%。代わりに嘘なしは -81.3% → -78.1%、自分の受け取り時刻を偽る嘘は -76.5% → -70.9%
+ *   (申し立てた攻撃者は、監視中に罰が止まる間に 1〜2 回攻撃できる)。 */
 static int get_m3_appeal(void) {
   static int v = -1;
   if (v >= 0) return v;
   const char* e = getenv("CLOTH_M3_APPEAL");
-  v = (e != NULL && e[0] != '\0') ? atoi(e) : 0;
-  if (v < 0 || v > 3) v = 0;
-  if (v > 0 && get_m3_distrust() != 2) {
-    fprintf(stderr, "[method3] CLOTH_M3_APPEAL は CLOTH_M3_DISTRUST_CONFIRMED=2 のときだけ効く (使わない)\n");
+  int given = (e != NULL && e[0] != '\0');
+  v = given ? atoi(e) : 3;
+  if (v < 0 || v > 3) v = 3;
+  if (v > 0 && get_m3_distrust() != 2) {   /* 対策 2 でないときは使わない (明示したときだけ知らせる) */
+    if (given) fprintf(stderr, "[method3] CLOTH_M3_APPEAL は CLOTH_M3_DISTRUST_CONFIRMED=2 のときだけ効く (使わない)\n");
     v = 0;
   }
   return v;
