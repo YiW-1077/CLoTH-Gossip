@@ -992,18 +992,47 @@ static long m3_tamper_count = 0;   /* 書き換えた決済の数 */
  *   申し立ては全部申し立てた側の勝ち (それまでの告発を数えなくし、チャンネルを開け直す)。有罪のノードは以後も
  *   下流の隣の異常を本人の分とする。決着がつくまで監視を続け、決着の後の申し立ては受け付けない
  *   (相手として有罪になったノードも申し立てられない)。
- *   2 = 1 と同じだが、下流の隣がすでに確定している (自分の遅れとして説明がつく) ときは本人の分にしない。 */
+ *   2 = 1 と同じだが、下流の隣がすでに確定している (自分の遅れとして説明がつく) ときは本人の分にしない。
+ *   3 = 割合で比べる: 監視中に中継した決済の数 r と証拠の数 e (本人の異常 + 中継した決済での下流の隣の異常) を数え、
+ *       割合 (e + θ·m) / (r + m) の高いほうが負け (負ける側の e が CLOTH_M3_APPEAL_MIN_EVIDENCE (既定 2) 以上の
+ *       ときだけ。同じなら監視を続ける)。θ = CLOTH_M3_APPEAL_PRIOR_RATE (既定 0.2)・m = CLOTH_M3_APPEAL_PRIOR_WEIGHT
+ *       (既定 5) は前もっての割合とその重み (中継しない相手 (送金者など) は θ のまま)。下流の隣の異常は数えるだけで、
+ *       その隣はふつうどおり告発する (有罪のノードの下流の隣の異常だけは、1・2 と同じく有罪のノードの分にする)。
+ *       扱う決済が多いハブは、下流の隣で別の攻撃者が攻撃しても割合は小さい (嘘なしの seed 7・n=12800 で中央 2%・
+ *       最大 12%。攻撃者自身は中継の 86% で攻撃する)。 */
 static int get_m3_appeal(void) {
   static int v = -1;
   if (v >= 0) return v;
   const char* e = getenv("CLOTH_M3_APPEAL");
   v = (e != NULL && e[0] != '\0') ? atoi(e) : 0;
-  if (v < 0 || v > 2) v = 0;
+  if (v < 0 || v > 3) v = 0;
   if (v > 0 && get_m3_distrust() != 2) {
     fprintf(stderr, "[method3] CLOTH_M3_APPEAL は CLOTH_M3_DISTRUST_CONFIRMED=2 のときだけ効く (使わない)\n");
     v = 0;
   }
   return v;
+}
+static long get_m3_appeal_long(const char* name, long def) {
+  const char* e = getenv(name);
+  if (e == NULL || e[0] == '\0') return def;
+  long t = atol(e);
+  return (t >= 1) ? t : def;
+}
+static long get_m3_appeal_prior_weight(void) {
+  static long v = -1;
+  return (v >= 0) ? v : (v = get_m3_appeal_long("CLOTH_M3_APPEAL_PRIOR_WEIGHT", 5));
+}
+static double get_m3_appeal_prior_rate(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_M3_APPEAL_PRIOR_RATE");
+  v = 0.2;
+  if (e != NULL && e[0] != '\0') { double t = atof(e); if (t >= 0.0 && t <= 1.0) v = t; }
+  return v;
+}
+static long get_m3_appeal_min_evidence(void) {
+  static long v = -1;
+  return (v >= 0) ? v : (v = get_m3_appeal_long("CLOTH_M3_APPEAL_MIN_EVIDENCE", 2));
 }
 struct m3_ev {                /* 対策 2 用: 決済ごとの告発 (告発者つき) */
   long pid;
@@ -1030,6 +1059,8 @@ struct m3_target {            /* 対象ノードごとの告発の状態 (ゴシ
   uint64_t ap_start, ap_end;
   long void_from;             /* 申し立てに勝った: これより前の告発 (ev の番号) は数えない */
   long cl_e[8]; int n_cl;     /* 申し立てで閉じたチャンネル (辺の id) */
+  long a_r, a_e;              /* 割合で比べる (3): 監視中に中継した決済の数・証拠の数 */
+  long* by; int n_by, cap_by; /* 自分を相手に申し立てたノード */
 };
 static struct m3_target* m3_t = NULL;
 static long m3_nn = 0;
@@ -1134,6 +1165,7 @@ static void m3_appeal_start(struct network* network, struct simulation* simulati
   struct m3_target* t = &m3_t[x];
   t->ap = 1; t->ap_opp = u; t->ap_start = simulation->current_time;
   m3_t[u].named++;
+  m3_add_id(&m3_t[u].by, &m3_t[u].n_by, &m3_t[u].cap_by, x);
   struct node* nx = (struct node*)array_get(network->nodes, x);
   t->n_cl = 0;
   for (long k = 0; nx != NULL && nx->open_edges != NULL && k < array_len(nx->open_edges) && t->n_cl < 8; k++) {
@@ -1314,6 +1346,59 @@ static int m3_appeal_evidence(struct network* network, struct simulation* simula
   }
   return blame && !self;
 }
+/* 割合で比べる (3) */
+static int m3_watched(long v) { return v >= 0 && v < m3_nn && (m3_t[v].ap == 1 || m3_t[v].named > 0); }
+static void m3_ratio_pair(struct network* network, struct simulation* simulation, struct payment* payment,
+                          struct network_params net_params, long x, long u) {
+  struct m3_target* tx = &m3_t[x];
+  struct m3_target* tu = &m3_t[u];
+  if (tx->ap != 1 || tx->ap_opp != u || tu->guilty) return;
+  double m = (double)get_m3_appeal_prior_weight(), th = get_m3_appeal_prior_rate();
+  long E = get_m3_appeal_min_evidence();
+  double rx = ((double)tx->a_e + th * m) / ((double)tx->a_r + m);
+  double ru = ((double)tu->a_e + th * m) / ((double)tu->a_r + m);
+  if (rx > ru && tx->a_e >= E) {          /* 申し立てた側の負け */
+    m3_appeal_end(network, simulation, x, 0);
+    m3_propagate(network, simulation, payment, net_params, x);
+  } else if (ru > rx && tu->a_e >= E) {   /* 相手の負け */
+    m3_convict(network, simulation, payment, net_params, u);
+  }
+}
+static void m3_ratio_check(struct network* network, struct simulation* simulation, struct payment* payment,
+                           struct network_params net_params, long v) {
+  if (v < 0 || v >= m3_nn) return;
+  if (m3_t[v].ap == 1) m3_ratio_pair(network, simulation, payment, net_params, v, m3_t[v].ap_opp);
+  if (m3_t[v].named > 0 && m3_t[v].n_by > 0) {
+    int n = m3_t[v].n_by;
+    long* cp = malloc((size_t)n * sizeof(long));
+    memcpy(cp, m3_t[v].by, (size_t)n * sizeof(long));
+    for (int k = 0; k < n; k++) m3_ratio_pair(network, simulation, payment, net_params, cp[k], v);
+    free(cp);
+  }
+}
+/* 位置 q の対象 y を正直な判定者 flg[0..nf-1] が異常と見た: 監視中なら証拠に数える。有罪の上流の隣の分にしたら 1 を返す */
+static int m3_ratio_evidence(struct network* network, struct simulation* simulation, struct payment* payment,
+                             struct network_params net_params, int q, struct node* target, const long* flg, int nf) {
+  long y = target->id, w = -1, uw = -1;
+  if (q >= 2) {   /* 上流の隣が中継のときだけ */
+    struct route_hop* r1 = (struct route_hop*)array_get(payment->route->route_hops, q - 1);
+    struct route_hop* r2 = (struct route_hop*)array_get(payment->route->route_hops, q - 2);
+    if (r1 != NULL) w = r1->from_node_id;
+    if (r2 != NULL) uw = r2->from_node_id;
+  }
+  if (w >= m3_nn) w = -1;
+  if (m3_watched(y)) m3_t[y].a_e++;
+  if (w >= 0 && m3_watched(w)) m3_t[w].a_e++;
+  int blame = (w >= 0 && m3_t[w].guilty);
+  if (blame) {
+    struct node* wn = (struct node*)array_get(network->nodes, w);
+    m3_t[w].blamed++;
+    if (wn != NULL) m3_accuse_v2(network, simulation, payment, net_params, &m3_t[w], wn, flg, nf, uw);
+  }
+  m3_ratio_check(network, simulation, payment, net_params, y);
+  if (w >= 0) m3_ratio_check(network, simulation, payment, net_params, w);
+  return blame;
+}
 /* 嘘のパターン: この決済の保持者が、自分に preimage を渡した下流の隣を告発する (warmup 後に実際に遅れを足したときだけ)。 */
 static void method3_false_accuse(struct network* network, struct simulation* simulation, struct payment* payment,
                                  struct network_params net_params) {
@@ -1364,6 +1449,11 @@ static int method3_observe(struct network* network, struct simulation* simulatio
     if (r) flg[nf++] = obs->id;
   }
   if (tested) { t->tests++; target->settle_test_count++; }
+  if (get_m3_appeal() == 3 && !warm && m3_watched(target->id) &&
+      target->id != payment->sender && target->id != payment->receiver) {   /* 監視中に中継した決済を数える */
+    m3_t[target->id].a_r++;
+    m3_ratio_check(network, simulation, payment, net_params, target->id);
+  }
   if (nf == 0) return 0;
   t->anomalies++; target->settle_anomaly_count++;
   int lv = get_m3_distrust();
@@ -1373,7 +1463,9 @@ static int method3_observe(struct network* network, struct simulation* simulatio
     return 0;
   }
   if (lv == 2) {
-    if (get_m3_appeal() && m3_appeal_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
+    if (get_m3_appeal() == 3) {
+      if (m3_ratio_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
+    } else if (get_m3_appeal() && m3_appeal_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
     long up = -1;
     if (q >= 1) {
       struct route_hop* ru = (struct route_hop*)array_get(payment->route->route_hops, q - 1);
@@ -1398,7 +1490,7 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
   FILE* f = fopen(fn, "w");
   if (f == NULL) return;
   fprintf(f, "node_id,is_malicious,degree,first_attack_time,tests,anomalies,distinct_accusers,confirmed,first_accuse_time,confirm_time,pending_at_confirm,reports,false_accusations,malicious_accusers,ignored_accusations,revoked_reports,unconfirms%s\n",
-          get_m3_appeal() ? ",appeal_state,appeal_won,appeal_opponent,appeal_start,appeal_end,convicted,blamed" : "");
+          get_m3_appeal() ? ",appeal_state,appeal_won,appeal_opponent,appeal_start,appeal_end,convicted,blamed,watch_relays,watch_evidence" : "");
   long n_ap = 0, n_won = 0, n_lost = 0, n_conv = 0, n_won_h = 0, n_won_m = 0, n_conv_h = 0;
   for (long i = 0; i < m3_nn; i++) {
     struct m3_target* t = &m3_t[i];
@@ -1416,9 +1508,9 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
             t->false_accusations, mal_acc, t->ignored, t->revoked, t->unconfirms);
     if (get_m3_appeal()) {
       int mal = (nd != NULL && nd->is_malicious);
-      fprintf(f, ",%d,%d,%ld,%llu,%llu,%d,%ld", t->ap, t->ap_won, t->ap ? t->ap_opp : -1L,
-              (unsigned long long)t->ap_start, (unsigned long long)t->ap_end, t->guilty, t->blamed);
-      if (t->ap) n_ap++;
+      fprintf(f, ",%d,%d,%ld,%llu,%llu,%d,%ld,%ld,%ld", t->ap, t->ap_won, t->ap ? t->ap_opp : -1L,
+              (unsigned long long)t->ap_start, (unsigned long long)t->ap_end, t->guilty, t->blamed, t->a_r, t->a_e);
+      if (t->ap == 1 || t->ap_won != 0) n_ap++;   /* 申し立てたノード (相手として有罪になっただけのノードは除く) */
       if (t->ap_won == 1) { n_won++; if (mal) n_won_m++; else n_won_h++; }
       if (t->ap_won == 2) n_lost++;
       if (t->guilty) { n_conv++; if (!mal) n_conv_h++; }
@@ -1427,7 +1519,8 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
   }
   fclose(f);
   if (get_m3_appeal())
-    printf("[method3] 申し立て %ld 件 (勝ち %ld = 正直 %ld・悪意 %ld / 負け %ld / 監視中 %ld)・相手として有罪 %ld (うち正直 %ld)\n",
+    printf("[method3] 申し立て (方式 %d、割合で比べるときの前もっての割合 %.2f・重み %ld・最小の証拠 %ld) %ld 件 (勝ち %ld = 正直 %ld・悪意 %ld / 負け %ld / 監視中 %ld)・相手として有罪 %ld (うち正直 %ld)\n",
+           get_m3_appeal(), get_m3_appeal_prior_rate(), get_m3_appeal_prior_weight(), get_m3_appeal_min_evidence(),
            n_ap, n_won, n_won_h, n_won_m, n_lost, n_ap - n_won - n_lost, n_conv, n_conv_h);
   printf("[method3] 判定者×対象の検定の状態 %ld 組・告発の記録 %s\n", m3_used, fn);
   if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件\n", m3_tamper_count);
