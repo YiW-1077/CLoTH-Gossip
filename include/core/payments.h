@@ -76,6 +76,8 @@ struct payment {
   /* この試行で保持者が足した遅れ [ms] (= settle_delay - settle_base)。攻撃注入側の内部状態で検知器には渡らない。
    * 賢い嘘 (CLOTH_FALSE_REPORT_SMART) と判定ノード経由の受け渡し (CLOTH_JUDGE_COPY) の検証モデルだけが使う。 */
   uint64_t grief_hold_extra_ms;
+  /* method3 の受取人の検定 (CLOTH_M3_RECEIVER_TEST) 用: 受取人がこの試行で HTLC を受け取った時刻 (0 = まだ) */
+  uint64_t m3_rcv_arrive;
 
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments

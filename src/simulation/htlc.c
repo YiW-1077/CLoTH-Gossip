@@ -1048,6 +1048,58 @@ static int get_m3_appeal_ev_down(void) {
   const char* e = getenv("CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM");
   return (v = (get_m3_appeal() == 3 && e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
 }
+/* 受取人の保持も検定する (CLOTH_M3_RECEIVER_TEST、既定 1。0 = 使わない。method3 のときだけ)。受取人は自分の支払いを遅らせない前提なので、
+ * 受取人の保持 (HTLC を受け取ってから preimage を返したと記録された時刻まで) が異常なら、受取人のすぐ上流の中継を告発する
+ * (監視中なら、その中継の証拠にも数える)。検定するのは受取人より上流の正直なノード (送金者を含み、告発される中継は除く)。
+ * 受取人としての基準は、中継としての基準とは別に学ぶ。
+ * 既定にした理由 (金額 100・p 0.001・3 シード、n=12800): 案 1〜3 (受取人の検定・受取人の記録を直接・絞り込み) の組み合わせを
+ * 比べ、書き換え 2 条件の削減の平均が一番大きく、嘘なしを悪くしないのが受取人の検定だけだった (すぐ隣 -49.4% -> -66.1%、
+ * 下流のどこか -31.2% -> -51.8%、嘘なしは 27 セルとも出力が同じ)。絞り込みを足すと書き換えにはもっと効くが嘘なしが 0.9 pt 悪くなり、
+ * 受取人の記録を直接届けると受取人の保持が異常に見えなくなって、この検定の効き目が消える。 */
+static int get_m3_rcv_test(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_RECEIVER_TEST");
+  return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
+}
+static long m3_rcv_tests = 0, m3_rcv_anom = 0;
+/* 受取人の記録を経路を通さずに送金者へ届ける (CLOTH_M3_RECEIVER_DIRECT=1、既定 0。method3 のときだけ)。
+ * 受取人と送金者は請求書のやりとりで直接つながっているので、受取人の時刻はこの道で届き、途中の中継には書き換えられない。
+ * 記録の書き換え (CLOTH_M3_TAMPER) が受取人の記録に及ばなくなるだけで、ほかの処理 (受取人の記録を信じる突き合わせ) はそのまま。 */
+static int get_m3_rcv_direct(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_RECEIVER_DIRECT");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+static long m3_rcv_direct_kept = 0;
+/* 誰が上流にいたときに異常が出たかで絞る (CLOTH_M3_TOMOGRAPHY=1、既定 0。method3 のときだけ)。
+ * 各中継について、warmup 後に中継した決済の数 r と、そのうち下流のどこかの中継が異常と見られた決済の数 c を数え、
+ * 割合 (c + θm) / (r + m) が CLOTH_M3_TOMO_THRESHOLD (既定 0.3) 以上で c が CLOTH_M3_TOMO_MIN (既定 3) 以上なら、
+ * その決済で異常を見た正直な判定者がその中継も告発する (1 決済 1 回)。θ・m は申し立ての前もっての割合と重み。 */
+static int get_m3_tomo(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_TOMOGRAPHY");
+  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+static double get_m3_tomo_threshold(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_M3_TOMO_THRESHOLD");
+  v = 0.3;
+  if (e != NULL && e[0] != '\0') { double t = atof(e); if (t > 0.0 && t <= 1.0) v = t; }
+  return v;
+}
+static long get_m3_tomo_min(void) {
+  static long v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_TOMO_MIN");
+  v = 3;
+  if (e != NULL && e[0] != '\0') { long t = atol(e); if (t >= 1) v = t; }
+  return v;
+}
+static long m3_tomo_acc = 0, m3_tomo_acc_h = 0;   /* 絞って告発した回数・そのうち正直なノード */   /* 受取人の記録が書き換えられずに届いた (書き換えの対象が受取人だった) 回数 */
 static long get_m3_appeal_prior_weight(void) {
   static long v = -1;
   return (v >= 0) ? v : (v = get_m3_appeal_long("CLOTH_M3_APPEAL_PRIOR_WEIGHT", 5));
@@ -1092,6 +1144,7 @@ struct m3_target {            /* 対象ノードごとの告発の状態 (ゴシ
   long cl_e[8]; int n_cl;     /* 申し立てで閉じたチャンネル (辺の id) */
   long a_r, a_e;              /* 割合で比べる (3): 監視中に中継した決済の数・証拠の数 */
   long a_last_pid;            /* 2 つ以上先の異常を数えた最後の決済 (id+1)。同じ決済で 2 回数えない */
+  long tm_r, tm_c, tm_last_pid, tm_acc_pid;   /* 絞り込み: 中継した決済・下流で異常が出た決済・最後に数えた決済・最後に告発した決済 (id+1) */
   long* by; int n_by, cap_by; /* 自分を相手に申し立てたノード */
   long* opps; int n_opps;     /* 申し立ての相手 (全部の上流のとき) */
 };
@@ -1134,6 +1187,28 @@ static struct node* m3_shadow(long observer, struct node* target) {
   struct node* sh = calloc(1, sizeof(struct node));
   sh->id = target->id;
   sh->open_edges = target->open_edges;   /* 次数 (σ の膨張) は対象のものを使う。共有するだけで解放しない */
+  m3_insert(key, sh);
+  return sh;
+}
+/* 受取人としての検定の状態 (中継としての状態とは別のキー) */
+static struct node* m3_shadow_rcv(long observer, struct node* target) {
+  uint64_t key = (((uint64_t)observer + 1) << 32) | ((uint64_t)(target->id + 1) | 0x80000000ULL);
+  if (m3_cap == 0 || (m3_used + 1) * 2 > m3_cap) {
+    long oc = m3_cap; uint64_t* ok = m3_keys; struct node** ov = m3_vals;
+    m3_cap = oc ? oc * 2 : 1 << 16;
+    m3_keys = calloc((size_t)m3_cap, sizeof(uint64_t)); m3_vals = calloc((size_t)m3_cap, sizeof(struct node*));
+    m3_used = 0;
+    for (long k = 0; k < oc; k++) if (ok[k] != 0) m3_insert(ok[k], ov[k]);
+    free(ok); free(ov);
+  }
+  uint64_t i = m3_hash(key) & (uint64_t)(m3_cap - 1);
+  while (m3_keys[i] != 0) {
+    if (m3_keys[i] == key) return m3_vals[i];
+    i = (i + 1) & (uint64_t)(m3_cap - 1);
+  }
+  struct node* sh = calloc(1, sizeof(struct node));
+  sh->id = target->id;
+  sh->open_edges = target->open_edges;
   m3_insert(key, sh);
   return sh;
 }
@@ -1509,6 +1584,49 @@ static int m3_ratio_evidence(struct network* network, struct simulation* simulat
   }
   return blame;
 }
+/* 受取人の保持を検定し、異常なら受取人のすぐ上流の中継を告発する (CLOTH_M3_RECEIVER_TEST) */
+static void method3_receiver_test(struct network* network, struct simulation* simulation, struct payment* payment,
+                                  struct network_params net_params, int nh, double avg_iv) {
+  if (nh < 2 || payment->m3_rcv_arrive == 0 || payment->hop_settle_send_times == NULL) return;
+  if (nh > payment->hop_settle_recv_capacity) return;
+  uint64_t sb = payment->hop_settle_send_times[nh];   /* 受取人が preimage を返したと記録された時刻 */
+  if (sb == 0 || sb <= payment->m3_rcv_arrive) return;
+  double lat = (double)(sb - payment->m3_rcv_arrive);
+  struct node* rcv = (struct node*)array_get(network->nodes, payment->receiver);
+  struct route_hop* rl = (struct route_hop*)array_get(payment->route->route_hops, nh - 1);
+  if (rcv == NULL || rl == NULL) return;
+  long last = rl->from_node_id;   /* 受取人のすぐ上流の中継 */
+  if (last == payment->sender || last < 0 || last >= m3_nn) return;
+  int warm = detector_in_warmup(payment, (long)simulation->processed_payments);
+  long flg[nh]; int nf = 0, tested = 0;
+  for (int u = 0; u < nh; u++) {
+    struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, u);
+    if (rh == NULL) continue;
+    struct node* obs = (struct node*)array_get(network->nodes, rh->from_node_id);
+    if (obs == NULL || obs->is_malicious || obs->id == last) continue;
+    struct node* sh = m3_shadow_rcv(obs->id, rcv);
+    hold_set_sample_var(0.0);
+    int r = on_hold_hypothesis_test(sh, lat, warm, avg_iv, nh);
+    if (!warm) tested = 1;
+    if (r) flg[nf++] = obs->id;
+  }
+  if (tested) m3_rcv_tests++;
+  if (nf == 0) return;
+  m3_rcv_anom++;
+  struct node* ln = (struct node*)array_get(network->nodes, last);
+  struct m3_target* t = m3_target_of(network, last);
+  if (ln == NULL || t == NULL) return;
+  long up = -1;
+  if (nh >= 2) { struct route_hop* r2 = (struct route_hop*)array_get(payment->route->route_hops, nh - 2); if (r2 != NULL) up = r2->from_node_id; }
+  if (get_m3_appeal() == 3 && m3_watched(last)) m3_t[last].a_e++;   /* 監視中なら本人の証拠に */
+  if (get_m3_distrust() == 2) {
+    m3_accuse_v2(network, simulation, payment, net_params, t, ln, flg, nf, up);
+  } else {
+    for (int k = 0; k < nf; k++) m3_add_accuser(t, flg[k]);
+    m3_accuse_event(network, simulation, payment, net_params, t, ln, flg[0]);
+  }
+  if (get_m3_appeal() == 3) m3_ratio_check(network, simulation, payment, net_params, last);
+}
 /* 嘘のパターン: この決済の保持者が、自分に preimage を渡した下流の隣を告発する (warmup 後に実際に遅れを足したときだけ)。 */
 static void method3_false_accuse(struct network* network, struct simulation* simulation, struct payment* payment,
                                  struct network_params net_params) {
@@ -1534,6 +1652,31 @@ static void method3_false_accuse(struct network* network, struct simulation* sim
     m3_add_accuser(t, att->id);
     m3_accuse_event(network, simulation, payment, net_params, t, prev, att->id);
     return;
+  }
+}
+/* 絞り込み: 位置 q の対象を正直な判定者 flg[] が異常と見た。q より上流の中継の「下流で異常が出た決済」を数え、
+ * 割合がしきい値を超えた中継を同じ判定者が告発する */
+static void method3_tomo(struct network* network, struct simulation* simulation, struct payment* payment,
+                         struct network_params net_params, int q, struct node* target, const long* flg, int nf) {
+  double m = (double)get_m3_appeal_prior_weight(), th = get_m3_appeal_prior_rate();
+  for (int k = 1; k < q; k++) {
+    struct route_hop* rk = (struct route_hop*)array_get(payment->route->route_hops, k);
+    long u = (rk != NULL) ? rk->from_node_id : -1;
+    if (u < 0 || u >= m3_nn || u == target->id || u == payment->sender) continue;
+    struct m3_target* tu = &m3_t[u];
+    if (tu->tm_last_pid == payment->id + 1) continue;
+    tu->tm_last_pid = payment->id + 1;
+    tu->tm_c++;
+    double rho = ((double)tu->tm_c + th * m) / ((double)tu->tm_r + m);
+    if (tu->tm_c < get_m3_tomo_min() || rho < get_m3_tomo_threshold() || tu->tm_acc_pid == payment->id + 1) continue;
+    tu->tm_acc_pid = payment->id + 1;
+    struct node* un = (struct node*)array_get(network->nodes, u);
+    if (un == NULL) continue;
+    m3_tomo_acc++; if (!un->is_malicious) m3_tomo_acc_h++;
+    long up = -1;
+    if (k >= 1) { struct route_hop* r2 = (struct route_hop*)array_get(payment->route->route_hops, k - 1); if (r2 != NULL) up = r2->from_node_id; }
+    if (get_m3_distrust() == 2) m3_accuse_v2(network, simulation, payment, net_params, tu, un, flg, nf, up);
+    else { for (int j = 0; j < nf; j++) m3_add_accuser(tu, flg[j]); m3_accuse_event(network, simulation, payment, net_params, tu, un, flg[0]); }
   }
 }
 /* 位置 q の対象ノードの保持 settle_lat を、q より上流の各判定者が検定する。報告したら 1 を返す。 */
@@ -1564,6 +1707,8 @@ static int method3_observe(struct network* network, struct simulation* simulatio
     m3_t[target->id].a_r++;
     m3_ratio_check(network, simulation, payment, net_params, target->id);
   }
+  if (get_m3_tomo() && !warm && target->id != payment->sender && target->id != payment->receiver)
+    t->tm_r++;   /* 絞り込み: 中継した決済を数える */
   if (nf == 0) return 0;
   t->anomalies++; target->settle_anomaly_count++;
   int lv = get_m3_distrust();
@@ -1572,6 +1717,7 @@ static int method3_observe(struct network* network, struct simulation* simulatio
     if (t->first_accuse_time == 0) t->first_accuse_time = simulation->current_time;
     return 0;
   }
+  if (get_m3_tomo() && !warm) method3_tomo(network, simulation, payment, net_params, q, target, flg, nf);
   if (lv == 2) {
     if (get_m3_appeal() == 3) {
       if (m3_ratio_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
@@ -1636,6 +1782,10 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
                                     : (get_m3_appeal_ev_down() ? "・証拠は下流の全部" : ""), get_m3_appeal_prior_rate(), get_m3_appeal_prior_weight(), get_m3_appeal_min_evidence(),
            n_ap, n_won, n_won_h, n_won_m, n_lost, n_ap - n_won - n_lost, n_conv, n_conv_h);
   printf("[method3] 判定者×対象の検定の状態 %ld 組・告発の記録 %s\n", m3_used, fn);
+  if (get_m3_tomo()) printf("[method3] 絞り込み (しきい値 %.2f・最小 %ld) で告発 %ld 回 (うち正直なノード %ld 回)\n",
+                           get_m3_tomo_threshold(), get_m3_tomo_min(), m3_tomo_acc, m3_tomo_acc_h);
+  if (get_m3_rcv_direct()) printf("[method3] 受取人の記録を直接届けた: 書き換えが受取人の記録に及ばなかった回数 %ld\n", m3_rcv_direct_kept);
+  if (get_m3_rcv_test()) printf("[method3] 受取人の検定 %ld 回・異常 %ld 回 (受取人のすぐ上流の中継を告発)\n", m3_rcv_tests, m3_rcv_anom);
   if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件 (方式 %d・受取人に付け替え %ld 件・付け替え先までの平均ホップ %.2f)\n",
                              m3_tamper_count, get_m3_tamper(), m3_tamper_recv,
                              m3_tamper_count ? (double)m3_tamper_dist_sum / (double)m3_tamper_count : 0.0);
@@ -2305,6 +2455,7 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
               payment->hop_settle_send_times[i] = 0;
   }
   payment->grief_hold_extra_ms = 0;   /* 保持者が足した遅れも試行ごとに消す */
+  payment->m3_rcv_arrive = 0;
 
   /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
    * 送信者の最初のホップ先が悪意ノードの場合も、中継 (forward_payment) と同様に
@@ -2618,6 +2769,7 @@ void receive_payment(struct event* event, struct simulation* simulation, struct 
   payment = event->payment;
   route = payment->route;
   node = array_get(network->nodes, event->node_id);
+  payment->m3_rcv_arrive = simulation->current_time;   /* method3 の受取人の検定用 (受取人が HTLC を受け取った時刻) */
 
   last_route_hop = array_get(route->route_hops, array_len(route->route_hops) - 1);
   forward_edge = array_get(network->edges, last_route_hop->edge_id);
@@ -2752,7 +2904,8 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
             ok = (payment->hop_settle_recv_times[k] != 0 && payment->hop_settle_send_times[k] != 0);
           if (ok) {
             uint64_t X = payment->grief_hold_extra_ms;
-            payment->hop_settle_send_times[tgt] += X;   /* 付け替え先 (tgt == nh は受取人) */
+            if (tgt == nh_r && get_m3_rcv_direct()) m3_rcv_direct_kept++;   /* 受取人の記録は直接届くので書き換えられない */
+            else payment->hop_settle_send_times[tgt] += X;   /* 付け替え先 (tgt == nh は受取人) */
             for (int k = hi + 1; k < tgt; k++) { payment->hop_settle_recv_times[k] += X; payment->hop_settle_send_times[k] += X; }
             payment->hop_settle_recv_times[hi] += X;
             m3_tamper_count++;
@@ -3192,6 +3345,8 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
 
       /* method3 の嘘のパターン (CLOTH_M3_FALSE_ACCUSE): 保持者が下流の隣を告発する。
        * この決済の正直な判定者の検定のあとに処理する (同じ決済で確定した嘘つきの告発を対策で捨てられるように) */
+      if (net_params.judging_strategy == 3 && get_m3_rcv_test())   /* 受取人の保持も検定する */
+          method3_receiver_test(network, simulation, payment, net_params, nh, avg_iv);
       if (net_params.judging_strategy == 3) method3_false_accuse(network, simulation, payment, net_params);
 
       /* エスクロー方式: 受け渡しごとのタイムアウト (判定ノードへのエスカレーション) を記録する。
