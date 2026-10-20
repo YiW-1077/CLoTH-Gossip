@@ -952,7 +952,10 @@ void judge_copy_write_outputs(char output_dir_name[]) {
  * k=1 では対策 1 と 2 の結果は同じ。保持せずに嘘だけをつく悪意ノードは想定しない (それには k=1 が一番弱い)。
  * 記録の書き換え (CLOTH_M3_TAMPER=1, 既定 0。method3 のときだけ): 時刻に署名がないので、保持した攻撃者が
  * 下流の隣 B (受取人のこともある) の「自分に preimage を渡した時刻」を足した遅れの分だけ遅く書き換え、
- * 自分の受け取り時刻も同じだけ遅く書く。記録は食い違わず、B が保持したように見える (B が受取人なら遅れは消える)。 */
+ * 自分の受け取り時刻も同じだけ遅く書く。記録は食い違わず、B が保持したように見える (B が受取人なら遅れは消える)。
+ * CLOTH_M3_TAMPER=2: 付け替え先を下流のどこか (すぐ隣から受取人まで) にする。決済 ID と攻撃者の ID のハッシュで選ぶ
+ * (乱数は使わない)。付け替え先 C の送出時刻、A と C の間のノードの受領・送出時刻、A の受領時刻を同じだけ遅くするので、
+ * 記録は食い違わず C が保持したように見える (間のノードの保持は変わらない)。すぐ隣を選んだときは 1 と同じ。 */
 static int get_m3_false_accuse(void) {
   static int v = -1;
   if (v >= 0) return v;
@@ -979,9 +982,13 @@ static int get_m3_tamper(void) {
   static int v = -1;
   if (v >= 0) return v;
   const char* e = getenv("CLOTH_M3_TAMPER");
-  return (v = (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+  v = (e != NULL && e[0] != '\0') ? atoi(e) : 0;
+  if (v < 0 || v > 2) v = 0;
+  return v;
 }
 static long m3_tamper_count = 0;   /* 書き換えた決済の数 */
+static long m3_tamper_recv = 0;    /* そのうち受取人に付け替えた数 */
+static long m3_tamper_dist_sum = 0;   /* 付け替え先までのホップ数の合計 */
 /* 申し立て (CLOTH_M3_APPEAL, 既定 3。0 = 使わない。対策 2 のときだけ効く):
  *   確定したノード x は 1 回だけ「冤罪だ」と申し立てられる (本物の攻撃者も申し立てる)。相手は x が確定した決済で
  *   x の上流の隣 u (x の記録を書き換えられる位置)。申し立てると x と u のチャンネルを閉じ、x の罰を止めて
@@ -1527,7 +1534,9 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
            get_m3_appeal(), get_m3_appeal_prior_rate(), get_m3_appeal_prior_weight(), get_m3_appeal_min_evidence(),
            n_ap, n_won, n_won_h, n_won_m, n_lost, n_ap - n_won - n_lost, n_conv, n_conv_h);
   printf("[method3] 判定者×対象の検定の状態 %ld 組・告発の記録 %s\n", m3_used, fn);
-  if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件\n", m3_tamper_count);
+  if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件 (方式 %d・受取人に付け替え %ld 件・付け替え先までの平均ホップ %.2f)\n",
+                             m3_tamper_count, get_m3_tamper(), m3_tamper_recv,
+                             m3_tamper_count ? (double)m3_tamper_dist_sum / (double)m3_tamper_count : 0.0);
 }
 
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
@@ -2620,7 +2629,7 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
         }
       }
     }
-    /* method3 の記録の書き換え: 下流の隣の送出時刻と自分の受領時刻を、足した遅れの分だけ遅くする */
+    /* method3 の記録の書き換え: 付け替え先 (1 = 下流の隣、2 = 下流のどこか) までの記録を、足した遅れの分だけ遅くする */
     if (get_m3_tamper() && net_params.judging_strategy == 3 && node->is_malicious &&
         payment->grief_hold_extra_ms > 0 && get_hold_roundtrip() &&
         payment->hop_settle_recv_times != NULL && payment->hop_settle_send_times != NULL &&
@@ -2629,10 +2638,24 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
       for (int hi = 0; hi < nh_r && hi < payment->hop_settle_recv_capacity; hi++) {   /* 送出の記録は容量+1 枠 */
         struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
         if (rh != NULL && rh->from_node_id == node->id) {
-          if (payment->hop_settle_send_times[hi + 1] != 0 && payment->hop_settle_recv_times[hi] != 0) {
-            payment->hop_settle_send_times[hi + 1] += payment->grief_hold_extra_ms;   /* 下流の隣 (hi+1 == nh は受取人) */
-            payment->hop_settle_recv_times[hi] += payment->grief_hold_extra_ms;
+          int tgt = hi + 1;   /* 付け替え先の位置 (nh_r は受取人) */
+          if (get_m3_tamper() == 2 && nh_r > hi + 1) {
+            unsigned long h = ((unsigned long)payment->id * 2654435761UL) ^ ((unsigned long)node->id * 40503UL + 0x9E37UL);
+            h ^= (h >> 15); h *= 2246822519UL; h ^= (h >> 13);
+            tgt = hi + 1 + (int)(h % (unsigned long)(nh_r - hi));
+          }
+          if (tgt > payment->hop_settle_recv_capacity) tgt = payment->hop_settle_recv_capacity;
+          int ok = (payment->hop_settle_send_times[tgt] != 0 && payment->hop_settle_recv_times[hi] != 0);
+          for (int k = hi + 1; k < tgt && ok; k++)
+            ok = (payment->hop_settle_recv_times[k] != 0 && payment->hop_settle_send_times[k] != 0);
+          if (ok) {
+            uint64_t X = payment->grief_hold_extra_ms;
+            payment->hop_settle_send_times[tgt] += X;   /* 付け替え先 (tgt == nh は受取人) */
+            for (int k = hi + 1; k < tgt; k++) { payment->hop_settle_recv_times[k] += X; payment->hop_settle_send_times[k] += X; }
+            payment->hop_settle_recv_times[hi] += X;
             m3_tamper_count++;
+            m3_tamper_dist_sum += tgt - hi;
+            if (tgt == nh_r) m3_tamper_recv++;
           }
           break;
         }
