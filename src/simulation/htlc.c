@@ -18,6 +18,8 @@
 #include "network/monitoring.h"
 #include "core/event.h"
 #include "data_structures/utils.h"
+#include "simulation/m3_hmac.h"
+#include <time.h>
 
 /* 使用ライブラリの役割（このCファイル）
  * - 標準Cライブラリ（stdlib/stdio/string/stdint/unistd）:
@@ -1686,13 +1688,196 @@ static int m3_ratio_evidence(struct network* network, struct simulation* simulat
   return blame;
 }
 /* 受取人の保持を検定し、異常なら受取人のすぐ上流の中継を告発する (CLOTH_M3_RECEIVER_TEST) */
+
+/* === method3 のハッシュチェーン (CLOTH_M3_HASHCHAIN、既定 1。0 で使わない = 10/22 昼までの既定) ===
+ * preimage を返すとき、各ノード (中継と受取人) は自分の記録 (受け取った時刻・上流へ渡した時刻。受取人は HTLC が届いた時刻も) と
+ * 下流から届いた印をまとめて、送金者と自分だけが知る鍵で HMAC-SHA256 の印を付ける (鍵は送金・試行・位置・ノードごと)。
+ * 送金者は最後に全部の印を確かめる。途中のノードが下流の記録を書き換えると、書き換えられた記録の印が合わなくなる。
+ * 送金者に一番近い側で印が合わない位置を j とすると、j より下流の記録 (j-1 の保持の検定も j の記録を使う) は検定に使わず、
+ * ペア (j-1, j) を判定ノードに知らせる (j-1 が送金者なら j だけ)。印からはペアのどちらかまでしか分からない。
+ * 判定ノードはそのペアを監視し、以後その 2 人が中継する決済では、2 人それぞれの保持を判定ノードの時計で測る
+ * (判定ノード経由の受け渡し、CLOTH_JUDGE_COPY と同じ作り: 保持 = 本人の写しの時刻 − 本人の受領書の時刻。どちらも本人の
+ *  ものなので、相手の数字は動かせない。攻撃者は受領書を遅らせる手と写しを先に送る手で、それぞれ T まで隠す。T = CLOTH_JUDGE_COPY_T_MS)。
+ * 測った保持は、経路の上流の正直な判定者が自分の基準値 (warmup で学んだもの。監視中の値では学び直さない) で検定する。
+ * 異常が出たノードをそのペアの犯人として普段どおり告発し、相手は監視から外す。犯人は監視を続ける。決まらないペアは監視を続ける。
+ * 判定ノード (CLOTH_M3_HASHCHAIN_JUDGES 個、既定 10) は受け持ちを数えるだけで、判定ノードまでの遅れは 0 とみなす。
+ * 鍵は乱数を使わずに作る (ほかの乱数の列を変えない)。印を付ける・確かめる時間は実際に測って出力する。 */
+static int get_m3_hashchain(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_HASHCHAIN");
+  v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1;
+  if (v && !m3_hmac_selftest()) { fprintf(stderr, "ERROR: HMAC-SHA256 の自己テスト (FIPS 180・RFC 4231) が合わない\n"); exit(1); }
+  return v;
+}
+static int get_m3_hc_judges(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_HASHCHAIN_JUDGES");
+  v = 10; if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 1) v = t; }
+  return v;
+}
+/* 送金者が印を確かめる時間 (1 ホップあたり ms、既定 0)。0 より大きいと、確かめてから検定・告発するまでを t × ホップ数 遅らせる
+ * (送金の完了は遅らせない) */
+static double get_m3_hc_verify_ms(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_M3_HASHCHAIN_VERIFY_MS");
+  v = 0.0; if (e != NULL && e[0] != '\0') { double t = atof(e); if (t > 0.0) v = t; }
+  return v;
+}
+static long m3_hc_deferred = 0;   /* 遅らせて検定した決済 */
+static long m3_hc_tag_n = 0, m3_hc_ver_n = 0;            /* 付けた印・確かめた印の数 */
+static double m3_hc_tag_ns = 0.0, m3_hc_ver_ns = 0.0;    /* そのためにかかった時間 (実際の計算) */
+static long m3_hc_checked = 0, m3_hc_fail = 0, m3_hc_fail_match = 0, m3_hc_fail_explained = 0;
+static long m3_hc_meas = 0, m3_hc_meas_att = 0, m3_hc_cmp = 0, m3_hc_same = 0;
+static double m3_hc_hidden = 0.0, m3_hc_extra = 0.0;
+struct m3_hc_pair { long a, b; int judge; uint64_t t0, t1; long fails; int resolved; long culprit; };
+static struct m3_hc_pair* m3_hc_pairs = NULL;
+static long m3_hc_np = 0, m3_hc_pcap = 0, m3_hc_nn = 0;
+static int* m3_hc_mon = NULL;     /* ノードごと: 決まっていない監視中のペアの数 */
+static char* m3_hc_culp = NULL;   /* ノードごと: 監視で犯人と決まった */
+static int* m3_hc_jof = NULL;     /* ノードごと: 受け持つ判定ノード */
+static uint64_t* m3_hc_since = NULL;   /* ノードごと: 監視を始めた時刻 (これより後の受け渡しだけ判定ノードが測れる) */
+static long* m3_hc_load = NULL;   /* 判定ノードごと: 測った回数 */
+static void m3_hc_init(struct network* network) {
+  if (m3_hc_mon != NULL) return;
+  m3_hc_nn = array_len(network->nodes);
+  m3_hc_mon = calloc((size_t)m3_hc_nn, sizeof(int));
+  m3_hc_culp = calloc((size_t)m3_hc_nn, sizeof(char));
+  m3_hc_jof = calloc((size_t)m3_hc_nn, sizeof(int));
+  m3_hc_since = calloc((size_t)m3_hc_nn, sizeof(uint64_t));
+  m3_hc_load = calloc((size_t)get_m3_hc_judges(), sizeof(long));
+}
+static int m3_hc_monitored(long v) {
+  return m3_hc_mon != NULL && v >= 0 && v < m3_hc_nn && (m3_hc_mon[v] > 0 || m3_hc_culp[v]);
+}
+/* 位置 q の受け渡しを判定ノードが見ていたか: 監視中で、本人が受け取ったのが監視を始めたあと */
+static int m3_hc_watched_here(struct payment* pm, int q, int nh, long v) {
+  if (!m3_hc_monitored(v) || pm->m3_true_recv == NULL || q >= pm->m3_hc_cap) return 0;
+  uint64_t t_in = (q < nh) ? pm->m3_true_recv[q] : pm->m3_rcv_arrive;
+  return t_in != 0 && t_in >= m3_hc_since[v];
+}
+static long m3_hc_node_at(struct payment* pm, int pos, int nh) {   /* 位置 pos のノード (0 = 送金者、nh = 受取人) */
+  if (pos == nh) return pm->receiver;
+  struct route_hop* rh = (struct route_hop*)array_get(pm->route->route_hops, pos);
+  return (rh != NULL) ? rh->from_node_id : -1;
+}
+static double m3_hc_ns(struct timespec a, struct timespec b) {
+  return (double)(b.tv_sec - a.tv_sec) * 1e9 + (double)(b.tv_nsec - a.tv_nsec);
+}
+static void m3_hc_put(uint8_t* buf, size_t* n, uint64_t v, int bytes) {
+  for (int k = bytes - 1; k >= 0; k--) buf[(*n)++] = (uint8_t)(v >> (8 * k));
+}
+/* 送金者と位置 pos のノードだけが知る鍵 (本物の LN ではオニオンの鍵共有で作る。ここでは送金・試行・位置・ノードから SHA-256 で作る) */
+static void m3_hc_key(const struct payment* pm, int pos, long node_id, uint8_t key[32]) {
+  static const char lbl[] = "CLoTH-Gossip method3 hashchain";
+  uint8_t buf[64]; size_t n = 0;
+  memcpy(buf, lbl, sizeof lbl - 1); n = sizeof lbl - 1;
+  m3_hc_put(buf, &n, (uint64_t)pm->id, 8); m3_hc_put(buf, &n, (uint64_t)pm->attempts, 4);
+  m3_hc_put(buf, &n, (uint64_t)pos, 4); m3_hc_put(buf, &n, (uint64_t)node_id, 8);
+  m3_sha256(buf, n, key);
+}
+/* 位置 pos の印 = HMAC(鍵, 送金・試行・位置・ノード・受け取った時刻・渡した時刻・HTLC が届いた時刻 (受取人)・下流の印) */
+static void m3_hc_mac(const struct payment* pm, int pos, int nh, long node_id, uint8_t out[32]) {
+  uint8_t key[32], msg[96]; size_t n = 0;
+  static const uint8_t zero[32] = {0};
+  m3_hc_key(pm, pos, node_id, key);
+  m3_hc_put(msg, &n, (uint64_t)pm->id, 8); m3_hc_put(msg, &n, (uint64_t)pm->attempts, 4);
+  m3_hc_put(msg, &n, (uint64_t)pos, 4); m3_hc_put(msg, &n, (uint64_t)node_id, 8);
+  m3_hc_put(msg, &n, (pos < nh) ? pm->hop_settle_recv_times[pos] : 0, 8);
+  m3_hc_put(msg, &n, pm->hop_settle_send_times[pos], 8);
+  m3_hc_put(msg, &n, (pos == nh) ? pm->m3_rcv_arrive : 0, 8);
+  memcpy(msg + n, (pos < nh) ? pm->m3_tags + 32 * (pos + 1) : zero, 32); n += 32;
+  m3_hmac_sha256(key, 32, msg, n, out);
+}
+/* 位置 pos のノードが自分の記録に印を付ける (自分の記録を書いたあと・下流の印が届いたあと) */
+static void m3_hc_sign(struct payment* pm, int pos, long node_id) {
+  if (pm->m3_tags == NULL || pm->route == NULL) return;
+  int nh = array_len(pm->route->route_hops);
+  if (pos < 1 || pos > nh || nh >= pm->m3_hc_cap || nh > pm->hop_settle_recv_capacity) return;
+  struct timespec a, b;
+  clock_gettime(CLOCK_MONOTONIC, &a);
+  m3_hc_mac(pm, pos, nh, node_id, pm->m3_tags + 32 * pos);
+  clock_gettime(CLOCK_MONOTONIC, &b);
+  m3_hc_tag_ns += m3_hc_ns(a, b); m3_hc_tag_n++;
+}
+/* 送金者が全部の印を確かめる。送金者に一番近い側で合わなかった位置を返す (全部合えば 0) */
+static int m3_hc_verify(struct payment* pm, int nh) {
+  int j = 0;
+  for (int p = nh; p >= 1; p--) {
+    uint8_t exp[32];
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    m3_hc_mac(pm, p, nh, m3_hc_node_at(pm, p, nh), exp);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    m3_hc_ver_ns += m3_hc_ns(a, b); m3_hc_ver_n++;
+    if (memcmp(exp, pm->m3_tags + 32 * p, 32) != 0) j = p;
+  }
+  return j;
+}
+/* 印が位置 j で合わなかった: ペア (j-1, j) を判定ノードに知らせる。すでに監視で犯人と決まったノードを含むなら説明済み */
+static void m3_hc_flag(struct network* network, struct simulation* simulation, struct payment* pm, int j, int nh) {
+  m3_hc_init(network);
+  long b = m3_hc_node_at(pm, j, nh);
+  long a = (j - 1 >= 1) ? m3_hc_node_at(pm, j - 1, nh) : -1;   /* j-1 が送金者なら j だけ */
+  if (b < 0 || b >= m3_hc_nn || a >= m3_hc_nn) return;
+  if ((a >= 0 && m3_hc_culp[a]) || m3_hc_culp[b]) { m3_hc_fail_explained++; return; }
+  for (long k = 0; k < m3_hc_np; k++) {
+    struct m3_hc_pair* q = &m3_hc_pairs[k];
+    if (!q->resolved && q->a == a && q->b == b) { q->fails++; return; }
+  }
+  if (m3_hc_np == m3_hc_pcap) {
+    m3_hc_pcap = m3_hc_pcap ? 2 * m3_hc_pcap : 256;
+    m3_hc_pairs = realloc(m3_hc_pairs, (size_t)m3_hc_pcap * sizeof(struct m3_hc_pair));
+  }
+  struct m3_hc_pair* q = &m3_hc_pairs[m3_hc_np];
+  q->a = a; q->b = b; q->judge = (int)(m3_hc_np % get_m3_hc_judges());
+  q->t0 = simulation->current_time; q->t1 = 0; q->fails = 1; q->resolved = 0; q->culprit = -1;
+  m3_hc_np++;
+  if (a >= 0) { if (!m3_hc_monitored(a)) m3_hc_since[a] = q->t0; m3_hc_mon[a]++; m3_hc_jof[a] = q->judge; }
+  if (!m3_hc_monitored(b)) m3_hc_since[b] = q->t0;
+  m3_hc_mon[b]++; m3_hc_jof[b] = q->judge;
+}
+/* 監視で v に異常が出た: v を含む決まっていないペアの犯人を v にし、相手を監視から外す。v は監視を続ける */
+static void m3_hc_resolve(long v, uint64_t now) {
+  if (v < 0 || v >= m3_hc_nn) return;
+  m3_hc_culp[v] = 1;
+  for (long k = 0; k < m3_hc_np; k++) {
+    struct m3_hc_pair* q = &m3_hc_pairs[k];
+    if (q->resolved || (q->a != v && q->b != v)) continue;
+    q->resolved = 1; q->culprit = v; q->t1 = now;
+    if (q->a >= 0) m3_hc_mon[q->a]--;
+    m3_hc_mon[q->b]--;
+  }
+}
+/* 判定ノードの時計で測った位置 q の保持 (本人の写しの時刻 − 本人の受領書の時刻)。判定ノードまでの遅れ 0 では本当の時刻になり、
+ * ずれるのは本人の手口の分だけ: その決済の保持者 (悪意) は受領書を遅らせて min(足した遅れ, T)、残りを写しを先に送って
+ * min(残り, T) 隠す (判定ノードが受け渡しを代わりにする前に)。戻り値 <= 0 は測れない */
+static double m3_hc_judge_hold(struct network* network, struct payment* pm, int q, int nh, struct jc_eval* ev) {
+  ev->hidden_in = ev->hidden_out = 0.0; ev->delivered = 0;
+  if (q < 1 || q > nh || pm->m3_true_send == NULL || q >= pm->m3_hc_cap) return 0.0;
+  uint64_t t_in = (q < nh) ? pm->m3_true_recv[q] : pm->m3_rcv_arrive;
+  uint64_t t_out = pm->m3_true_send[q];
+  if (t_in == 0 || t_out <= t_in) return 0.0;
+  long id = m3_hc_node_at(pm, q, nh);
+  struct node* nd = (id >= 0) ? (struct node*)array_get(network->nodes, id) : NULL;
+  if (nd != NULL && nd->is_malicious && id == pm->grief_hold_node_id && pm->grief_hold_extra_ms > 0) {
+    double T = get_judge_copy_t_ms(), x = (double)pm->grief_hold_extra_ms;
+    ev->hidden_in = (x < T) ? x : T;
+    ev->delivered = (x > T);
+    double r = x - ev->hidden_in;
+    ev->hidden_out = (r < T) ? r : T;
+  }
+  return (double)(t_out - t_in) - ev->hidden_in - ev->hidden_out;
+}
 static void method3_receiver_test(struct network* network, struct simulation* simulation, struct payment* payment,
-                                  struct network_params net_params, int nh, double avg_iv) {
+                                  struct network_params net_params, int nh, double avg_iv, double lat_judge) {
   if (nh < 2 || payment->m3_rcv_arrive == 0 || payment->hop_settle_send_times == NULL) return;
   if (nh > payment->hop_settle_recv_capacity) return;
   uint64_t sb = payment->hop_settle_send_times[nh];   /* 受取人が preimage を返したと記録された時刻 */
   if (sb == 0 || sb <= payment->m3_rcv_arrive) return;
-  double lat = (double)(sb - payment->m3_rcv_arrive);
+  double lat = (lat_judge > 0.0) ? lat_judge : (double)(sb - payment->m3_rcv_arrive);   /* 監視中の受取人は判定ノードの時計で測った値 */
   struct node* rcv = (struct node*)array_get(network->nodes, payment->receiver);
   struct route_hop* rl = (struct route_hop*)array_get(payment->route->route_hops, nh - 1);
   if (rcv == NULL || rl == NULL) return;
@@ -1903,6 +2088,45 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
   if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件 (方式 %d・受取人に付け替え %ld 件・付け替え先までの平均ホップ %.2f)\n",
                              m3_tamper_count, get_m3_tamper(), m3_tamper_recv,
                              m3_tamper_count ? (double)m3_tamper_dist_sum / (double)m3_tamper_count : 0.0);
+  if (get_m3_hashchain()) {
+    long np_res = 0, np_mal = 0, np_hon = 0, np_mal_any = 0, mon_now = 0;
+    for (long k = 0; k < m3_hc_np; k++) {
+      struct m3_hc_pair* q = &m3_hc_pairs[k];
+      struct node* na = (q->a >= 0) ? (struct node*)array_get(network->nodes, q->a) : NULL;
+      struct node* nb = (struct node*)array_get(network->nodes, q->b);
+      if ((na != NULL && na->is_malicious) || (nb != NULL && nb->is_malicious)) np_mal_any++;
+      if (!q->resolved) continue;
+      np_res++;
+      struct node* nc = (struct node*)array_get(network->nodes, q->culprit);
+      if (nc != NULL && nc->is_malicious) np_mal++; else np_hon++;
+    }
+    for (long v = 0; v < m3_hc_nn; v++) if (m3_hc_monitored(v)) mon_now++;
+    printf("[method3] ハッシュチェーン: 印 %ld 個 (1 個 %.2f µs)・確かめた印 %ld 個 (1 個 %.2f µs)・確かめた決済 %ld 件・印が合わない決済 %ld 件 (書き換えた保持者のすぐ下流で合わない %ld 件・犯人が決まっていて説明済み %ld 件)\n",
+           m3_hc_tag_n, m3_hc_tag_n ? m3_hc_tag_ns / 1e3 / (double)m3_hc_tag_n : 0.0,
+           m3_hc_ver_n, m3_hc_ver_n ? m3_hc_ver_ns / 1e3 / (double)m3_hc_ver_n : 0.0, m3_hc_checked, m3_hc_fail, m3_hc_fail_match, m3_hc_fail_explained);
+    printf("[method3] ハッシュチェーンの監視 (判定ノード %d 個・T %.0f ms): ペア %ld 組 (悪意を含む %ld 組)・犯人が決まった %ld 組 (悪意 %ld・正直 %ld)・終わった時点で監視中のノード %ld・判定ノードで測った回数 %ld (攻撃した決済 %ld 回、足した遅れ %.0f ms のうち隠した %.0f ms)・記録と判定ノードの保持が同じ検定 %ld / %ld\n",
+           get_m3_hc_judges(), get_judge_copy_t_ms(), m3_hc_np, np_mal_any, np_res, np_mal, np_hon, mon_now, m3_hc_meas, m3_hc_meas_att, m3_hc_extra, m3_hc_hidden, m3_hc_same, m3_hc_cmp);
+    char fp2[512];
+    snprintf(fp2, sizeof fp2, "%smethod3_hashchain_pairs.csv", output_dir_name);
+    FILE* g = fopen(fp2, "w");
+    if (g != NULL) {
+      fprintf(g, "a,b,a_malicious,b_malicious,judge,flag_time,fails,resolved,culprit,culprit_malicious,resolve_time\n");
+      for (long k = 0; k < m3_hc_np; k++) {
+        struct m3_hc_pair* q = &m3_hc_pairs[k];
+        struct node* na = (q->a >= 0) ? (struct node*)array_get(network->nodes, q->a) : NULL;
+        struct node* nb = (struct node*)array_get(network->nodes, q->b);
+        struct node* nc = (q->culprit >= 0) ? (struct node*)array_get(network->nodes, q->culprit) : NULL;
+        fprintf(g, "%ld,%ld,%d,%d,%d,%llu,%ld,%d,%ld,%d,%llu\n", q->a, q->b, na != NULL ? na->is_malicious : -1,
+                nb != NULL ? nb->is_malicious : -1, q->judge, (unsigned long long)q->t0, q->fails, q->resolved, q->culprit,
+                nc != NULL ? nc->is_malicious : -1, (unsigned long long)q->t1);
+      }
+      fclose(g);
+    }
+    printf("[method3] ハッシュチェーンの検証時間 %.1f ms/ホップ・遅らせて検定した決済 %ld 件\n", get_m3_hc_verify_ms(), m3_hc_deferred);
+    printf("[method3] 判定ノードごとの測った回数:");
+    for (int k = 0; k < get_m3_hc_judges(); k++) printf(" %ld", m3_hc_load != NULL ? m3_hc_load[k] : 0L);
+    printf("\n");
+  }
 }
 
 /* ノードが申告する時刻 = 真の時刻 + 時計オフセット + (嘘をつくなら嘘の分)。
@@ -2570,6 +2794,19 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   }
   payment->grief_hold_extra_ms = 0;   /* 保持者が足した遅れも試行ごとに消す */
   payment->m3_rcv_arrive = 0;
+  if (net_params.judging_strategy == 3 && get_m3_hashchain() && payment->hop_settle_send_times != NULL) {   /* ハッシュチェーン: 位置ごとの印と本当の時刻 */
+      int need = payment->hop_settle_recv_capacity + 1;
+      if (payment->m3_hc_cap < need) {
+          free(payment->m3_tags); free(payment->m3_true_recv); free(payment->m3_true_send);
+          payment->m3_tags = (unsigned char*)malloc((size_t)need * 32);
+          payment->m3_true_recv = (uint64_t*)malloc((size_t)need * sizeof(uint64_t));
+          payment->m3_true_send = (uint64_t*)malloc((size_t)need * sizeof(uint64_t));
+          payment->m3_hc_cap = need;
+      }
+      memset(payment->m3_tags, 0, (size_t)payment->m3_hc_cap * 32);
+      memset(payment->m3_true_recv, 0, (size_t)payment->m3_hc_cap * sizeof(uint64_t));
+      memset(payment->m3_true_send, 0, (size_t)payment->m3_hc_cap * sizeof(uint64_t));
+  }
 
   /* === Stage ① Malicious Node Attack Injection (最初のホップ) ===
    * 送信者の最初のホップ先が悪意ノードの場合も、中継 (forward_payment) と同様に
@@ -2913,6 +3150,13 @@ void receive_payment(struct event* event, struct simulation* simulation, struct 
           payment->hop_settle_send_times[nh_rcv] =
               reported_time(array_get(network->nodes, payment->receiver), payment, next_event_time, -1);
   }
+  if (get_m3_hashchain() && net_params.judging_strategy == 3 && payment->m3_tags != NULL && payment->route != NULL) {
+      int nh_rcv = array_len(payment->route->route_hops);
+      if (nh_rcv < payment->m3_hc_cap) {
+          payment->m3_true_send[nh_rcv] = next_event_time;
+          m3_hc_sign(payment, nh_rcv, payment->receiver);
+      }
+  }
   next_event = new_event(next_event_time, event_type, prev_node_id, event->payment);
   simulation->events = heap_insert(simulation->events, next_event, compare_event);
 }
@@ -3045,6 +3289,18 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
           }
       }
   }
+  if (get_m3_hashchain() && net_params.judging_strategy == 3 && payment->m3_tags != NULL && payment->route != NULL) {
+      int nh_s = array_len(payment->route->route_hops);
+      for (int hi = 1; hi < nh_s && hi < payment->m3_hc_cap; hi++) {
+          struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, hi);
+          if (rh != NULL && rh->from_node_id == node->id) {
+              payment->m3_true_recv[hi] = simulation->current_time;
+              payment->m3_true_send[hi] = next_event_time;
+              m3_hc_sign(payment, hi, node->id);
+              break;
+          }
+      }
+  }
 
   /* === シャドウ計測 (Phase 0): 報告はしない。各ノードの決済転送レイテンシを記録し、
    * 攻撃者(保持) vs 正常ノードの分離度(SNR) を実測する。CLOTH_GRIEF_SHADOW_LOG 時のみ。
@@ -3092,49 +3348,11 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
 }
 
 /* receive an HTLC success (behavior of the payment sender node) */
-void receive_success(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params){
-  if (get_escrow() || escrow_params()->hold_legs > 0) escrow_bind(network);
-  struct node* node;
-  struct payment* payment;
-  payment = event->payment;
-  node = array_get(network->nodes, event->node_id);
-  event->payment->end_time = simulation->current_time;
-  {
-    static int jc_printed = 0;
-    if (!jc_printed && (get_judge_copy() || get_false_report_smart())) {
-      jc_printed = 1;
-      printf("[JudgeCopy] 判定ノード経由=%d T=%.0fms 賢い嘘=%d 嘘のスイッチ=%ldms 側=%s\n",
-             get_judge_copy(), get_judge_copy_t_ms(), get_false_report_smart(), get_false_report_ms(),
-             get_false_report_side() == FALSE_REPORT_SIDE_RECV ? "recv" :
-             get_false_report_side() == FALSE_REPORT_SIDE_SEND ? "send" : "both");
-    }
-  }
-
-  add_attempt_history(payment, network, simulation->current_time, 1);
-
-  /* === Stage ④ Hypothesis Testing: Increment global payment counter === */
-  simulation->processed_payments++;
-
-  /* === hold round-trip 検出 (案A, CLOTH_HOLD_ROUNDTRIP)：隣接差分版 ===
-   * 各ノードの往復時間 RT[i] = recv[i] - send[i] は自ノードだけで観測可能。経路上の隣接
-   * ノードの差 Δ[i] = RT[i] - RT[i+1] は導出上「下流ノード(i+1)の決済転送遅延 settle_delay
-   * ＋1本の順方向ホップ」に等しい。よって resid = Δ[i] - 平均インターバル ≈ 下流ノード
-   * (i+1)の settle_delay を、観測可能な往復量だけから復元できる(希釈なし=(B)と同じ信号)。
-   * この resid を下流ノードの settle 検定にかけ、異常なノードを報告する(報告者=上流ノード、
-   * 同じ決済で同じノードは1回)。**既定 ON**。既定の相互証明 (CLOTH_REPORT_ATTEST=1) では
-   * 検定値を下の相互証明モードの hold[p]=recv[p-1]-send_back[p+1] に置き換える。 */
-  if (get_hold_roundtrip() && net_params.enable_reputation_system &&
-      payment->route != NULL && payment->hop_send_times != NULL &&
-      payment->hop_settle_recv_times != NULL) {
+/* 送金者が preimage を受け取ったあとの保持の検定 (method2・method3。method3 のハッシュチェーンの検証と監視を含む)。
+ * ハッシュチェーンの検証時間があるときは M3VERIFY のイベントで遅らせて呼ぶ */
+static void hold_tests_on_success(struct payment* payment, struct simulation* simulation,
+                                  struct network* network, struct network_params net_params) {
       int nh = array_len(payment->route->route_hops);
-      /* 送信者(=このノード)の preimage 受信時刻を記録 */
-      for (int i = 0; i < nh && i < payment->hop_settle_recv_capacity; i++) {
-          struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, i);
-          if (rh != NULL && rh->from_node_id == node->id) {
-              payment->hop_settle_recv_times[i] = reported_time(node, payment, simulation->current_time, +1); break;
-          }
-      }
-      payment->num_attack_reporters = 0;   /* 試行ごとに初期化(dedup キー兼用) */
       double avg_iv = (double)net_params.average_payment_forward_interval;
       /* fail(receive_fail) は順方向 per-hop レイテンシ send[i+1]-send[i] を各ホップで検定し
        * 異常ホップの攻撃者を報告する。hold もこれに対称に、決済(backward)経路の per-hop
@@ -3156,8 +3374,48 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
               jc_recs[jc_rec].extra = (double)payment->grief_hold_extra_ms;
           }
       }
+      /* method3 のハッシュチェーン: 全部の印を確かめ、合わない位置 hc_fail より下流の記録は使わない */
+      int hc_on = (net_params.judging_strategy == 3 && get_m3_hashchain() && payment->m3_tags != NULL && nh < payment->m3_hc_cap);
+      int hc_fail = 0;
+      if (hc_on) {
+          m3_hc_init(network);
+          hc_fail = m3_hc_verify(payment, nh);
+          m3_hc_checked++;
+          if (hc_fail > 0) {
+              m3_hc_fail++;
+              if (hc_fail >= 2 && m3_hc_node_at(payment, hc_fail - 1, nh) == payment->grief_hold_node_id) m3_hc_fail_match++;
+              m3_hc_flag(network, simulation, payment, hc_fail, nh);
+          }
+      }
       for (int i = 0; i + 1 < nh; i++) {
           if (i + 1 >= payment->hop_settle_recv_capacity) break;
+          if (hc_on) {
+              int q = i + 1;
+              long vq = m3_hc_node_at(payment, q, nh);
+              if (m3_hc_watched_here(payment, q, nh, vq)) {   /* 監視中: 判定ノードの時計で測った保持を検定する */
+                  struct jc_eval hev;
+                  double lat = m3_hc_judge_hold(network, payment, q, nh, &hev);
+                  struct node* qn = (struct node*)array_get(network->nodes, vq);
+                  struct m3_target* tq = m3_target_of(network, vq);
+                  if (lat > 0.0 && qn != NULL && tq != NULL) {
+                      long an0 = tq->anomalies;
+                      int m3r = method3_observe(network, simulation, payment, net_params, q, qn, lat, 1, avg_iv, nh, 0.0);
+                      if (tq->anomalies > an0) m3_hc_resolve(vq, simulation->current_time);
+                      m3_hc_meas++; m3_hc_load[m3_hc_jof[vq]]++;
+                      if (vq == payment->grief_hold_node_id && payment->grief_hold_extra_ms > 0) {
+                          m3_hc_meas_att++; m3_hc_hidden += hev.hidden_in + hev.hidden_out; m3_hc_extra += (double)payment->grief_hold_extra_ms;
+                      }
+                      if (jc_rec >= 0 && vq == payment->grief_hold_node_id) {
+                          struct jc_record* r = &jc_recs[jc_rec];
+                          r->evaluated = 1; r->hold_true = lat + hev.hidden_in + hev.hidden_out; r->hold_meas = lat;
+                          r->hidden_in = hev.hidden_in; r->hidden_out = hev.hidden_out; r->delivered = hev.delivered;
+                          r->fav_test = 1; r->reported = m3r;
+                      }
+                  }
+                  continue;
+              }
+              if (hc_fail > 0 && q >= hc_fail - 1) continue;   /* 印が合わない記録を使う検定はしない */
+          }
           uint64_t ru = payment->hop_settle_recv_times[i];      /* node i が決済を受領した時刻 */
           uint64_t rd = payment->hop_settle_recv_times[i + 1];  /* node i+1 が決済を受領した時刻 */
           /* 入れ子制約: 区間[send[i],recv[i]] は [send[i+1],recv[i+1]] を厳密に含むので
@@ -3349,6 +3607,11 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
           /* method3: 判定ノードの共通の基準値ではなく、経路上の各判定者が自分の基準値で検定して告発する。
            * ペア検定・従来の報告は使わない */
           if (net_params.judging_strategy == 3) {
+              if (hc_on && !fav_test) {   /* 測り方の確認: 記録の保持と判定ノードの時計の保持 (隠す手口なし) が同じか */
+                  struct jc_eval cev;
+                  double jl = m3_hc_judge_hold(network, payment, i + 1, nh, &cev);
+                  if (jl > 0.0 && cev.hidden_in + cev.hidden_out == 0.0) { m3_hc_cmp++; if (fabs(jl - settle_lat) < 0.5) m3_hc_same++; }
+              }
               int m3r = method3_observe(network, simulation, payment, net_params, i + 1, dn_node, settle_lat,
                                         fav_test, avg_iv, nh, legs_var);
               if (jc_rec >= 0 && cand == payment->grief_hold_node_id) {   /* 攻撃ごとの記録 (検証用) */
@@ -3459,8 +3722,15 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
 
       /* method3 の嘘のパターン (CLOTH_M3_FALSE_ACCUSE): 保持者が下流の隣を告発する。
        * この決済の正直な判定者の検定のあとに処理する (同じ決済で確定した嘘つきの告発を対策で捨てられるように) */
-      if (net_params.judging_strategy == 3 && get_m3_rcv_test())   /* 受取人の保持も検定する */
-          method3_receiver_test(network, simulation, payment, net_params, nh, avg_iv);
+      if (net_params.judging_strategy == 3 && get_m3_rcv_test()) {   /* 受取人の保持も検定する */
+          double lat_j = 0.0;
+          if (hc_on && m3_hc_watched_here(payment, nh, nh, payment->receiver)) {   /* 監視中の受取人は判定ノードの時計で測る */
+              struct jc_eval rev;
+              lat_j = m3_hc_judge_hold(network, payment, nh, nh, &rev);
+          }
+          if (!hc_on || lat_j > 0.0 || hc_fail == 0)   /* 印が合わない (受取人の記録を使えない) ときはしない */
+              method3_receiver_test(network, simulation, payment, net_params, nh, avg_iv, lat_j);
+      }
       if (net_params.judging_strategy == 3) method3_false_accuse(network, simulation, payment, net_params);
 
       /* エスクロー方式: 受け渡しごとのタイムアウト (判定ノードへのエスカレーション) を記録する。
@@ -3508,6 +3778,69 @@ void receive_success(struct event* event, struct simulation* simulation, struct 
                       n_hand_tor, n_to_h_tor, n_hand_slow, n_to_h_slow, n_mal_recv);
               fclose(sf);
           }
+      }
+}
+void method3_verify_event(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params) {
+  struct payment* payment = event->payment;
+  long saved = simulation->processed_payments;   /* warmup の旧判定は受け取った時点の数で */
+  simulation->processed_payments = payment->m3_proc_at;
+  hold_tests_on_success(payment, simulation, network, net_params);
+  simulation->processed_payments = saved;
+  m3_hc_deferred++;
+}
+
+void receive_success(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params){
+  if (get_escrow() || escrow_params()->hold_legs > 0) escrow_bind(network);
+  struct node* node;
+  struct payment* payment;
+  payment = event->payment;
+  node = array_get(network->nodes, event->node_id);
+  event->payment->end_time = simulation->current_time;
+  {
+    static int jc_printed = 0;
+    if (!jc_printed && (get_judge_copy() || get_false_report_smart())) {
+      jc_printed = 1;
+      printf("[JudgeCopy] 判定ノード経由=%d T=%.0fms 賢い嘘=%d 嘘のスイッチ=%ldms 側=%s\n",
+             get_judge_copy(), get_judge_copy_t_ms(), get_false_report_smart(), get_false_report_ms(),
+             get_false_report_side() == FALSE_REPORT_SIDE_RECV ? "recv" :
+             get_false_report_side() == FALSE_REPORT_SIDE_SEND ? "send" : "both");
+    }
+  }
+
+  add_attempt_history(payment, network, simulation->current_time, 1);
+
+  /* === Stage ④ Hypothesis Testing: Increment global payment counter === */
+  simulation->processed_payments++;
+
+  /* === hold round-trip 検出 (案A, CLOTH_HOLD_ROUNDTRIP)：隣接差分版 ===
+   * 各ノードの往復時間 RT[i] = recv[i] - send[i] は自ノードだけで観測可能。経路上の隣接
+   * ノードの差 Δ[i] = RT[i] - RT[i+1] は導出上「下流ノード(i+1)の決済転送遅延 settle_delay
+   * ＋1本の順方向ホップ」に等しい。よって resid = Δ[i] - 平均インターバル ≈ 下流ノード
+   * (i+1)の settle_delay を、観測可能な往復量だけから復元できる(希釈なし=(B)と同じ信号)。
+   * この resid を下流ノードの settle 検定にかけ、異常なノードを報告する(報告者=上流ノード、
+   * 同じ決済で同じノードは1回)。**既定 ON**。既定の相互証明 (CLOTH_REPORT_ATTEST=1) では
+   * 検定値を下の相互証明モードの hold[p]=recv[p-1]-send_back[p+1] に置き換える。 */
+  if (get_hold_roundtrip() && net_params.enable_reputation_system &&
+      payment->route != NULL && payment->hop_send_times != NULL &&
+      payment->hop_settle_recv_times != NULL) {
+      int nh = array_len(payment->route->route_hops);
+      /* 送信者(=このノード)の preimage 受信時刻を記録 */
+      for (int i = 0; i < nh && i < payment->hop_settle_recv_capacity; i++) {
+          struct route_hop* rh = (struct route_hop*)array_get(payment->route->route_hops, i);
+          if (rh != NULL && rh->from_node_id == node->id) {
+              payment->hop_settle_recv_times[i] = reported_time(node, payment, simulation->current_time, +1); break;
+          }
+      }
+      payment->num_attack_reporters = 0;   /* 試行ごとに初期化(dedup キー兼用) */
+      uint64_t hc_dly = 0;
+      if (net_params.judging_strategy == 3 && get_m3_hashchain() && get_m3_hc_verify_ms() > 0.0)
+          hc_dly = (uint64_t)(get_m3_hc_verify_ms() * (double)nh + 0.5);
+      if (hc_dly > 0) {   /* ハッシュチェーンの検証時間: 印を確かめ終えてから検定・告発する */
+          payment->m3_proc_at = (long)simulation->processed_payments;
+          struct event* ve = new_event(simulation->current_time + hc_dly, M3VERIFY, node->id, payment);
+          simulation->events = heap_insert(simulation->events, ve, compare_event);
+      } else {
+          hold_tests_on_success(payment, simulation, network, net_params);
       }
   }
 

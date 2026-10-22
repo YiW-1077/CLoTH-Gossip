@@ -32,6 +32,7 @@ set(NETWORK_SOURCES
 # HTLC & Payment Mechanics
 set(SIMULATION_SOURCES
     src/simulation/htlc.c
+    src/simulation/m3_hmac.c
 )
 
 # Data Structures & Utilities

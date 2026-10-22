@@ -23,6 +23,11 @@ struct payment* new_payment(long id, long sender, long receiver, uint64_t amount
   p->sender= sender;
   p->receiver = receiver;
   p->m3_rcv_arrive = 0;
+  p->m3_tags = NULL;
+  p->m3_true_recv = NULL;
+  p->m3_true_send = NULL;
+  p->m3_hc_cap = 0;
+  p->m3_proc_at = 0;
   p->amount = amount;
   p->start_time = start_time;
   p->route = NULL;

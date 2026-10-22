@@ -78,6 +78,13 @@ struct payment {
   uint64_t grief_hold_extra_ms;
   /* method3 の受取人の検定 (CLOTH_M3_RECEIVER_TEST) 用: 受取人がこの試行で HTLC を受け取った時刻 (0 = まだ) */
   uint64_t m3_rcv_arrive;
+  /* method3 のハッシュチェーン (CLOTH_M3_HASHCHAIN) 用: 位置ごとの印 (HMAC-SHA256 の 32 バイト × m3_hc_cap)、
+   * 判定ノードの時計で測るための本当の時刻 (位置ごとに preimage を受け取った時刻・上流へ渡した時刻)。m3_hc_cap = 位置の数 */
+  unsigned char* m3_tags;
+  uint64_t* m3_true_recv;
+  uint64_t* m3_true_send;
+  int m3_hc_cap;
+  long m3_proc_at;   /* 検定を遅らせるとき: 受け取った時点の processed_payments (warmup の旧判定用) */
 
   /* === Warm-up phase tracking === */
   unsigned int is_warmup;           // 1 if payment is part of the first 500 generated payments

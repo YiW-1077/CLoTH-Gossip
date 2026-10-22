@@ -35,6 +35,7 @@ void receive_payment(struct event* event, struct simulation* simulation, struct 
 void forward_success(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params);
 
 void receive_success(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params);
+void method3_verify_event(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params);
 
 void forward_fail(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params);
 

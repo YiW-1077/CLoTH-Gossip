@@ -20,6 +20,7 @@ enum event_type {
   CHANNELUPDATESUCCESS,
   UPDATEGROUP,
   CONSTRUCTGROUPS,
+  M3VERIFY,          /* method3 のハッシュチェーン: 送金者が印を確かめ終えて検定する (CLOTH_M3_HASHCHAIN_VERIFY_MS) */
 };
 
 struct event {
