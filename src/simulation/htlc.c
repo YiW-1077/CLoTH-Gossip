@@ -1063,6 +1063,30 @@ static int get_m3_rcv_test(void) {
   return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
 }
 static long m3_rcv_tests = 0, m3_rcv_anom = 0;
+/* 受取人の検定で見つかった異常は、すぐ罰せず割合で決める (CLOTH_M3_RCV_WATCH、既定 1。0 ですぐ告発する前の作り)。受取人のすぐ上流の中継 L について、
+ * warmup 後に中継した決済の数 r と、受取人の異常が出た決済の数 e を数え、(e + θm) / (r + m) が CLOTH_M3_RCV_WATCH_RATE
+ * (既定 0.3) 以上かつ e が CLOTH_M3_RCV_WATCH_MIN (既定 2) 以上になってから L を告発する。θ・m は申し立ての前もっての割合と重み。 */
+static int get_m3_rcv_watch(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_RCV_WATCH");
+  return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
+}
+static double get_m3_rcv_watch_rate(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_M3_RCV_WATCH_RATE");
+  v = 0.3; if (e != NULL && e[0] != '\0') { double t = atof(e); if (t > 0.0 && t <= 1.0) v = t; }
+  return v;
+}
+static long get_m3_rcv_watch_min(void) {
+  static long v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_RCV_WATCH_MIN");
+  v = 2; if (e != NULL && e[0] != '\0') { long t = atol(e); if (t >= 1) v = t; }
+  return v;
+}
+static long m3_rcv_held = 0;   /* 受取人の異常のうち、割合が低くて告発を見送った回数 */
 /* 受取人の記録を経路を通さずに送金者へ届ける (CLOTH_M3_RECEIVER_DIRECT=1、既定 0。method3 のときだけ)。
  * 受取人と送金者は請求書のやりとりで直接つながっているので、受取人の時刻はこの道で届き、途中の中継には書き換えられない。
  * 記録の書き換え (CLOTH_M3_TAMPER) が受取人の記録に及ばなくなるだけで、ほかの処理 (受取人の記録を信じる突き合わせ) はそのまま。 */
@@ -1100,6 +1124,48 @@ static long get_m3_tomo_min(void) {
   return v;
 }
 static long m3_tomo_acc = 0, m3_tomo_acc_h = 0;   /* 絞って告発した回数・そのうち正直なノード */   /* 受取人の記録が書き換えられずに届いた (書き換えの対象が受取人だった) 回数 */
+/* 申し立てを受け付ける条件 (CLOTH_M3_APPEAL_CONC=1、既定 0。割合で比べる 3 のときだけ)。確定してもすぐには申し立てず、
+ * 数える告発の記録が CLOTH_M3_APPEAL_CONC_MIN (既定 2) 件以上たまり、そのうち CLOTH_M3_APPEAL_CONC_FRAC (既定 0.8) 以上が
+ * 同じ上流の隣の決済だったときだけ、その隣を相手に申し立てる (濡れ衣は罪を被せた上流の隣の下に集中する)。
+ * 条件を満たさない間は確定したまま (罰は止めない)。 */
+static int get_m3_appeal_conc(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_APPEAL_CONC");
+  return (v = (get_m3_appeal() == 3 && e != NULL && e[0] != '\0' && strcmp(e, "0") != 0) ? 1 : 0);
+}
+static long get_m3_appeal_conc_min(void) {
+  static long v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_APPEAL_CONC_MIN");
+  v = 2; if (e != NULL && e[0] != '\0') { long t = atol(e); if (t >= 1) v = t; }
+  return v;
+}
+static double get_m3_appeal_conc_frac(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_M3_APPEAL_CONC_FRAC");
+  v = 0.8; if (e != NULL && e[0] != '\0') { double t = atof(e); if (t > 0.0 && t <= 1.0) v = t; }
+  return v;
+}
+/* 申し立ての相手を有罪にするのは、相手の割合が申し立てた側の CLOTH_M3_APPEAL_OPP_FACTOR 倍 (既定 2。1 で前の作り) を
+ * 超えたときだけにする (割合で比べる 3 のとき)。申し立てた側が負ける決め方は変えない。 */
+static double get_m3_appeal_opp_factor(void) {
+  static double v = -1.0;
+  if (v >= 0.0) return v;
+  const char* e = getenv("CLOTH_M3_APPEAL_OPP_FACTOR");
+  v = 2.0; if (e != NULL && e[0] != '\0') { double t = atof(e); if (t >= 1.0) v = t; }
+  return v;
+}
+/* 申し立てに勝った (冤罪と認められた) ノードが、あとで別の相手のせいでまた確定したら、もう 1 回だけ申し立てられる
+ * (CLOTH_M3_APPEAL_TWICE、既定 1。0 で 1 回だけの前の作り。割合で比べる 3 のとき)。負けたノードと相手として有罪になったノードは申し立てられない。 */
+static int get_m3_appeal_twice(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_APPEAL_TWICE");
+  return (v = (get_m3_appeal() == 3 && ((e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1)) ? 1 : 0);
+}
+static int m3_cmp_long(const void* a, const void* b) { long x = *(const long*)a, y = *(const long*)b; return (x > y) - (x < y); }
 static long get_m3_appeal_prior_weight(void) {
   static long v = -1;
   return (v >= 0) ? v : (v = get_m3_appeal_long("CLOTH_M3_APPEAL_PRIOR_WEIGHT", 5));
@@ -1144,9 +1210,11 @@ struct m3_target {            /* 対象ノードごとの告発の状態 (ゴシ
   long cl_e[8]; int n_cl;     /* 申し立てで閉じたチャンネル (辺の id) */
   long a_r, a_e;              /* 割合で比べる (3): 監視中に中継した決済の数・証拠の数 */
   long a_last_pid;            /* 2 つ以上先の異常を数えた最後の決済 (id+1)。同じ決済で 2 回数えない */
+  long rv_r, rv_e;            /* 受取人の検定の監視: 中継した決済・受取人の異常が出た決済 */
   long tm_r, tm_c, tm_last_pid, tm_acc_pid;   /* 絞り込み: 中継した決済・下流で異常が出た決済・最後に数えた決済・最後に告発した決済 (id+1) */
   long* by; int n_by, cap_by; /* 自分を相手に申し立てたノード */
   long* opps; int n_opps;     /* 申し立ての相手 (全部の上流のとき) */
+  int n_appeals;              /* 申し立てた回数 */
 };
 static struct m3_target* m3_t = NULL;
 static long m3_nn = 0;
@@ -1278,6 +1346,7 @@ static void m3_add_id(long** arr, int* n, int* cap, long v) {
 static void m3_appeal_start(struct network* network, struct simulation* simulation, long x, long u) {
   struct m3_target* t = &m3_t[x];
   t->ap = 1; t->ap_opp = u; t->ap_start = simulation->current_time;
+  t->n_appeals++;
   m3_t[u].named++;
   m3_add_id(&m3_t[u].by, &m3_t[u].n_by, &m3_t[u].cap_by, x);
   struct node* nx = (struct node*)array_get(network->nodes, x);
@@ -1312,7 +1381,32 @@ static int m3_sync(struct network* network, struct simulation* simulation, struc
   int want = (eff >= get_m3_accusers_required());
   if (get_m3_appeal()) {
     if (t->guilty) want = 1;
-    if (want && !t->confirmed && t->ap == 0) {   /* 確定する: 1 回だけ申し立てる (相手 = いま数える最後の告発の上流の隣) */
+    /* 2 回目の申し立てができる: 1 回目に勝っていて、まだ 2 回目を使っていない (CLOTH_M3_APPEAL_TWICE) */
+    int again = get_m3_appeal_twice() && t->ap == 2 && t->ap_won == 1 && !t->guilty && t->n_appeals < 2;
+    if (get_m3_appeal_conc() && !get_m3_appeal_all()) {
+      if (want && (t->ap == 0 || again) && !t->guilty) {   /* 告発の記録が同じ上流の隣の下に集中しているときだけ申し立てる */
+        long* us = malloc((size_t)(t->n_ev > 0 ? t->n_ev : 1) * sizeof(long)); long nc = 0;
+        for (long j = t->void_from; j < t->n_ev; j++) {
+          int cnt_ok = 0;
+          for (int k = 0; k < t->ev[j].n_acc; k++) if (t->ev[j].acc[k] != x && m3_counts(t->ev[j].acc[k])) { cnt_ok = 1; break; }
+          if (cnt_ok && t->ev[j].up >= 0) us[nc++] = t->ev[j].up;
+        }
+        long best = -1, bestc = 0;
+        if (nc > 0) {
+          qsort(us, (size_t)nc, sizeof(long), m3_cmp_long);
+          for (long i = 0, j; i < nc; i = j) {
+            for (j = i; j < nc && us[j] == us[i]; j++) ;
+            if (j - i > bestc) { bestc = j - i; best = us[i]; }
+          }
+        }
+        free(us);
+        if (nc >= get_m3_appeal_conc_min() && (double)bestc >= get_m3_appeal_conc_frac() * (double)nc &&
+            best >= 0 && best < m3_nn && best != x && !(again && best == t->ap_opp)) {
+          if (again) t->ap_won = 0;
+          m3_appeal_start(network, simulation, x, best);
+        }
+      }
+    } else if (want && !t->confirmed && t->ap == 0) {   /* 確定する: 1 回だけ申し立てる (相手 = いま数える最後の告発の上流の隣) */
       long opp = -1; struct m3_ev* eo = NULL;
       for (long j = t->n_ev - 1; j >= t->void_from && opp < 0; j--)
         for (int k = 0; k < t->ev[j].n_acc; k++)
@@ -1329,6 +1423,13 @@ static int m3_sync(struct network* network, struct simulation* simulation, struc
           }
         }
       } else if (opp >= 0 && opp < m3_nn && opp != x) m3_appeal_start(network, simulation, x, opp);
+    } else if (want && !t->confirmed && again) {
+      /* 申し立てに勝ったあと、別の相手のせいでまた確定した: 2 回目の申し立て (相手が前回と違うときだけ) */
+      long opp = -1;
+      for (long j = t->n_ev - 1; j >= t->void_from && opp < 0; j--)
+        for (int k = 0; k < t->ev[j].n_acc; k++)
+          if (t->ev[j].acc[k] != x && m3_counts(t->ev[j].acc[k])) { opp = t->ev[j].up; break; }
+      if (opp >= 0 && opp < m3_nn && opp != x && opp != t->ap_opp) { t->ap_won = 0; m3_appeal_start(network, simulation, x, opp); }
     }
     if (t->ap == 1) want = 0;   /* 監視中は罰を止める */
   }
@@ -1500,7 +1601,7 @@ static void m3_ratio_pair(struct network* network, struct simulation* simulation
   if (rx > ru && tx->a_e >= E) {          /* 申し立てた側の負け */
     m3_appeal_end(network, simulation, x, 0);
     m3_propagate(network, simulation, payment, net_params, x);
-  } else if (ru > rx && tu->a_e >= E) {   /* 相手の負け */
+  } else if (ru > rx * get_m3_appeal_opp_factor() && tu->a_e >= E) {   /* 相手の負け */
     m3_convict(network, simulation, payment, net_params, u);
   }
 }
@@ -1521,7 +1622,7 @@ static void m3_ratio_appeal(struct network* network, struct simulation* simulati
   if (rx > rb && tx->a_e >= E) {                       /* 申し立てた側の負け */
     m3_appeal_end(network, simulation, x, 0);
     m3_propagate(network, simulation, payment, net_params, x);
-  } else if (rb > rx && m3_t[ub].a_e >= E) {           /* 一番疑わしい相手の負け */
+  } else if (rb > rx * get_m3_appeal_opp_factor() && m3_t[ub].a_e >= E) {           /* 一番疑わしい相手の負け */
     m3_convict(network, simulation, payment, net_params, ub);
   }
 }
@@ -1619,6 +1720,16 @@ static void method3_receiver_test(struct network* network, struct simulation* si
   long up = -1;
   if (nh >= 2) { struct route_hop* r2 = (struct route_hop*)array_get(payment->route->route_hops, nh - 2); if (r2 != NULL) up = r2->from_node_id; }
   if (get_m3_appeal() == 3 && m3_watched(last)) m3_t[last].a_e++;   /* 監視中なら本人の証拠に */
+  if (get_m3_rcv_watch()) {   /* すぐ罰せず、受取人の異常が出た割合が高くなってから告発する */
+    double m = (double)get_m3_appeal_prior_weight(), th = get_m3_appeal_prior_rate();
+    t->rv_e++;
+    double rho = ((double)t->rv_e + th * m) / ((double)t->rv_r + m);
+    if (t->rv_e < get_m3_rcv_watch_min() || rho < get_m3_rcv_watch_rate()) {
+      m3_rcv_held++;
+      if (get_m3_appeal() == 3) m3_ratio_check(network, simulation, payment, net_params, last);
+      return;
+    }
+  }
   if (get_m3_distrust() == 2) {
     m3_accuse_v2(network, simulation, payment, net_params, t, ln, flg, nf, up);
   } else {
@@ -1707,6 +1818,8 @@ static int method3_observe(struct network* network, struct simulation* simulatio
     m3_t[target->id].a_r++;
     m3_ratio_check(network, simulation, payment, net_params, target->id);
   }
+  if (get_m3_rcv_watch() && !warm && target->id != payment->sender && target->id != payment->receiver)
+    t->rv_r++;   /* 受取人の検定の監視: 中継した決済を数える */
   if (get_m3_tomo() && !warm && target->id != payment->sender && target->id != payment->receiver)
     t->tm_r++;   /* 絞り込み: 中継した決済を数える */
   if (nf == 0) return 0;
@@ -1785,7 +1898,8 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
   if (get_m3_tomo()) printf("[method3] 絞り込み (しきい値 %.2f・最小 %ld) で告発 %ld 回 (うち正直なノード %ld 回)\n",
                            get_m3_tomo_threshold(), get_m3_tomo_min(), m3_tomo_acc, m3_tomo_acc_h);
   if (get_m3_rcv_direct()) printf("[method3] 受取人の記録を直接届けた: 書き換えが受取人の記録に及ばなかった回数 %ld\n", m3_rcv_direct_kept);
-  if (get_m3_rcv_test()) printf("[method3] 受取人の検定 %ld 回・異常 %ld 回 (受取人のすぐ上流の中継を告発)\n", m3_rcv_tests, m3_rcv_anom);
+  if (get_m3_rcv_test()) printf("[method3] 受取人の検定 %ld 回・異常 %ld 回 (受取人のすぐ上流の中継を告発%s %ld 回)\n", m3_rcv_tests, m3_rcv_anom,
+                               get_m3_rcv_watch() ? "・割合が低くて見送った" : "", m3_rcv_held);
   if (get_m3_tamper()) printf("[method3] 記録を書き換えた決済 %ld 件 (方式 %d・受取人に付け替え %ld 件・付け替え先までの平均ホップ %.2f)\n",
                              m3_tamper_count, get_m3_tamper(), m3_tamper_recv,
                              m3_tamper_count ? (double)m3_tamper_dist_sum / (double)m3_tamper_count : 0.0);

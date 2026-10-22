@@ -1685,7 +1685,7 @@ int main(int argc, char *argv[]) {
     } else if (net_params.judging_strategy == 3) {
       /* method3: 判定ノードを置かない。全ノードが検知の対象 (method2 の全ノード観測と同じ範囲) */
       set_all_nodes_observed(1);
-      printf("[Config] method3: 判定ノードなし・経路上の判定者が自分の基準値で検定・違う告発者 %s 人以上で確定・嘘の告発 (CLOTH_M3_FALSE_ACCUSE) %s・確定した告発者の告発を数えない (CLOTH_M3_DISTRUST_CONFIRMED) %s・記録の書き換え (CLOTH_M3_TAMPER) %s・申し立て (CLOTH_M3_APPEAL) %s・申し立ての相手を上流の全部に (CLOTH_M3_APPEAL_ALL_UPSTREAM) %s・証拠を下流の全部に (CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM) %s・受取人の検定 (CLOTH_M3_RECEIVER_TEST) %s・受取人の記録を直接届ける (CLOTH_M3_RECEIVER_DIRECT) %s・絞り込み (CLOTH_M3_TOMOGRAPHY) %s\n",
+      printf("[Config] method3: 判定ノードなし・経路上の判定者が自分の基準値で検定・違う告発者 %s 人以上で確定・嘘の告発 (CLOTH_M3_FALSE_ACCUSE) %s・確定した告発者の告発を数えない (CLOTH_M3_DISTRUST_CONFIRMED) %s・記録の書き換え (CLOTH_M3_TAMPER) %s・申し立て (CLOTH_M3_APPEAL) %s・申し立ての相手を上流の全部に (CLOTH_M3_APPEAL_ALL_UPSTREAM) %s・証拠を下流の全部に (CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM) %s・受取人の検定 (CLOTH_M3_RECEIVER_TEST) %s・受取人の記録を直接届ける (CLOTH_M3_RECEIVER_DIRECT) %s・絞り込み (CLOTH_M3_TOMOGRAPHY) %s・申し立ての受け付け条件 (CLOTH_M3_APPEAL_CONC) %s・受取人の異常はすぐ罰さない (CLOTH_M3_RCV_WATCH) %s・相手を有罪にする倍率 (CLOTH_M3_APPEAL_OPP_FACTOR) %s・2 回目の申し立て (CLOTH_M3_APPEAL_TWICE) %s\n",
              getenv("CLOTH_M3_ACCUSERS") ? getenv("CLOTH_M3_ACCUSERS") : "1",
              getenv("CLOTH_M3_FALSE_ACCUSE") ? getenv("CLOTH_M3_FALSE_ACCUSE") : "0",
              getenv("CLOTH_M3_DISTRUST_CONFIRMED") ? getenv("CLOTH_M3_DISTRUST_CONFIRMED") : "2",
@@ -1695,7 +1695,11 @@ int main(int argc, char *argv[]) {
              getenv("CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM") ? getenv("CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM") : "0",
              getenv("CLOTH_M3_RECEIVER_TEST") ? getenv("CLOTH_M3_RECEIVER_TEST") : "1",
              getenv("CLOTH_M3_RECEIVER_DIRECT") ? getenv("CLOTH_M3_RECEIVER_DIRECT") : "0",
-             getenv("CLOTH_M3_TOMOGRAPHY") ? getenv("CLOTH_M3_TOMOGRAPHY") : "0");
+             getenv("CLOTH_M3_TOMOGRAPHY") ? getenv("CLOTH_M3_TOMOGRAPHY") : "0",
+             getenv("CLOTH_M3_APPEAL_CONC") ? getenv("CLOTH_M3_APPEAL_CONC") : "0",
+             getenv("CLOTH_M3_RCV_WATCH") ? getenv("CLOTH_M3_RCV_WATCH") : "1",
+             getenv("CLOTH_M3_APPEAL_OPP_FACTOR") ? getenv("CLOTH_M3_APPEAL_OPP_FACTOR") : "2",
+             getenv("CLOTH_M3_APPEAL_TWICE") ? getenv("CLOTH_M3_APPEAL_TWICE") : "1");
     }
   }
 
