@@ -1260,6 +1260,12 @@ static struct node* m3_shadow(long observer, struct node* target) {
   m3_insert(key, sh);
   return sh;
 }
+/* 照らし合わせ用: 送金者がこれまで確かめた記録の全部のホップの保持をまとめて学ぶ状態 (対象ごとではない) */
+static struct node* m3_shadow_pool(long observer) {
+  struct node tmp; memset(&tmp, 0, sizeof tmp);
+  tmp.id = 0x3FFFFFFF;   /* どのノードの id とも重ならないキー (open_edges は NULL = 次数 0) */
+  return m3_shadow(observer, &tmp);
+}
 /* 受取人としての検定の状態 (中継としての状態とは別のキー) */
 static struct node* m3_shadow_rcv(long observer, struct node* target) {
   uint64_t key = (((uint64_t)observer + 1) << 32) | ((uint64_t)(target->id + 1) | 0x80000000ULL);
@@ -1896,6 +1902,57 @@ static void m3_hc_resolve(long v, uint64_t now) {
     m3_hc_mon[q->b]--;
   }
 }
+/* === 告発の照らし合わせ (CLOTH_M3_ACCUSE_CHECK、既定 1。0 で照らし合わせない。ハッシュチェーンを使うときだけ) ===
+ * 告発は「この送金で位置 q のノードの保持が異常だった」という主張なので、その送金の送金者が、印を確かめた記録で
+ * 位置 q の保持 (両隣の記録から: recv[q-1] − send[q+1]) を計算し直す。送金者がこれまで確かめた全部のホップの保持で学んだ
+ * まとめた基準値に対して z が CLOTH_M3_ACCUSE_CHECK_Z (既定 1.0) より小さい (はっきり正常) なら、告発は記録と食い違う。
+ * 1 = 食い違う告発は捨てる、2 = 捨てたうえで、告発した本人を送金者が告発し返す。正直な判定者の告発にも同じ決まりを当てる。
+ * 照らし合わせるのは正直な送金者だけ。印が合わない記録を使う告発と、判定ノードの測定の告発は照らし合わせない */
+static int get_m3_xcheck(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_ACCUSE_CHECK");
+  v = 1; if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 0 && t <= 2) v = t; }
+  return v;
+}
+static double get_m3_xcheck_z(void) {
+  static double v = -1e9;
+  if (v > -1e8) return v;
+  const char* e = getenv("CLOTH_M3_ACCUSE_CHECK_Z");
+  v = 1.0; if (e != NULL && e[0] != '\0') v = atof(e);
+  return v;
+}
+static int m3_xc_on = 0, m3_xc_fail = 0;   /* この送金で照らし合わせるか・印が合わない位置 */
+static long m3_xc_checked = 0, m3_xc_ref_obs = 0, m3_xc_ref_obs_mal = 0, m3_xc_ref_false = 0, m3_xc_counter = 0;
+static long m3_xc_skip_fail = 0, m3_xc_skip_sender = 0, m3_xc_skip_rec = 0;   /* 照らし合わせられなかった: 印が合わない・送金者が悪意・記録がない */
+static int m3_xc_refutes(struct network* network, struct payment* pm, int q, int nh, double avg_iv) {
+  if (!m3_xc_on || q < 1 || q > nh) return 0;
+  if (m3_xc_fail > 0 && (q == nh ? q : q + 1) >= m3_xc_fail) { m3_xc_skip_fail++; return 0; }   /* 印が合わない記録は使えない */
+  struct node* sn = (struct node*)array_get(network->nodes, pm->sender);
+  if (sn == NULL || sn->is_malicious) { m3_xc_skip_sender++; return 0; }   /* 照らし合わせるのは正直な送金者だけ */
+  if (pm->hop_settle_send_times == NULL || nh > pm->hop_settle_recv_capacity) { m3_xc_skip_rec++; return 0; }
+  /* 中継は両隣の記録から (recv[q-1] − send[q+1])、受取人は本人の記録から (preimage を返した時刻 − HTLC が届いた時刻) */
+  uint64_t ru = (q < nh) ? pm->hop_settle_recv_times[q - 1] : pm->hop_settle_send_times[nh];
+  uint64_t sb = (q < nh) ? pm->hop_settle_send_times[q + 1] : pm->m3_rcv_arrive;
+  if (ru == 0 || sb == 0) { m3_xc_skip_rec++; return 0; }
+  m3_xc_checked++;
+  if (ru <= sb) return 1;   /* 記録の上では保持がない */
+  hold_set_sample_var(0.0);
+  on_hold_hypothesis_test_nolearn(m3_shadow_pool(pm->sender), (double)(ru - sb), 0, avg_iv, nh);
+  return hold_last_z() < get_m3_xcheck_z();
+}
+/* 記録と食い違う告発をしたノード acc を、送金者が告発し返す */
+static void m3_xc_counter_accuse(struct network* network, struct simulation* simulation, struct payment* pm,
+                                 struct network_params net_params, long acc, int nh) {
+  struct node* an = (struct node*)array_get(network->nodes, acc);
+  struct m3_target* at = m3_target_of(network, acc);
+  if (an == NULL || at == NULL || acc == pm->sender) return;
+  long up = -1;
+  for (int p = 1; p <= nh; p++) if (m3_hc_node_at(pm, p, nh) == acc) { up = m3_hc_node_at(pm, p - 1, nh); break; }
+  long s = pm->sender;
+  m3_accuse_v2(network, simulation, pm, net_params, at, an, &s, 1, up);
+  m3_xc_counter++;
+}
 /* 判定ノードの時計で測った位置 q の保持 (本人の写しの時刻 − 本人の受領書の時刻)。判定ノードまでの遅れ 0 では本当の時刻になり、
  * ずれるのは本人の手口の分だけ: その決済の保持者 (悪意) は受領書を遅らせて min(足した遅れ, T)、残りを写しを先に送って
  * min(残り, T) 隠す (判定ノードが受け渡しを代わりにする前に)。戻り値 <= 0 は測れない */
@@ -1983,6 +2040,11 @@ static void method3_false_accuse(struct network* network, struct simulation* sim
     struct m3_target* t = m3_target_of(network, prev->id);
     if (t == NULL) return;
     t->false_accusations++;
+    if (m3_xc_refutes(network, payment, a + 1, nh, (double)net_params.average_payment_forward_interval)) {   /* 照らし合わせ: 記録と食い違う */
+      m3_xc_ref_false++;
+      if (get_m3_xcheck() == 2) m3_xc_counter_accuse(network, simulation, payment, net_params, att->id, nh);
+      return;
+    }
     int lv = get_m3_distrust();
     if (lv == 2) {
       long a1 = att->id;
@@ -2053,6 +2115,12 @@ static int method3_observe(struct network* network, struct simulation* simulatio
   if (get_m3_tomo() && !warm && target->id != payment->sender && target->id != payment->receiver)
     t->tm_r++;   /* 絞り込み: 中継した決済を数える */
   if (nf == 0) return 0;
+  if (!warm && target->id != m3_hc_judge_target && m3_xc_refutes(network, payment, q, nh, avg_iv)) {   /* 照らし合わせ: 記録と食い違う告発は捨てる */
+    m3_xc_ref_obs += nf;
+    if (target->is_malicious) m3_xc_ref_obs_mal += nf;
+    if (get_m3_xcheck() == 2) for (int k = 0; k < nf; k++) m3_xc_counter_accuse(network, simulation, payment, net_params, flg[k], nh);
+    return 0;
+  }
   t->anomalies++; target->settle_anomaly_count++;
   int lv = get_m3_distrust();
   if (target->id == payment->sender || target->id == payment->receiver) {
@@ -2169,6 +2237,10 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
     }
     printf("[method3] ハッシュチェーンの検証時間 %.1f ms/ホップ・遅らせて検定した決済 %ld 件・犯人の扱い %d (また書き換えた犯人を送金者が告発 %ld 回)\n",
            get_m3_hc_verify_ms(), m3_hc_deferred, get_m3_hc_culprit(), m3_hc_reaccuse);
+    if (get_m3_xcheck())
+      printf("[method3] 告発の照らし合わせ (方式 %d・z < %.2f で食い違い): 照らし合わせた告発 %ld 件・捨てた判定者の告発 %ld 件 (対象が悪意 %ld)・捨てた嘘の告発 %ld 件・告発し返した %ld 回・照らし合わせられなかった (印が合わない %ld・送金者が悪意 %ld・記録がない %ld)\n",
+             get_m3_xcheck(), get_m3_xcheck_z(), m3_xc_checked, m3_xc_ref_obs, m3_xc_ref_obs_mal, m3_xc_ref_false, m3_xc_counter,
+             m3_xc_skip_fail, m3_xc_skip_sender, m3_xc_skip_rec);
     printf("[method3] 判定ノードごとの測った回数:");
     for (int k = 0; k < get_m3_hc_judges(); k++) printf(" %ld", m3_hc_load != NULL ? m3_hc_load[k] : 0L);
     printf("\n");
@@ -3427,6 +3499,8 @@ static void hold_tests_on_success(struct payment* payment, struct simulation* si
           m3_hc_init(network);
           hc_fail = m3_hc_verify(payment, nh);
           m3_hc_checked++;
+          m3_xc_on = (get_m3_xcheck() > 0);
+          m3_xc_fail = hc_fail;
           if (hc_fail > 0) {
               m3_hc_fail++;
               if (hc_fail >= 2 && m3_hc_node_at(payment, hc_fail - 1, nh) == payment->grief_hold_node_id) m3_hc_fail_match++;
@@ -3661,6 +3735,11 @@ static void hold_tests_on_success(struct payment* payment, struct simulation* si
           /* method3: 判定ノードの共通の基準値ではなく、経路上の各判定者が自分の基準値で検定して告発する。
            * ペア検定・従来の報告は使わない */
           if (net_params.judging_strategy == 3) {
+              if (m3_xc_on && !fav_test) {   /* 照らし合わせのまとめた基準値を学ぶ (送金者が確かめた記録の全部のホップ) */
+                  hold_set_sample_var(0.0);
+                  (void)on_hold_hypothesis_test(m3_shadow_pool(payment->sender), settle_lat,
+                                                detector_in_warmup(payment, (long)simulation->processed_payments), avg_iv, nh);
+              }
               if (hc_on && !fav_test) {   /* 測り方の確認: 記録の保持と判定ノードの時計の保持 (隠す手口なし) が同じか */
                   struct jc_eval cev;
                   double jl = m3_hc_judge_hold(network, payment, i + 1, nh, &cev);
@@ -3786,6 +3865,7 @@ static void hold_tests_on_success(struct payment* payment, struct simulation* si
               method3_receiver_test(network, simulation, payment, net_params, nh, avg_iv, lat_j);
       }
       if (net_params.judging_strategy == 3) method3_false_accuse(network, simulation, payment, net_params);
+      m3_xc_on = 0; m3_xc_fail = 0;
 
       /* エスクロー方式: 受け渡しごとのタイムアウト (判定ノードへのエスカレーション) を記録する。
        * 受け手 = hop k の from (中継), 送り手 = hop k の to。送金者が受け手の k=0 は除く。
