@@ -1365,6 +1365,7 @@ static void m3_appeal_start(struct network* network, struct simulation* simulati
 /* 対策 2: 対象 x の確定と報告を「いま数える告発」だけで決め直す。確定が変わったら 1 を返す。
  * 確定する = 数える告発者が k 人以上。報告する決済 = 確定していて、数える告発者が 1 人以上いる決済。
  * 報告が要らなくなった決済は取り消して評判を戻し (revoke_reports_from_judges)、また要るようになった決済は報告し直す。 */
+static int m3_hc_no_appeal(long x);   /* ハッシュチェーン: 判定ノードの測定で決まった犯人は申し立てられない (CLOTH_M3_HASHCHAIN_CULPRIT=3) */
 static int m3_sync(struct network* network, struct simulation* simulation, struct payment* payment,
                    struct network_params net_params, long x) {
   struct m3_target* t = &m3_t[x];
@@ -1385,8 +1386,9 @@ static int m3_sync(struct network* network, struct simulation* simulation, struc
     if (t->guilty) want = 1;
     /* 2 回目の申し立てができる: 1 回目に勝っていて、まだ 2 回目を使っていない (CLOTH_M3_APPEAL_TWICE) */
     int again = get_m3_appeal_twice() && t->ap == 2 && t->ap_won == 1 && !t->guilty && t->n_appeals < 2;
+    int no_ap = m3_hc_no_appeal(x);
     if (get_m3_appeal_conc() && !get_m3_appeal_all()) {
-      if (want && (t->ap == 0 || again) && !t->guilty) {   /* 告発の記録が同じ上流の隣の下に集中しているときだけ申し立てる */
+      if (want && (t->ap == 0 || again) && !t->guilty && !no_ap) {   /* 告発の記録が同じ上流の隣の下に集中しているときだけ申し立てる */
         long* us = malloc((size_t)(t->n_ev > 0 ? t->n_ev : 1) * sizeof(long)); long nc = 0;
         for (long j = t->void_from; j < t->n_ev; j++) {
           int cnt_ok = 0;
@@ -1408,7 +1410,7 @@ static int m3_sync(struct network* network, struct simulation* simulation, struc
           m3_appeal_start(network, simulation, x, best);
         }
       }
-    } else if (want && !t->confirmed && t->ap == 0) {   /* 確定する: 1 回だけ申し立てる (相手 = いま数える最後の告発の上流の隣) */
+    } else if (want && !t->confirmed && t->ap == 0 && !no_ap) {   /* 確定する: 1 回だけ申し立てる (相手 = いま数える最後の告発の上流の隣) */
       long opp = -1; struct m3_ev* eo = NULL;
       for (long j = t->n_ev - 1; j >= t->void_from && opp < 0; j--)
         for (int k = 0; k < t->ev[j].n_acc; k++)
@@ -1425,7 +1427,7 @@ static int m3_sync(struct network* network, struct simulation* simulation, struc
           }
         }
       } else if (opp >= 0 && opp < m3_nn && opp != x) m3_appeal_start(network, simulation, x, opp);
-    } else if (want && !t->confirmed && again) {
+    } else if (want && !t->confirmed && again && !no_ap) {
       /* 申し立てに勝ったあと、別の相手のせいでまた確定した: 2 回目の申し立て (相手が前回と違うときだけ) */
       long opp = -1;
       for (long j = t->n_ev - 1; j >= t->void_from && opp < 0; j--)
@@ -1749,8 +1751,33 @@ static void m3_hc_init(struct network* network) {
   m3_hc_since = calloc((size_t)m3_hc_nn, sizeof(uint64_t));
   m3_hc_load = calloc((size_t)get_m3_hc_judges(), sizeof(long));
 }
+/* 監視で犯人と決まったノードの扱い (CLOTH_M3_HASHCHAIN_CULPRIT): 0 = 監視を続ける (10/22 夕方の既定)、
+ * 1 = 罰を受けている (確定している) 間は監視しない (申し立て中などで罰が止まると監視に戻る)、2 = もう監視しない
+ * (申し立てで罰が止まったまま証拠がたまらず、罰を受けなくなる)、3 = 申し立てられず監視もしない (既定) */
+static long m3_hc_judge_target = -1;   /* いま判定ノードの測定で検定しているノード */
+static int get_m3_hc_culprit(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_HASHCHAIN_CULPRIT");
+  v = 3; if (e != NULL && e[0] != '\0') { int t = atoi(e); if (t >= 0 && t <= 3) v = t; }
+  return v;
+}
+/* 3 = 判定ノードの測定で決まった犯人は申し立てられず (申し立て中なら負け)、監視もしない。
+ * 判定ノードの時計で測った保持は本人のものなので、冤罪の申し立ても、異常を上流の隣の証拠に付け替える処理も要らない。
+ * 犯人がまた書き換えて印が合わなくなったら、正直な送金者が犯人を告発する (m3_hc_flag。報告が重ならないと評判が下がらないため) */
+static int m3_hc_no_appeal(long x) {
+  if (!get_m3_hashchain() || get_m3_hc_culprit() != 3 || m3_hc_culp == NULL || x < 0 || x >= m3_hc_nn) return 0;
+  return m3_hc_culp[x] || x == m3_hc_judge_target;
+}
+static int m3_hc_culp_watched(long v) {
+  if (!m3_hc_culp[v]) return 0;
+  int mode = get_m3_hc_culprit();
+  if (mode == 0) return 1;
+  if (mode >= 2) return 0;
+  return !(m3_t != NULL && v < m3_nn && m3_t[v].confirmed);
+}
 static int m3_hc_monitored(long v) {
-  return m3_hc_mon != NULL && v >= 0 && v < m3_hc_nn && (m3_hc_mon[v] > 0 || m3_hc_culp[v]);
+  return m3_hc_mon != NULL && v >= 0 && v < m3_hc_nn && (m3_hc_mon[v] > 0 || m3_hc_culp_watched(v));
 }
 /* 位置 q の受け渡しを判定ノードが見ていたか: 監視中で、本人が受け取ったのが監視を始めたあと */
 static int m3_hc_watched_here(struct payment* pm, int q, int nh, long v) {
@@ -1817,12 +1844,30 @@ static int m3_hc_verify(struct payment* pm, int nh) {
   return j;
 }
 /* 印が位置 j で合わなかった: ペア (j-1, j) を判定ノードに知らせる。すでに監視で犯人と決まったノードを含むなら説明済み */
-static void m3_hc_flag(struct network* network, struct simulation* simulation, struct payment* pm, int j, int nh) {
+static long m3_hc_reaccuse = 0;   /* 犯人がまた書き換え、送金者が告発した回数 (CLOTH_M3_HASHCHAIN_CULPRIT=3) */
+static void m3_hc_flag(struct network* network, struct simulation* simulation, struct payment* pm,
+                       struct network_params net_params, int j, int nh) {
   m3_hc_init(network);
   long b = m3_hc_node_at(pm, j, nh);
   long a = (j - 1 >= 1) ? m3_hc_node_at(pm, j - 1, nh) : -1;   /* j-1 が送金者なら j だけ */
   if (b < 0 || b >= m3_hc_nn || a >= m3_hc_nn) return;
-  if ((a >= 0 && m3_hc_culp[a]) || m3_hc_culp[b]) { m3_hc_fail_explained++; return; }
+  if ((a >= 0 && m3_hc_culp[a]) || m3_hc_culp[b]) {
+    m3_hc_fail_explained++;
+    if (get_m3_hc_culprit() == 3) {   /* 犯人がまた書き換えた: 判定ノードを使わず、送金者が犯人を告発する (正直な送金者だけ) */
+      long cv = (a >= 0 && m3_hc_culp[a]) ? a : b;
+      int pc = (cv == a) ? j - 1 : j;
+      struct node* sn = (struct node*)array_get(network->nodes, pm->sender);
+      struct node* cn = (struct node*)array_get(network->nodes, cv);
+      struct m3_target* ct = m3_target_of(network, cv);
+      if (sn != NULL && !sn->is_malicious && cn != NULL && ct != NULL) {
+        long acc = pm->sender;
+        long up = (pc >= 1) ? m3_hc_node_at(pm, pc - 1, nh) : -1;
+        m3_accuse_v2(network, simulation, pm, net_params, ct, cn, &acc, 1, up);
+        m3_hc_reaccuse++;
+      }
+    }
+    return;
+  }
   for (long k = 0; k < m3_hc_np; k++) {
     struct m3_hc_pair* q = &m3_hc_pairs[k];
     if (!q->resolved && q->a == a && q->b == b) { q->fails++; return; }
@@ -2018,7 +2063,7 @@ static int method3_observe(struct network* network, struct simulation* simulatio
   if (get_m3_tomo() && !warm) method3_tomo(network, simulation, payment, net_params, q, target, flg, nf);
   if (lv == 2) {
     if (get_m3_appeal() == 3) {
-      if (m3_ratio_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
+      if (!m3_hc_no_appeal(target->id) && m3_ratio_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
     } else if (get_m3_appeal() && m3_appeal_evidence(network, simulation, payment, net_params, q, target, flg, nf)) return 0;
     long up = -1;
     if (q >= 1) {
@@ -2122,7 +2167,8 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
       }
       fclose(g);
     }
-    printf("[method3] ハッシュチェーンの検証時間 %.1f ms/ホップ・遅らせて検定した決済 %ld 件\n", get_m3_hc_verify_ms(), m3_hc_deferred);
+    printf("[method3] ハッシュチェーンの検証時間 %.1f ms/ホップ・遅らせて検定した決済 %ld 件・犯人の扱い %d (また書き換えた犯人を送金者が告発 %ld 回)\n",
+           get_m3_hc_verify_ms(), m3_hc_deferred, get_m3_hc_culprit(), m3_hc_reaccuse);
     printf("[method3] 判定ノードごとの測った回数:");
     for (int k = 0; k < get_m3_hc_judges(); k++) printf(" %ld", m3_hc_load != NULL ? m3_hc_load[k] : 0L);
     printf("\n");
@@ -3384,7 +3430,7 @@ static void hold_tests_on_success(struct payment* payment, struct simulation* si
           if (hc_fail > 0) {
               m3_hc_fail++;
               if (hc_fail >= 2 && m3_hc_node_at(payment, hc_fail - 1, nh) == payment->grief_hold_node_id) m3_hc_fail_match++;
-              m3_hc_flag(network, simulation, payment, hc_fail, nh);
+              m3_hc_flag(network, simulation, payment, net_params, hc_fail, nh);
           }
       }
       for (int i = 0; i + 1 < nh; i++) {
@@ -3399,8 +3445,16 @@ static void hold_tests_on_success(struct payment* payment, struct simulation* si
                   struct m3_target* tq = m3_target_of(network, vq);
                   if (lat > 0.0 && qn != NULL && tq != NULL) {
                       long an0 = tq->anomalies;
+                      m3_hc_judge_target = vq;
                       int m3r = method3_observe(network, simulation, payment, net_params, q, qn, lat, 1, avg_iv, nh, 0.0);
-                      if (tq->anomalies > an0) m3_hc_resolve(vq, simulation->current_time);
+                      m3_hc_judge_target = -1;
+                      if (tq->anomalies > an0) {
+                          m3_hc_resolve(vq, simulation->current_time);
+                          if (get_m3_hc_culprit() == 3 && tq->ap == 1) {   /* 申し立て中の犯人: 負けで終わらせて罰を戻す */
+                              m3_appeal_end(network, simulation, vq, 0);
+                              m3_propagate(network, simulation, payment, net_params, vq);
+                          }
+                      }
                       m3_hc_meas++; m3_hc_load[m3_hc_jof[vq]]++;
                       if (vq == payment->grief_hold_node_id && payment->grief_hold_extra_ms > 0) {
                           m3_hc_meas_att++; m3_hc_hidden += hev.hidden_in + hev.hidden_out; m3_hc_extra += (double)payment->grief_hold_extra_ms;
