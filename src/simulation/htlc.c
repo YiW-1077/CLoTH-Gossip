@@ -1737,6 +1737,17 @@ static double get_m3_hc_verify_ms(void) {
   v = 0.0; if (e != NULL && e[0] != '\0') { double t = atof(e); if (t > 0.0) v = t; }
   return v;
 }
+/* 印に鍵を使うか (CLOTH_M3_HASHCHAIN_KEYED、既定 1)。0 = 鍵なし (対照用): 印は SHA-256 (記録と下流の印) で、だれでも計算できる。
+ * 記録を書き換えた攻撃者は、書き換えた位置の印を下流から順に作り直すので、送金者が確かめても全部合う。
+ * 対照 (10/26、金額 100・p 0.001・3 シード、n=12800、防御なしに対する遅延の変化): 書き換え すぐ隣 −79.8% → −37.9%、
+ * 下流のどこか −79.8% → −43.8%、罰を受けた正直 0 → 408 / 318。書き換えのない条件は鍵つきと出力が同じ */
+static int get_m3_hc_keyed(void) {
+  static int v = -1;
+  if (v >= 0) return v;
+  const char* e = getenv("CLOTH_M3_HASHCHAIN_KEYED");
+  return (v = (e != NULL && e[0] != '\0') ? (strcmp(e, "0") != 0) : 1);
+}
+static long m3_hc_forged = 0;   /* 鍵なしで攻撃者が作り直した印の数 */
 static long m3_hc_deferred = 0;   /* 遅らせて検定した決済 */
 static long m3_hc_tag_n = 0, m3_hc_ver_n = 0;            /* 付けた印・確かめた印の数 */
 static double m3_hc_tag_ns = 0.0, m3_hc_ver_ns = 0.0;    /* そのためにかかった時間 (実際の計算) */
@@ -1825,7 +1836,8 @@ static void m3_hc_mac(const struct payment* pm, int pos, int nh, long node_id, u
   m3_hc_put(msg, &n, pm->hop_settle_send_times[pos], 8);
   m3_hc_put(msg, &n, (pos == nh) ? pm->m3_rcv_arrive : 0, 8);
   memcpy(msg + n, (pos < nh) ? pm->m3_tags + 32 * (pos + 1) : zero, 32); n += 32;
-  m3_hmac_sha256(key, 32, msg, n, out);
+  if (get_m3_hc_keyed()) m3_hmac_sha256(key, 32, msg, n, out);
+  else m3_sha256(msg, n, out);
 }
 /* 位置 pos のノードが自分の記録に印を付ける (自分の記録を書いたあと・下流の印が届いたあと) */
 static void m3_hc_sign(struct payment* pm, int pos, long node_id) {
@@ -2330,9 +2342,11 @@ void method3_write_outputs(struct network* network, char output_dir_name[]) {
       if (nc != NULL && nc->is_malicious) np_mal++; else np_hon++;
     }
     for (long v = 0; v < m3_hc_nn; v++) if (m3_hc_monitored(v)) mon_now++;
-    printf("[method3] ハッシュチェーン: 印 %ld 個 (1 個 %.2f µs)・確かめた印 %ld 個 (1 個 %.2f µs)・確かめた決済 %ld 件・印が合わない決済 %ld 件 (書き換えた保持者のすぐ下流で合わない %ld 件・犯人が決まっていて説明済み %ld 件)\n",
+    printf("[method3] ハッシュチェーン (%s): 印 %ld 個 (1 個 %.2f µs)・確かめた印 %ld 個 (1 個 %.2f µs)・確かめた決済 %ld 件・印が合わない決済 %ld 件 (書き換えた保持者のすぐ下流で合わない %ld 件・犯人が決まっていて説明済み %ld 件)・攻撃者が作り直した印 %ld 個\n",
+           get_m3_hc_keyed() ? "鍵つき" : "鍵なし",
            m3_hc_tag_n, m3_hc_tag_n ? m3_hc_tag_ns / 1e3 / (double)m3_hc_tag_n : 0.0,
-           m3_hc_ver_n, m3_hc_ver_n ? m3_hc_ver_ns / 1e3 / (double)m3_hc_ver_n : 0.0, m3_hc_checked, m3_hc_fail, m3_hc_fail_match, m3_hc_fail_explained);
+           m3_hc_ver_n, m3_hc_ver_n ? m3_hc_ver_ns / 1e3 / (double)m3_hc_ver_n : 0.0, m3_hc_checked, m3_hc_fail, m3_hc_fail_match, m3_hc_fail_explained,
+           m3_hc_forged);
     printf("[method3] ハッシュチェーンの監視 (判定ノード %d 個・T %.0f ms): ペア %ld 組 (悪意を含む %ld 組)・犯人が決まった %ld 組 (悪意 %ld・正直 %ld)・終わった時点で監視中のノード %ld・判定ノードで測った回数 %ld (攻撃した決済 %ld 回、足した遅れ %.0f ms のうち隠した %.0f ms)・記録と判定ノードの保持が同じ検定 %ld / %ld\n",
            get_m3_hc_judges(), get_judge_copy_t_ms(), m3_hc_np, np_mal_any, np_res, np_mal, np_hon, mon_now, m3_hc_meas, m3_hc_meas_att, m3_hc_extra, m3_hc_hidden, m3_hc_same, m3_hc_cmp);
     char fp2[512];
@@ -3512,6 +3526,15 @@ void forward_success(struct event* event, struct simulation* simulation, struct 
             else payment->hop_settle_send_times[tgt] += X;   /* 付け替え先 (tgt == nh は受取人) */
             for (int k = hi + 1; k < tgt; k++) { payment->hop_settle_recv_times[k] += X; payment->hop_settle_send_times[k] += X; }
             payment->hop_settle_recv_times[hi] += X;
+            /* 鍵なしのハッシュチェーン: 書き換えた位置 (付け替え先からすぐ下流まで) の印を下流から順に作り直す。
+             * 自分の印はこのあと作り直した印の上に付ける */
+            if (get_m3_hashchain() && !get_m3_hc_keyed() && payment->m3_tags != NULL &&
+                nh_r < payment->m3_hc_cap && nh_r <= payment->hop_settle_recv_capacity) {
+              for (int k = tgt; k > hi; k--) {
+                m3_hc_mac(payment, k, nh_r, m3_hc_node_at(payment, k, nh_r), payment->m3_tags + 32 * k);
+                m3_hc_forged++;
+              }
+            }
             m3_tamper_count++;
             m3_tamper_dist_sum += tgt - hi;
             if (tgt == nh_r) m3_tamper_recv++;
