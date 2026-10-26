@@ -51,6 +51,9 @@ void judge_copy_write_outputs(char output_dir_name[]);
 // method3 (判定ノードなし) の告発の記録を書く (method3 のときだけ)
 void method3_write_outputs(struct network* network, char output_dir_name[]);
 
+// 悪意ノードもふつうに送金するか (CLOTH_MAL_SENDER_SEND、既定 0 = 悪意の送金者の送金は線に乗せずにすぐ失敗させる)
+int get_mal_sender_send(void);
+
 // return `struct element* group_add_queue`
 struct element* request_group_update(struct event* event, struct simulation* simulation, struct network* network, struct network_params net_params, struct element* group_add_queue);
 

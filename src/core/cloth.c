@@ -208,7 +208,10 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
     if (payment == NULL || payment->id == -1 || payment->is_warmup) continue;
 
     n_payments++;
-    if (payment_sender_is_malicious(network, payment)) n_malicious_sender++;
+    if (payment_sender_is_malicious(network, payment)) {
+      n_malicious_sender++;
+      if (get_mal_sender_send()) continue;   /* 悪意の送金者もふつうに送金する: 正直な利用者の送金だけを数える */
+    }
 
     if (payment->is_success) {
       n_successful++;
@@ -229,7 +232,8 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
    * (送信時即失敗) なので分子は不変。 */
   long n_effective = n_payments - n_malicious_sender;
   double success_rate = (n_effective > 0) ? ((double)n_successful / (double)n_effective) : 0.0;
-  double avg_delay = (n_payments > 0) ? ((double)total_delay / (double)n_payments) : 0.0;
+  long n_delay_den = get_mal_sender_send() ? n_effective : n_payments;   /* 平均の分母 (悪意の送金者の送金を外したときはその分も外す) */
+  double avg_delay = (n_delay_den > 0) ? ((double)total_delay / (double)n_delay_den) : 0.0;
 
   // Write metrics to CSV
   strcpy(output_filename, output_dir_name);
@@ -254,7 +258,7 @@ void write_baseline_metrics(struct network* network, struct array* payments, str
           net_params.malicious_failure_probability,
           total_attacks,
           total_attack_delay,
-          (n_payments > 0) ? ((double)total_attack_delay / (double)n_payments) : 0.0,
+          (n_delay_den > 0) ? ((double)total_attack_delay / (double)n_delay_den) : 0.0,
           payments_with_attack_delay,
           total_attack_delay_events,
           total_malicious_nodes,
@@ -524,7 +528,10 @@ void write_all_summary_outputs(struct network* network, struct array* payments,
         struct payment* payment = (struct payment*)array_get(payments, i);
         if (payment != NULL && !payment->is_warmup) {
           total_payments++;
-          if (payment_sender_is_malicious(network, payment)) malicious_sender_payments++;
+          if (payment_sender_is_malicious(network, payment)) {
+            malicious_sender_payments++;
+            if (get_mal_sender_send()) continue;   /* 悪意の送金者もふつうに送金する: 正直な利用者の送金だけを数える */
+          }
           if (payment->is_success) {
             successful_payments++;
           }
@@ -782,7 +789,10 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
     struct payment* pmt = (struct payment*)array_get(payments, i);
     if (pmt == NULL || pmt->id == -1 || pmt->is_warmup) continue;
     total_payments++;
-    if (payment_sender_is_malicious(network, pmt)) malicious_sender_payments++;
+    if (payment_sender_is_malicious(network, pmt)) {
+      malicious_sender_payments++;
+      if (get_mal_sender_send()) continue;   /* 悪意の送金者もふつうに送金する: 正直な利用者の送金だけを数える */
+    }
     if (pmt->is_success) successful_payments++;
     if (pmt->prt_abort_triggered) aborted_payments++;
     if (pmt->reconstruction_count > 5) high_recon_count++;
@@ -812,6 +822,9 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
     }
   }
   
+  /* 平均の分母 (悪意の送金者の送金を外したときはその分も外す) */
+  int avg_den = get_mal_sender_send() ? total_payments - malicious_sender_payments : total_payments;
+
   // Header
   fprintf(csv_stage4, "metric,value\n");
   fprintf(csv_stage4, "total_payments,%d\n", total_payments);
@@ -825,13 +838,13 @@ void write_stage4_comparison_csv(struct array* payments, struct network* network
   fprintf(csv_stage4, "prt_aborted_payments,%d\n", aborted_payments);
   fprintf(csv_stage4, "high_recon_count_payments,%d\n", high_recon_count);
   fprintf(csv_stage4, "avg_payment_delay_ms,%.2f\n", 
-          (double)total_delay / total_payments);
+          (double)total_delay / avg_den);
   fprintf(csv_stage4, "avg_attempts_per_payment,%.2f\n", 
-          (double)total_attempts / total_payments);
+          (double)total_attempts / avg_den);
   fprintf(csv_stage4, "attack_delay_total_ms,%llu\n",
           (unsigned long long)total_attack_delay);
   fprintf(csv_stage4, "attack_delay_avg_ms_per_payment,%.2f\n",
-          (double)total_attack_delay / total_payments);
+          (double)total_attack_delay / avg_den);
   fprintf(csv_stage4, "payments_with_attack_delay,%d\n", payments_with_attack_delay);
   fprintf(csv_stage4, "attack_delay_events,%llu\n",
           (unsigned long long)total_attack_delay_events);
@@ -1686,12 +1699,12 @@ int main(int argc, char *argv[]) {
     } else if (net_params.judging_strategy == 3) {
       /* method3: 判定ノードを置かない。全ノードが検知の対象 (method2 の全ノード観測と同じ範囲) */
       set_all_nodes_observed(1);
-      printf("[Config] method3: 判定ノードなし・経路上の判定者が自分の基準値で検定・違う告発者 %s 人以上で確定・嘘の告発 (CLOTH_M3_FALSE_ACCUSE) %s・確定した告発者の告発を数えない (CLOTH_M3_DISTRUST_CONFIRMED) %s・記録の書き換え (CLOTH_M3_TAMPER) %s・申し立て (CLOTH_M3_APPEAL) %s・申し立ての相手を上流の全部に (CLOTH_M3_APPEAL_ALL_UPSTREAM) %s・証拠を下流の全部に (CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM) %s・受取人の検定 (CLOTH_M3_RECEIVER_TEST) %s・受取人の記録を直接届ける (CLOTH_M3_RECEIVER_DIRECT) %s・絞り込み (CLOTH_M3_TOMOGRAPHY) %s・申し立ての受け付け条件 (CLOTH_M3_APPEAL_CONC) %s・受取人の異常はすぐ罰さない (CLOTH_M3_RCV_WATCH) %s・相手を有罪にする倍率 (CLOTH_M3_APPEAL_OPP_FACTOR) %s・2 回目の申し立て (CLOTH_M3_APPEAL_TWICE) %s・ハッシュチェーン (CLOTH_M3_HASHCHAIN) %s・検証時間 (CLOTH_M3_HASHCHAIN_VERIFY_MS、ms/ホップ) %s・犯人の監視 (CLOTH_M3_HASHCHAIN_CULPRIT) %s・告発の照らし合わせ (CLOTH_M3_ACCUSE_CHECK) %s\n",
+      printf("[Config] method3: 判定ノードなし・経路上の判定者が自分の基準値で検定・違う告発者 %s 人以上で確定・嘘の告発 (CLOTH_M3_FALSE_ACCUSE) %s・確定した告発者の告発を数えない (CLOTH_M3_DISTRUST_CONFIRMED) %s・記録の書き換え (CLOTH_M3_TAMPER) %s・申し立て (CLOTH_M3_APPEAL) %s・申し立ての相手を上流の全部に (CLOTH_M3_APPEAL_ALL_UPSTREAM) %s・証拠を下流の全部に (CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM) %s・受取人の検定 (CLOTH_M3_RECEIVER_TEST) %s・受取人の記録を直接届ける (CLOTH_M3_RECEIVER_DIRECT) %s・絞り込み (CLOTH_M3_TOMOGRAPHY) %s・申し立ての受け付け条件 (CLOTH_M3_APPEAL_CONC) %s・受取人の異常はすぐ罰さない (CLOTH_M3_RCV_WATCH) %s・相手を有罪にする倍率 (CLOTH_M3_APPEAL_OPP_FACTOR) %s・2 回目の申し立て (CLOTH_M3_APPEAL_TWICE) %s・ハッシュチェーン (CLOTH_M3_HASHCHAIN) %s・検証時間 (CLOTH_M3_HASHCHAIN_VERIFY_MS、ms/ホップ) %s・犯人の監視 (CLOTH_M3_HASHCHAIN_CULPRIT) %s・告発の照らし合わせ (CLOTH_M3_ACCUSE_CHECK) %s・悪意の送金者の嘘の告発 (CLOTH_M3_SENDER_FALSE_ACCUSE) %s・送金者だけの告発 (CLOTH_M3_SENDER_ONLY) %s\n",
              getenv("CLOTH_M3_ACCUSERS") ? getenv("CLOTH_M3_ACCUSERS") : "1",
              getenv("CLOTH_M3_FALSE_ACCUSE") ? getenv("CLOTH_M3_FALSE_ACCUSE") : "0",
              getenv("CLOTH_M3_DISTRUST_CONFIRMED") ? getenv("CLOTH_M3_DISTRUST_CONFIRMED") : "2",
              getenv("CLOTH_M3_TAMPER") ? getenv("CLOTH_M3_TAMPER") : "0",
-             getenv("CLOTH_M3_APPEAL") ? getenv("CLOTH_M3_APPEAL") : "3",
+             getenv("CLOTH_M3_APPEAL") ? getenv("CLOTH_M3_APPEAL") : "0",
              getenv("CLOTH_M3_APPEAL_ALL_UPSTREAM") ? getenv("CLOTH_M3_APPEAL_ALL_UPSTREAM") : "0",
              getenv("CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM") ? getenv("CLOTH_M3_APPEAL_EVIDENCE_DOWNSTREAM") : "0",
              getenv("CLOTH_M3_RECEIVER_TEST") ? getenv("CLOTH_M3_RECEIVER_TEST") : "1",
@@ -1704,8 +1717,17 @@ int main(int argc, char *argv[]) {
              getenv("CLOTH_M3_HASHCHAIN") ? getenv("CLOTH_M3_HASHCHAIN") : "1",
              getenv("CLOTH_M3_HASHCHAIN_VERIFY_MS") ? getenv("CLOTH_M3_HASHCHAIN_VERIFY_MS") : "0",
              getenv("CLOTH_M3_HASHCHAIN_CULPRIT") ? getenv("CLOTH_M3_HASHCHAIN_CULPRIT") : "3",
-             getenv("CLOTH_M3_ACCUSE_CHECK") ? getenv("CLOTH_M3_ACCUSE_CHECK") : "1");
+             getenv("CLOTH_M3_ACCUSE_CHECK") ? getenv("CLOTH_M3_ACCUSE_CHECK") : "1",
+             getenv("CLOTH_M3_SENDER_FALSE_ACCUSE") ? getenv("CLOTH_M3_SENDER_FALSE_ACCUSE") : "0",
+             getenv("CLOTH_M3_SENDER_ONLY") ? getenv("CLOTH_M3_SENDER_ONLY") : "1");
     }
+  }
+  if (get_mal_sender_send())
+    printf("[Config] 悪意ノードもふつうに送金する (CLOTH_MAL_SENDER_SEND=1)・成功率と遅延の集計からは悪意の送金者の送金を外す\n");
+  {
+    const char* e = getenv("CLOTH_M3_SENDER_FALSE_ACCUSE");
+    if (e != NULL && e[0] != '\0' && strcmp(e, "0") != 0 && !get_mal_sender_send())
+      printf("[Config] 警告: CLOTH_M3_SENDER_FALSE_ACCUSE は CLOTH_MAL_SENDER_SEND=1 のときだけ効く (悪意の送金者は送金しないので嘘もつかない)\n");
   }
 
   /* === 代役ハブ注入(トポロジ what-if, env-gated, 既定OFF) ===
