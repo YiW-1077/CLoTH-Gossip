@@ -26,7 +26,7 @@ if [[ -n "$remote_arg" ]]; then
     fi
 fi
 
-max_processes="${MAX_PROCESSES:-32}"
+max_processes="${MAX_PROCESSES:-8}"
 N_PAYMENTS="${N_PAYMENTS:-5000}"
 PAYMENT_TIMEOUT_MS="${PAYMENT_TIMEOUT_MS:-200000}"
 TOP_HUB_COUNT="${TOP_HUB_COUNT:-10}"

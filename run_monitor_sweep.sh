@@ -568,7 +568,7 @@ if [[ "$1" == "--regen-summary" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-max_processes=12
+max_processes=8
 queue=()
 running_processes=0
 total_simulations=0

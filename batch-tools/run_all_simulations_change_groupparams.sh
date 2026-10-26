@@ -26,7 +26,7 @@ if [[ -n "$remote_arg" ]]; then
     fi
 fi
 
-max_processes=12
+max_processes=8
 
 queue=()
 running_processes=0

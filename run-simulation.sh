@@ -96,7 +96,7 @@ run_once() {
                 python3 "$environment_dir/scripts/simple_live_view.py" "$result_dir" > "$result_dir/log/simple_view.log" 2>&1 &
                 viewer_pid=$!
             fi
-            eval "export $env_exports; GSL_RNG_SEED=$seed nice -n 4 ./CLoTH_Gossip $result_dir/" 2>&1 | tee "$result_dir/log/cloth.log"
+            eval "export $env_exports; GSL_RNG_SEED=$seed nice -n 8 ./CLoTH_Gossip $result_dir/" 2>&1 | tee "$result_dir/log/cloth.log"
             sim_status=${PIPESTATUS[0]}
             if [ -n "$viewer_pid" ]; then
                 wait "$viewer_pid" 2>/dev/null || true
@@ -105,7 +105,7 @@ run_once() {
                 exit "$sim_status"
             fi
         else
-            eval "export $env_exports; GSL_RNG_SEED=$seed nice -n 4 ./CLoTH_Gossip $result_dir/" 2>&1 | tee "$result_dir/log/cloth.log"
+            eval "export $env_exports; GSL_RNG_SEED=$seed nice -n 8 ./CLoTH_Gossip $result_dir/" 2>&1 | tee "$result_dir/log/cloth.log"
             sim_status=${PIPESTATUS[0]}
             if [ "$sim_status" -ne 0 ]; then
                 exit "$sim_status"

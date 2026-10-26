@@ -36,7 +36,7 @@ BIN="$project_root/cmake-build-debug/CLoTH_Gossip"
 source "$project_root/scripts/nas_lib.sh"
 nas_setup "$out_base" || exit 1
 
-max_processes="${MAX_PROCESSES:-12}"
+max_processes="${MAX_PROCESSES:-8}"
 P_VALUE="${P_VALUE:-0.001}"
 AVG_PMT="${AVG_PMT:-100}"
 SIGMA="${CLOTH_ATTACK_DELAY_SIGMA:-1.0}"
@@ -116,7 +116,7 @@ run_cell_once() {
             CLOTH_PVALUE_THRESHOLD="$P_VALUE" \
             CLOTH_SUBSTITUTE_COUNT="$SUBSTITUTE_COUNT" CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0 \
             CLOTH_ATTACK_DELAY_DIST="$dist" CLOTH_ATTACK_DELAY_SIGMA="$SIGMA" \
-            nice -n 4 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
+            nice -n 8 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
     ) 2>/dev/null
 }
 

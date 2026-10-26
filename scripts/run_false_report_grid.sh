@@ -90,7 +90,7 @@ run_once() {
             CLOTH_ATTACK_DELAY_DIST=lognormal CLOTH_ATTACK_DELAY_SIGMA=1.0 \
             CLOTH_REPORT_ATTEST="$att" CLOTH_FALSE_REPORT_MS="$lie" CLOTH_CLOCK_SKEW_MS="$sk" \
             CLOTH_FALSE_REPORT_PROB="$pr" CLOTH_SILENT_REPORT_PROB="$sq" CLOTH_ATTEST_SILENCE_POLICY="$sp" CLOTH_ATTEST_DISPUTE_POLICY="$dp" ${VAR_INIT:+CLOTH_SETTLE_VAR_INIT=$VAR_INIT} \
-            nice -n 4 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
+            nice -n 8 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
     ) 2>/dev/null
 }
 

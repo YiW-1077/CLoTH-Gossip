@@ -99,7 +99,7 @@ run_cell_once() {
             CLOTH_NULL_DEGREE_SIGMA=0.04 CLOTH_RATE_GATE_TAU=0.001 \
             CLOTH_PVALUE_THRESHOLD="$P_VALUE" CLOTH_SUBSTITUTE_COUNT="$SUBSTITUTE_COUNT" CLOTH_SUBSTITUTE_MIN_DEGREE=100 CLOTH_SUBSTITUTE_MAX_LINKS=400 CLOTH_SUBSTITUTE_ON_DETECTION=0 \
             CLOTH_ATTACK_DELAY_DIST="$DIST" CLOTH_ATTACK_DELAY_SIGMA="$SIGMA" \
-            nice -n 4 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
+            nice -n 8 "$BIN" "$cell/" > "$cell/cloth.log" 2>&1
     ) 2>/dev/null
 }
 
