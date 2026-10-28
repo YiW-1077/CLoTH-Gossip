@@ -51,12 +51,27 @@ prepare_environment() {
     # 版が記録され、root と config/ が乖離した場合に run 記録が実効値と食い違う。
 }
 
+# 失敗した理由を log/fail_reason.txt に書く (1 行目 = 理由、2 行目 = 見るログ)。sweep の進み具合のウィンドウが出す
+fail_reason() {
+    printf '%s\n%s\n' "$1" "$2" > "$result_dir/log/fail_reason.txt"
+}
+
+# シミュレーター本体が 0 以外で終わった。129〜159 はシグナルで落ちたとき (255 は exit(-1))
+sim_failed() {
+    if [ "$1" -gt 128 ] && [ "$1" -lt 160 ]; then
+        fail_reason "シミュレーターがシグナル $(( $1 - 128 )) で落ちた (終了コード $1)" "log/cloth.log"
+    else
+        fail_reason "シミュレーターが終了コード $1 で終わった" "log/cloth.log"
+    fi
+    exit "$1"
+}
+
 run_once() {
     (
         viewer_pid=""
-        cd "$environment_dir" || exit 1
-        cmake . > "$result_dir/log/cmake.log" 2>&1 || exit 1
-        make > "$result_dir/log/make.log" 2>&1 || exit 1
+        cd "$environment_dir" || { fail_reason "作業 dir に入れない" "log/setup.log"; exit 1; }
+        cmake . > "$result_dir/log/cmake.log" 2>&1 || { fail_reason "cmake に失敗" "log/cmake.log"; exit 1; }
+        make > "$result_dir/log/make.log" 2>&1 || { fail_reason "make に失敗" "log/make.log"; exit 1; }
         
         # Re-apply parameter replacements after CMake build
         # (CMake copies the original cloth_input.txt, so we need to reapply sed)
@@ -102,13 +117,13 @@ run_once() {
                 wait "$viewer_pid" 2>/dev/null || true
             fi
             if [ "$sim_status" -ne 0 ]; then
-                exit "$sim_status"
+                sim_failed "$sim_status"
             fi
         else
             eval "export $env_exports; GSL_RNG_SEED=$seed nice -n 8 ./CLoTH_Gossip $result_dir/" 2>&1 | tee "$result_dir/log/cloth.log"
             sim_status=${PIPESTATUS[0]}
             if [ "$sim_status" -ne 0 ]; then
-                exit "$sim_status"
+                sim_failed "$sim_status"
             fi
         fi
         exit 0
@@ -143,6 +158,7 @@ else
     {
         echo "Simulation failed after $max_attempts attempts."
         echo "See logs in $result_dir/log/"
+        [ -f "$result_dir/log/fail_reason.txt" ] && echo "Last failure: $(head -1 "$result_dir/log/fail_reason.txt")"
     } > "$result_dir/log/error_summary.log"
     echo "failed" > "$result_dir/progress.tmp"
 fi

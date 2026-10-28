@@ -12,9 +12,16 @@
 #   sweep_status_write <state> [k=v...] : 状態ファイルを書き直す (実行中の進みを書くとき)
 #   sweep_status_set <state> [k=v...]   : 状態と、渡した key だけを変える (前に書いた数は残す)
 #   sweep_status_exit <rc>              : 終わったときの状態を書く (trap EXIT から呼ぶ)
+#   sweep_status_traps                  : 終わったとき・Ctrl-C や kill で止められたときに状態を書く trap を張る
+#   sweep_die <行...>                   : 行を出して (今までの echo と同じ)、エラーの内容として覚えてから止まる
+#   sweep_cell_errors <output_base>     : 失敗したセルの err 行を出す
+#   sweep_nas_errors <nas_error_log>    : NAS へ移せなかったものの err 行を出す
 #
 # state: starting / running / transfer (NAS へ移している) / summary (集計中) /
 #        seed_done / seed_failed (複数シードの 1 つが終わった) / done / failed
+# エラーの内容 (ウィンドウの「エラーの内容」に出す):
+#   err=<シード>|<文>                              : sweep が止まった理由・NAS へ移せなかったもの
+#   errcell=<シード>|<セル>|<理由>|<ログの最後の行> : 失敗したセル (理由は run-simulation.sh の log/fail_reason.txt)
 # =============================================================================
 
 sweep_progress_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,13 +88,96 @@ function sweep_status_set() {
     return 0
 }
 
+sweep_error_lines=()
+
+function sweep_die() {
+    local line
+    for line in "$@"; do
+        echo "$line"
+        sweep_error_lines+=("err=${seed_base:-}|$line")
+    done
+    exit 1
+}
+
 # 複数シードの子は seed_done / seed_failed を書き、全体の done / failed は親が書く
 function sweep_status_exit() {
     local rc="$1" child=""
     [[ -n "${SWEEP_SEED_COUNT:-}" ]] && child="seed_"
-    if [[ "$rc" -ne 0 ]]; then sweep_status_set "${child}failed" "rc=$rc"
-    else sweep_status_set "${child:-}done" "rc=0"
+    if [[ "$rc" -ne 0 ]]; then
+        if [[ ${#sweep_error_lines[@]} -eq 0 ]]; then   # sweep_die を通らずに終わった
+            if [[ "$rc" -gt 128 && "$rc" -lt 160 ]]; then
+                sweep_error_lines=("err=${seed_base:-}|$(sweep_signal_message "$rc")")
+            else
+                sweep_error_lines=("err=${seed_base:-}|終了コード $rc で終わった (理由の記録なし。sweep のログを見ること)")
+            fi
+        fi
+        sweep_status_set "${child}failed" "rc=$rc" "${sweep_error_lines[@]}"
+    else
+        sweep_status_set "${child:-}done" "rc=0"
     fi
+}
+
+# $1 = 終了コード (128 + シグナルの番号)
+function sweep_signal_message() {
+    case $(($1 - 128)) in
+        2) echo "Ctrl-C で止められた (SIGINT)" ;;
+        15) echo "kill で止められた (SIGTERM)" ;;
+        1) echo "端末が閉じられて止まった (SIGHUP)" ;;
+        *) echo "シグナル $(($1 - 128)) で止められた" ;;
+    esac
+}
+
+# シグナルで止められたときは EXIT の trap に $? が渡らない (0 になる) ので、シグナルごとに張る。
+# sweep_on_stop があれば先に呼ぶ (run_monitor_sweep.sh が走っているセルを止める)。
+# 書いたあとは同じシグナルで止まり直す
+function sweep_status_traps() {
+    trap 'sweep_status_exit $?' EXIT
+    local s
+    for s in INT:130 TERM:143 HUP:129; do
+        trap "declare -F sweep_on_stop > /dev/null && sweep_on_stop; sweep_stop_display; sweep_status_exit ${s#*:}; trap - ${s%%:*} EXIT; kill -${s%%:*} \$\$" "${s%%:*}"
+    done
+}
+
+# 進み具合を書く display_progress (run_monitor_sweep.sh の裏の処理、pid は display_pid) を止める。
+# 裏の処理は Ctrl-C を受けないので、止めないと「止められた」を「走行中」で上書きし続ける
+function sweep_stop_display() {
+    [[ -n "${display_pid:-}" ]] || return 0
+    kill "$display_pid" 2>/dev/null && wait "$display_pid" 2>/dev/null
+    return 0
+}
+
+# ログの最後の中身のある行 (進み具合の \r で上書きされた行は最後の分だけ)。make.log は最初の error の行
+function sweep_log_tail() {
+    [[ -f "$1" ]] || { echo "($1 がない)"; return; }
+    local line=""
+    [[ "$1" == */make.log ]] && line=$(grep -m 1 -i 'error' "$1")
+    [[ -z "$line" ]] && line=$(tr '\r' '\n' < "$1" | grep -v '^[[:space:]]*$' | tail -1)
+    echo "${line:0:300}"
+}
+
+function sweep_cell_errors() {
+    local base="$1" f d real reason logname n=0
+    while IFS= read -r f; do
+        [[ "$(<"$f")" == "failed" ]] || continue
+        n=$((n + 1))
+        [[ $n -gt 5 ]] && continue
+        d="${f%/progress.tmp}"
+        real="$d"
+        [[ -f "$d/.moved_to_remote" ]] && real="$(<"$d/.moved_to_remote")"   # もう NAS へ移した
+        reason="理由の記録なし"; logname="log/cloth.log"
+        if [[ -f "$real/log/fail_reason.txt" ]]; then
+            reason=$(sed -n 1p "$real/log/fail_reason.txt"); logname=$(sed -n 2p "$real/log/fail_reason.txt")
+        fi
+        echo "errcell=${seed_base:-}|${d#$base/}|$reason|$(sweep_log_tail "$real/$logname")"
+    done < <(find "$base" -type d -name environment -prune -o -type f -name progress.tmp -print 2>/dev/null | sort)
+    [[ $n -gt 5 ]] && echo "err=${seed_base:-}|ほかにも失敗したセルが $((n - 5)) 個ある"
+    return 0
+}
+
+function sweep_nas_errors() {
+    [[ -s "$1" ]] || return 0
+    grep '^\[ERROR\]' "$1" | head -3 | sed "s/^/err=${seed_base:-}|NAS: /"
+    return 0
 }
 
 # 直接実行したとき: 走っている sweep のウィンドウを開き直す

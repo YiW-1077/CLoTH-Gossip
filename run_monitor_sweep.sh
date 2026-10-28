@@ -180,6 +180,26 @@ if [ "${#_seeds[@]}" -gt 1 ]; then
     _multi_rc=0
     _seed_index=0
     _failed_seeds=""
+    _failed_cells=0
+    _seed_errors=()   # 子が書いたエラーの内容 (次のシードが状態ファイルを書き直すので覚えておく)
+    _child=""
+    # Ctrl-C・kill・端末を閉じたとき: 走っているシードの子に kill を送り (子は走っているセルと NAS への転送も止める)、
+    # 止めた理由を書いてから、同じシグナルで止まり直す。
+    # 子は裏で回して wait する (前で回すと、親への kill が子の終わるまで待たされる。
+    # 裏の子は Ctrl-C を受けないので、親が受けて子に渡す)
+    function stop_seed_child() {   # $1 = 終了コード (128 + シグナルの番号)
+        if [[ -n "$_child" ]] && kill -0 "$_child" 2>/dev/null; then
+            kill -TERM "$_child" 2>/dev/null
+            wait "$_child" 2>/dev/null
+        fi
+        echo ""
+        echo "### $(sweep_signal_message "$1") (シード $_s の途中)"
+        sweep_status_set failed "rc=$1" "failed_seeds=${_failed_seeds:+$_failed_seeds,}$_s" \
+            "err=$_s|$(sweep_signal_message "$1")" "${_seed_errors[@]}"
+    }
+    for _sig in INT:130 TERM:143 HUP:129; do
+        trap "stop_seed_child ${_sig#*:}; trap - ${_sig%%:*}; kill -${_sig%%:*} \$\$" "${_sig%%:*}"
+    done
     for _s in "${_seeds[@]}"; do
         [ -z "$_s" ] && continue
         _seed_index=$((_seed_index + 1))
@@ -188,19 +208,59 @@ if [ "${#_seeds[@]}" -gt 1 ]; then
         echo "### シード $_s 実行開始 ($(date '+%Y-%m-%d %H:%M:%S'))"
         echo "########################################################"
         SWEEP_SEED_INDEX=$_seed_index SWEEP_SEED_COUNT=$sweep_seed_total SWEEP_FAILED_SEEDS=$_failed_seeds \
-            "$0" "$_s" "${@:2}" || { _multi_rc=$?; _failed_seeds+="${_failed_seeds:+,}$_s"; }
+            "$0" "$_s" "${@:2}" &
+        _child=$!
+        wait "$_child" || { _multi_rc=$?; _failed_seeds+="${_failed_seeds:+,}$_s"; }
+        _child=""
+        if [[ -f "${SWEEP_STATUS_FILE:-}" ]]; then
+            mapfile -t -O "${#_seed_errors[@]}" _seed_errors < <(grep -E '^(err|errcell)=' "$SWEEP_STATUS_FILE")
+            _n=$(sed -n 's/^failed=//p' "$SWEEP_STATUS_FILE" | tail -1)
+            _failed_cells=$((_failed_cells + ${_n:-0}))
+        fi
     done
     echo ""
     echo "########################################################"
     echo "### 全シード完了: ${_seeds[*]} (rc=$_multi_rc)"
     echo "########################################################"
-    sweep_status_set "$([ "$_multi_rc" -eq 0 ] && echo done || echo failed)" "rc=$_multi_rc" "failed_seeds=$_failed_seeds"
+    sweep_status_set "$([ "$_multi_rc" -eq 0 ] && echo done || echo failed)" "rc=$_multi_rc" "failed_seeds=$_failed_seeds" \
+        "failed_total=$_failed_cells" "${_seed_errors[@]}"
     exit $_multi_rc
 fi
 # ---------------------------------------------------------------------------
 
 seed_base="$1"
-trap 'sweep_status_exit $?' EXIT
+
+# Ctrl-C・kill・端末を閉じたときに、走っているセル (run-simulation.sh とその中のシミュレーター) と
+# NAS への転送も止める (scripts/sweep_progress.sh の trap から呼ぶ)。
+# 裏で回しているものは Ctrl-C を受けないので、止めないと最後まで走り続ける
+function process_tree() {   # pid とその子孫を全部出す
+    local p
+    for p in "$@"; do
+        echo "$p"
+        process_tree $(pgrep -P "$p" 2>/dev/null)
+    done
+}
+function sweep_on_stop() {
+    local roots pids i
+    roots=$(jobs -p)
+    [[ -n "$roots" ]] || return 0
+    pids=$(process_tree $roots)
+    kill -STOP $pids 2>/dev/null   # 止めている間に新しい子 (run-simulation.sh の次の試行など) を作らせない
+    pids=$(process_tree $roots)    # 止めるまでにできた子も拾う
+    kill -STOP $pids 2>/dev/null
+    kill -TERM $pids 2>/dev/null
+    kill -CONT $pids 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 $pids 2>/dev/null || break
+        sleep 0.3
+    done
+    kill -KILL $pids 2>/dev/null
+    echo ""
+    echo "### 止められたので、走っていたセルと NAS への転送を止めた"
+    return 0
+}
+
+sweep_status_traps
 sweep_status_write starting
 output_base_arg="$2"
 remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
@@ -230,9 +290,8 @@ for ((i=4; i<=$#; i++)); do
                 JUDGING_METHODS_OVERRIDE="judge_disable judge_method1 judge_method2 judge_method3"
                 ;;
             *)
-                echo "ERROR: Invalid judging_strategy: $strategy_value"
-                echo "Valid options: disabled, method1, method2, method3, all"
-                exit 1
+                sweep_die "ERROR: Invalid judging_strategy: $strategy_value" \
+                    "Valid options: disabled, method1, method2, method3, all"
                 ;;
         esac
         echo "[Config] Override JUDGING_METHODS: $JUDGING_METHODS_OVERRIDE"
@@ -587,10 +646,7 @@ queue=()
 running_processes=0
 total_simulations=0
 output_base="$output_base_arg/$timestamp"
-mkdir -p "$output_base" || {
-    echo "ERROR: Cannot create local output directory: $output_base"
-    exit 1
-}
+mkdir -p "$output_base" || sweep_die "ERROR: Cannot create local output directory: $output_base"
 
 # ---------------------------------------------------------------------------
 # Handle remote output directory (SMB conversion to local mount path)
@@ -602,18 +658,18 @@ if [[ "$remote_arg" == "local" ]]; then
     remote_arg=""
     echo "[Config] 出力はローカルのみ (第3引数 local)。NAS には送らない"
 elif [[ "$remote_arg" == smb://* ]]; then
-    echo "ERROR: SMB URI は使えない: $remote_arg"
-    echo "       マウントしてからローカルのパス (例 /Volumes/<共有>/...) を渡すこと。"
-    exit 1
+    sweep_die "ERROR: SMB URI は使えない: $remote_arg" \
+        "       マウントしてからローカルのパス (例 /Volumes/<共有>/...) を渡すこと。"
 elif [[ -z "$remote_arg" ]]; then
-    if ! remote_arg=$(nas_find_dir); then
-        echo "       (第3引数で置き場所を直接渡すか、ローカルに残すなら第3引数に local)"
-        exit 1
+    if ! remote_arg=$(nas_find_dir 2> "${TMPDIR:-/tmp}/cloth_nas_find_$$.err"); then
+        _nas_err=$(<"${TMPDIR:-/tmp}/cloth_nas_find_$$.err"); rm -f "${TMPDIR:-/tmp}/cloth_nas_find_$$.err"
+        sweep_die "$_nas_err" "       (第3引数で置き場所を直接渡すか、ローカルに残すなら第3引数に local)"
     fi
+    rm -f "${TMPDIR:-/tmp}/cloth_nas_find_$$.err"
 fi
 if [[ -n "$remote_arg" ]]; then
     remote_output_base="$remote_arg/$timestamp"
-    mkdir -p "$remote_output_base" || { echo "ERROR: NAS に出力先を作れない: $remote_output_base"; exit 1; }
+    mkdir -p "$remote_output_base" || sweep_die "ERROR: NAS に出力先を作れない: $remote_output_base"
     echo "[Config] 出力先 NAS: $remote_output_base (終わった sim から移し、最後はローカルに results_summary.csv だけ残す)"
 fi
 
@@ -944,8 +1000,7 @@ for n_payment in "${N_PAYMENTS[@]}"; do
                         sub_env="$SUB_ENV_DEFENSE $DETECT_ENV_DEFENSE"
                         ;;
                     *)
-                        echo "ERROR: Unknown monitoring method: $method"
-                        exit 1
+                        sweep_die "ERROR: Unknown monitoring method: $method"
                     ;;
             esac
 
@@ -1048,8 +1103,9 @@ if [[ -s "$nas_error_log" ]]; then
     cat "$nas_error_log"
     echo "========================="
 fi
+mapfile -t _err_lines < <(sweep_cell_errors "$output_base"; sweep_nas_errors "$nas_error_log")
 sweep_status_set summary "nas_ok=$(cat "$nas_counter_transferred" 2>/dev/null || echo 0)" \
-    "nas_ng=$(cat "$nas_counter_failed" 2>/dev/null || echo 0)"
+    "nas_ng=$(cat "$nas_counter_failed" 2>/dev/null || echo 0)" "${_err_lines[@]}"
 rm -f "$nas_error_log" "$nas_counter_transferred" "$nas_counter_failed"
 
 echo ""
