@@ -15,6 +15,8 @@
 #   同じ CSV だけ残す (2026-10-14: CSV はローカルに残してよい、ただし NAS にも必ず置く)。
 #   第3引数に local を渡したときだけ NAS を使わずローカルに残す。
 #   集計の作り直し: ./run_monitor_sweep.sh --regen-summary <NAS 上の <timestamp> dir>
+# 進み具合は画面の小さなウィンドウにも出る (scripts/sweep_progress.sh。SWEEP_PROGRESS_WINDOW=0 で出さない。
+#   閉じても sweep は止まらない。開き直すのは bash scripts/sweep_progress.sh)
 
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <seed[,seed...]> <output_base_dir> [remote_output_dir_or_smb_uri] [key=value ...]"
@@ -163,6 +165,11 @@ SUBSTITUTE_ON_DETECTION=0       # 0=オラクル配置(既定) / 1=検知トリ�
 # ##   設定ブロックここまで。以降はロジック（通常は編集不要）                ##
 # ############################################################################
 
+# 進み具合のウィンドウ (scripts/sweep_progress.sh)。一番外側の sweep が開き、複数シードの子は状態を書くだけ。
+# SWEEP_PROGRESS_WINDOW=0 で出さない
+source "$(cd "$(dirname "$0")" && pwd)/scripts/sweep_progress.sh"
+[[ "$1" != "--regen-summary" ]] && sweep_progress_init "$1" "$2"
+
 # --- 複数シード対応 ---------------------------------------------------------
 # $1 にカンマ/空白区切りで複数シードを指定すると、各シードで本スクリプトを
 # 順番に自己再実行する(各シードは独立した timestamp 出力dir + results_summary.csv)。
@@ -171,23 +178,30 @@ IFS=', ' read -r -a _seeds <<< "$1"
 if [ "${#_seeds[@]}" -gt 1 ]; then
     echo "[Config] 複数シード検出: ${_seeds[*]} → 順番に実行します"
     _multi_rc=0
+    _seed_index=0
+    _failed_seeds=""
     for _s in "${_seeds[@]}"; do
         [ -z "$_s" ] && continue
+        _seed_index=$((_seed_index + 1))
         echo ""
         echo "########################################################"
         echo "### シード $_s 実行開始 ($(date '+%Y-%m-%d %H:%M:%S'))"
         echo "########################################################"
-        "$0" "$_s" "${@:2}" || _multi_rc=$?
+        SWEEP_SEED_INDEX=$_seed_index SWEEP_SEED_COUNT=$sweep_seed_total SWEEP_FAILED_SEEDS=$_failed_seeds \
+            "$0" "$_s" "${@:2}" || { _multi_rc=$?; _failed_seeds+="${_failed_seeds:+,}$_s"; }
     done
     echo ""
     echo "########################################################"
     echo "### 全シード完了: ${_seeds[*]} (rc=$_multi_rc)"
     echo "########################################################"
+    sweep_status_set "$([ "$_multi_rc" -eq 0 ] && echo done || echo failed)" "rc=$_multi_rc" "failed_seeds=$_failed_seeds"
     exit $_multi_rc
 fi
 # ---------------------------------------------------------------------------
 
 seed_base="$1"
+trap 'sweep_status_exit $?' EXIT
+sweep_status_write starting
 output_base_arg="$2"
 remote_arg="${3:-${REMOTE_OUTPUT_DIR:-}}"
 project_root="$(cd "$(dirname "$0")" && pwd)"
@@ -748,6 +762,7 @@ function display_progress() {
 
     local n_done=0
     local n_failed=0
+    local tick=0 entry sim_lines
     last_lines=0   # 多行インプレース描画で前回出力した行数(カーソル巻き戻し用)
 
     # NAS転送は nas_drainer に分離済み。ここは「読むだけ」の軽量ループで 0.1s ごとに
@@ -781,6 +796,14 @@ function display_progress() {
         local nas_ok=0 nas_ng=0
         [ -r "$nas_counter_transferred" ] && nas_ok=$(<"$nas_counter_transferred")
         [ -r "$nas_counter_failed" ]      && nas_ng=$(<"$nas_counter_failed")
+
+        # 進み具合のウィンドウ用の状態ファイル (1 秒ごと・終わった回)
+        if (( tick++ % 10 == 0 || n_done >= total_simulations )); then
+            sim_lines=()
+            for entry in "${running_entries[@]}"; do sim_lines+=("sim=$entry"); done
+            sweep_status_write running "done=$n_done" "total=$total_simulations" "failed=$n_failed" \
+                "nas=${remote_output_base:+1}" "nas_ok=$nas_ok" "nas_ng=$nas_ng" "${sim_lines[@]}"
+        fi
 
         # 進捗％・バー・ETA を整数演算で算出 (python3/bc 不使用)
         local permille pct_int pct_dec filled bar progress_line
@@ -996,10 +1019,21 @@ running_processes=0
 start_time=$(date +%s)
 
 display_progress &
+display_pid=$!
 nas_drainer &
+drainer_pid=$!
 while [ "${#queue[@]}" -gt 0 ] || [ "$running_processes" -gt 0 ]; do
     process_queue
     sleep 1
+done
+# display_progress が最後の状態を書き終えてから「NAS へ移している」にする (後から上書きされないように)。
+# 移し終わるまで、移した数を 1 秒ごとに書き直す (display_progress はもう止まっているので)
+wait "$display_pid" 2>/dev/null
+sweep_status_set transfer
+while kill -0 "$drainer_pid" 2>/dev/null; do
+    sleep 1
+    sweep_status_set transfer "nas_ok=$(cat "$nas_counter_transferred" 2>/dev/null || echo 0)" \
+        "nas_ng=$(cat "$nas_counter_failed" 2>/dev/null || echo 0)"
 done
 wait
 printf "\n"
@@ -1014,6 +1048,8 @@ if [[ -s "$nas_error_log" ]]; then
     cat "$nas_error_log"
     echo "========================="
 fi
+sweep_status_set summary "nas_ok=$(cat "$nas_counter_transferred" 2>/dev/null || echo 0)" \
+    "nas_ng=$(cat "$nas_counter_failed" 2>/dev/null || echo 0)"
 rm -f "$nas_error_log" "$nas_counter_transferred" "$nas_counter_failed"
 
 echo ""
